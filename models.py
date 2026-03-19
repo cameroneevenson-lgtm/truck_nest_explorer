@@ -7,19 +7,28 @@ import re
 DEFAULT_RELEASE_ROOT = r"L:\BATTLESHIELD\F-LARGE FLEET"
 DEFAULT_FABRICATION_ROOT = r"W:\LASER\For Battleshield Fabrication"
 DEFAULT_RADAN_KITTER_LAUNCHER = r"C:\Tools\radan_kitter\radan_kitter.bat"
-DEFAULT_INVENTOR_TO_RADAN_ENTRY = r"C:\Tools\inventor_to_radan\inventor_to_radan.py"
+DEFAULT_INVENTOR_TO_RADAN_ENTRY = r"C:\Tools\inventor_to_radan\inventor_to_radan.bat"
 DEFAULT_SUPPORT_FOLDERS = ("_bak", "_out", "_kits")
 DEFAULT_KIT_TEMPLATES = [
-    "BODY | PAINT PACK",
-    "PUMPHOUSE",
-    "CONSOLE PACK",
+    "PAINT PACK",
     "INTERIOR PACK",
     "EXTERIOR PACK",
-    "PUMP COVERINGS",
-    "GRAND REMOUS TWO",
+    "CONSOLE PACK",
+    "CHASSIS PACK",
+    "PUMP HOUSE => PUMP PACK\\PUMP HOUSE",
+    "PUMP COVERING => PUMP PACK\\COVERING",
+    "PUMP MOUNTS => PUMP PACK\\MOUNTS",
+    "PUMP BRACKETS => PUMP PACK\\BRACKETS",
+    "STEP PACK",
+    "OPERATIONAL PANELS => PUMP PACK\\OPERATIONAL PANELS",
 ]
 TRUCK_NUMBER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 HIDDEN_KIT_SEPARATOR = "::"
+KIT_NAME_ALIASES = {
+    "PUMP COVERINGS": "PUMP COVERING",
+    "STEPS PACK": "STEP PACK",
+    "STEPS": "STEP PACK",
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +42,27 @@ def _normalize_relative_path(value: object) -> str:
     text = str(value or "").strip().replace("/", "\\")
     parts = [segment.strip() for segment in text.split("\\") if segment.strip()]
     return "\\".join(parts)
+
+
+def canonicalize_kit_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return KIT_NAME_ALIASES.get(text.upper(), text)
+
+
+def kit_name_variants(value: object) -> tuple[str, ...]:
+    canonical_name = canonicalize_kit_name(value)
+    if not canonical_name:
+        return ()
+    variants = [canonical_name]
+    for alias_name, mapped_name in KIT_NAME_ALIASES.items():
+        if mapped_name.casefold() != canonical_name.casefold():
+            continue
+        if alias_name.casefold() == canonical_name.casefold():
+            continue
+        variants.append(alias_name)
+    return tuple(variants)
 
 
 def parse_kit_mapping_entry(value: object) -> KitMapping | None:
@@ -129,9 +159,27 @@ def normalize_hidden_truck_entries(values: list[object] | None) -> list[str]:
     return cleaned
 
 
+def normalize_truck_order_entries(values: list[object] | None) -> list[str]:
+    return normalize_hidden_truck_entries(values)
+
+
+def canonicalize_client_numbers_by_truck(values: object) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+
+    cleaned: dict[str, str] = {}
+    for raw_key, raw_value in values.items():
+        truck_number = normalize_hidden_truck_number(raw_key)
+        client_number = str(raw_value or "").strip()
+        if not truck_number or not client_number:
+            continue
+        cleaned[truck_number] = client_number
+    return cleaned
+
+
 def build_hidden_kit_key(truck_number: object, kit_name: object) -> str:
     truck_text = normalize_hidden_truck_number(truck_number)
-    kit_text = str(kit_name or "").strip()
+    kit_text = canonicalize_kit_name(kit_name)
     if not truck_text or not kit_text:
         return ""
     return f"{truck_text}{HIDDEN_KIT_SEPARATOR}{kit_text}"
@@ -164,6 +212,8 @@ def canonicalize_hidden_kit_entries(
     for mapping in build_kit_mappings(kit_template_values):
         kit_name_lookup[mapping.display_name.casefold()] = mapping.kit_name
         kit_name_lookup[mapping.kit_name.casefold()] = mapping.kit_name
+    for alias_name, canonical_name in KIT_NAME_ALIASES.items():
+        kit_name_lookup[alias_name.casefold()] = canonical_name
 
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -192,6 +242,8 @@ def canonicalize_punch_codes_by_kit(
     for mapping in build_kit_mappings(kit_template_values):
         kit_name_lookup[mapping.display_name.casefold()] = mapping.kit_name
         kit_name_lookup[mapping.kit_name.casefold()] = mapping.kit_name
+    for alias_name, canonical_name in KIT_NAME_ALIASES.items():
+        kit_name_lookup[alias_name.casefold()] = canonical_name
 
     cleaned: dict[str, str] = {}
     for raw_key, raw_value in values.items():
@@ -214,8 +266,10 @@ class ExplorerSettings:
     template_replacements_text: str = ""
     punch_codes_text: str = ""
     punch_codes_by_kit: dict[str, str] = field(default_factory=dict)
+    client_numbers_by_truck: dict[str, str] = field(default_factory=dict)
     create_support_folders: bool = True
     kit_templates: list[str] = field(default_factory=lambda: list(DEFAULT_KIT_TEMPLATES))
+    truck_order: list[str] = field(default_factory=list)
     hidden_trucks: list[str] = field(default_factory=list)
     hidden_kits: list[str] = field(default_factory=list)
 
@@ -275,6 +329,7 @@ class KitStatus:
     rpd_exists: bool
     rpd_size_bytes: int
     fabrication_folder_exists: bool
+    fabrication_has_files: bool
     spreadsheet_match: SpreadsheetMatch
     preview_pdf_match: PdfMatch
     inventor_outputs: InventorOutputPaths | None

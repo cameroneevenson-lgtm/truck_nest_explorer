@@ -6,27 +6,50 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 from main_window import MainWindow
 
 
-def _place_window_on_second_screen(app: QApplication, window: MainWindow) -> None:
-    screens = app.screens()
-    if not screens:
+def _target_screen():
+    screens = QGuiApplication.screens()
+    if len(screens) >= 2:
+        return screens[1]
+    return QGuiApplication.primaryScreen()
+
+
+def _lock_to_screen_maximized(window: MainWindow, screen) -> None:
+    if screen is None:
+        window.showMaximized()
+        return
+    try:
+        geometry = screen.availableGeometry()
+        window.setMinimumSize(geometry.size())
+        window.setMaximumSize(geometry.size())
+        window.move(geometry.topLeft())
+    except Exception:
+        pass
+    window.showMaximized()
+
+
+def _place_maximized_on_screen2(window: MainWindow) -> None:
+    screen = _target_screen()
+    if screen is None:
+        _lock_to_screen_maximized(window, QGuiApplication.primaryScreen())
         return
 
-    target_screen = screens[1] if len(screens) > 1 else screens[0]
     handle = window.windowHandle()
     if handle is not None:
-        handle.setScreen(target_screen)
-
-    geometry = target_screen.availableGeometry()
-    width = max(1400, geometry.width() - 80)
-    height = max(840, geometry.height() - 80)
-    window.resize(width, height)
-    top_left = geometry.center() - window.rect().center()
-    window.move(top_left)
+        try:
+            handle.setScreen(screen)
+        except Exception:
+            pass
+    try:
+        window.move(screen.geometry().topLeft())
+    except Exception:
+        pass
+    _lock_to_screen_maximized(window, screen)
 
 
 def _bring_window_to_front(window: MainWindow) -> None:
@@ -53,7 +76,7 @@ def main() -> int:
         runtime_dir=base_dir,
     )
     window.show()
-    _place_window_on_second_screen(app, window)
+    _place_maximized_on_screen2(window)
     _bring_window_to_front(window)
     QTimer.singleShot(120, lambda: _bring_window_to_front(window))
     return app.exec()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import sys
 import unittest
 from contextlib import contextmanager
@@ -16,7 +17,13 @@ if str(RADAN_DIR) not in sys.path:
     sys.path.insert(0, str(RADAN_DIR))
 
 import rpd_io  # type: ignore[import-not-found]
+from flow_bridge import (
+    flow_kit_insight_for_explorer_kit,
+    map_explorer_kit_to_flow_kit,
+    parse_flow_probe_payload,
+)
 from models import (
+    canonicalize_client_numbers_by_truck,
     ExplorerSettings,
     build_hidden_kit_key,
     canonicalize_hidden_kit_entries,
@@ -24,7 +31,8 @@ from models import (
 )
 from services import (
     build_kit_paths,
-    copy_inventor_outputs_to_project,
+    build_kit_status,
+    collect_kit_statuses,
     create_kit_scaffold,
     detect_print_packet_pdf,
     detect_preview_pdf,
@@ -35,6 +43,8 @@ from services import (
     find_fabrication_truck_dir,
     is_hidden_kit,
     is_hidden_truck,
+    move_inventor_outputs_to_project,
+    sort_truck_numbers_by_fabrication_order,
 )
 
 TEST_TMP_ROOT = PROJECT_DIR / "_tmp_tests"
@@ -52,6 +62,58 @@ def workspace_tempdir() -> Path:
 
 
 class TruckNestExplorerServicesTests(unittest.TestCase):
+    def test_map_explorer_kit_to_flow_kit_uses_built_in_schedule_rollups(self) -> None:
+        self.assertEqual(map_explorer_kit_to_flow_kit("PAINT PACK"), "Body")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP HOUSE"), "Pumphouse")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP MOUNTS"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP COVERINGS"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP BRACKETS"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("OPERATIONAL PANELS"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("STEPS PACK"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("STEPS"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("STEP PACK"), "")
+
+    def test_flow_kit_insight_for_explorer_kit_uses_probe_payload_and_fails_safe(self) -> None:
+        gantt_png = b"fake-png"
+        truck_insight = parse_flow_probe_payload(
+            {
+                "available": True,
+                "truck_number": "F56139",
+                "summary_text": "Flow plan 2026-03-02 | Active flow kits 4",
+                "gantt_png_base64": base64.b64encode(gantt_png).decode("ascii"),
+                "kits": [
+                    {
+                        "flow_kit_name": "Body",
+                        "display_text": "Unreleased | Hold 0.6w",
+                        "tooltip_text": "Flow kit: Body",
+                        "status_key": "yellow",
+                        "pdf_link": r"docs\body.pdf",
+                    }
+                ],
+            }
+        )
+
+        body_insight = flow_kit_insight_for_explorer_kit("PAINT PACK", truck_insight)
+        self.assertEqual(body_insight.display_text, "Unreleased | Hold 0.6w")
+        self.assertEqual(body_insight.status_key, "yellow")
+        self.assertEqual(truck_insight.gantt_png_bytes, gantt_png)
+        self.assertEqual(
+            Path(body_insight.pdf_link),
+            (PROJECT_DIR.parent / "fabrication_flow_dashboard" / "docs" / "body.pdf").resolve(),
+        )
+
+        inactive_pump_insight = flow_kit_insight_for_explorer_kit("PUMP HOUSE", truck_insight)
+        self.assertEqual(inactive_pump_insight.display_text, "Inactive")
+        self.assertEqual(inactive_pump_insight.status_key, "missing")
+
+        untracked_pump_subkit = flow_kit_insight_for_explorer_kit("PUMP MOUNTS", truck_insight)
+        self.assertEqual(untracked_pump_subkit.display_text, "Not tracked")
+        self.assertEqual(untracked_pump_subkit.status_key, "missing")
+
+        untracked_insight = flow_kit_insight_for_explorer_kit("STEP PACK", truck_insight)
+        self.assertEqual(untracked_insight.display_text, "Not tracked")
+        self.assertEqual(untracked_insight.status_key, "missing")
+
     def test_build_kit_paths_matches_expected_layout(self) -> None:
         settings = ExplorerSettings(
             release_root=r"L:\BATTLESHIELD\F-LARGE FLEET",
@@ -68,6 +130,62 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             str(paths.fabrication_kit_dir),
             r"W:\LASER\For Battleshield Fabrication\F55334\PAINT PACK",
         )
+
+    def test_build_kit_paths_accepts_plural_pump_coverings_alias(self) -> None:
+        settings = ExplorerSettings(
+            release_root=r"L:\BATTLESHIELD\F-LARGE FLEET",
+            fabrication_root=r"W:\LASER\For Battleshield Fabrication",
+        )
+
+        paths = build_kit_paths("F55334", "PUMP COVERINGS", settings)
+
+        self.assertEqual(paths.kit_name, "PUMP COVERING")
+        self.assertEqual(
+            str(paths.fabrication_kit_dir),
+            r"W:\LASER\For Battleshield Fabrication\F55334\PUMP PACK\COVERING",
+        )
+
+    def test_build_kit_paths_accepts_step_aliases(self) -> None:
+        settings = ExplorerSettings(
+            release_root=r"L:\BATTLESHIELD\F-LARGE FLEET",
+            fabrication_root=r"W:\LASER\For Battleshield Fabrication",
+        )
+
+        steps_pack_paths = build_kit_paths("F55334", "STEPS PACK", settings)
+        steps_paths = build_kit_paths("F55334", "STEPS", settings)
+
+        self.assertEqual(steps_pack_paths.kit_name, "STEP PACK")
+        self.assertEqual(steps_paths.kit_name, "STEP PACK")
+        self.assertEqual(
+            str(steps_pack_paths.fabrication_kit_dir),
+            r"W:\LASER\For Battleshield Fabrication\F55334\STEP PACK",
+        )
+        self.assertEqual(
+            str(steps_paths.fabrication_kit_dir),
+            r"W:\LASER\For Battleshield Fabrication\F55334\STEP PACK",
+        )
+
+    def test_build_kit_paths_prefers_existing_plural_coverings_release_path(self) -> None:
+        with workspace_tempdir() as temp_dir:
+            release_root = temp_dir / "release"
+            fabrication_root = temp_dir / "fabrication"
+            legacy_project_dir = release_root / "F55985" / "PUMP COVERINGS" / "F55985 PUMP COVERINGS"
+            legacy_project_dir.mkdir(parents=True, exist_ok=True)
+            legacy_rpd_path = legacy_project_dir / "F55985 PUMP COVERINGS.rpd"
+            legacy_rpd_path.write_text("<Project />", encoding="utf-8")
+
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            paths = build_kit_paths("F55985", "PUMP COVERING", settings)
+
+            self.assertEqual(paths.kit_name, "PUMP COVERING")
+            self.assertEqual(paths.release_kit_dir, legacy_project_dir.parent)
+            self.assertEqual(paths.project_dir, legacy_project_dir)
+            self.assertEqual(paths.project_name, "F55985 PUMP COVERINGS")
+            self.assertEqual(paths.rpd_path, legacy_rpd_path)
 
     def test_build_kit_paths_supports_dashboard_alias_for_radan_name(self) -> None:
         settings = ExplorerSettings(
@@ -110,16 +228,65 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             r"W:\LASER\For Battleshield Fabrication\F55334\LASER\CONSOLE\PACK",
         )
 
+    def test_build_kit_paths_flattens_pump_subkit_on_l_but_maps_into_pump_pack_on_w(self) -> None:
+        settings = ExplorerSettings(
+            release_root=r"L:\BATTLESHIELD\F-LARGE FLEET",
+            fabrication_root=r"W:\LASER\For Battleshield Fabrication",
+            kit_templates=["PUMP BRACKETS => PUMP PACK\\BRACKETS"],
+        )
+
+        paths = build_kit_paths("F55334", "PUMP BRACKETS", settings)
+
+        self.assertEqual(
+            str(paths.release_kit_dir),
+            r"L:\BATTLESHIELD\F-LARGE FLEET\F55334\PUMP BRACKETS",
+        )
+        self.assertEqual(
+            str(paths.fabrication_kit_dir),
+            r"W:\LASER\For Battleshield Fabrication\F55334\PUMP PACK\BRACKETS",
+        )
+
+    def test_collect_kit_statuses_respects_configured_canonical_order(self) -> None:
+        settings = ExplorerSettings(
+            release_root=r"L:\BATTLESHIELD\F-LARGE FLEET",
+            fabrication_root=r"W:\LASER\For Battleshield Fabrication",
+            kit_templates=[
+                "PAINT PACK",
+                "PUMP HOUSE => PUMP PACK\\PUMP HOUSE",
+                "PUMP MOUNTS => PUMP PACK\\MOUNTS",
+                "STEP PACK",
+            ],
+        )
+
+        statuses = collect_kit_statuses("F55334", settings)
+
+        self.assertEqual(
+            [status.kit_name for status in statuses],
+            ["PAINT PACK", "PUMP HOUSE", "PUMP MOUNTS", "STEP PACK"],
+        )
+
     def test_create_kit_scaffold_clones_template_and_replaces_tokens(self) -> None:
         with workspace_tempdir() as temp_root:
-            template_path = temp_root / "blank_template.rpd"
+            template_root = temp_root / "Template"
+            template_root.mkdir(parents=True)
+            (template_root / "nests").mkdir()
+            (template_root / "remnants").mkdir()
+            template_path = template_root / "Template.rpd"
             template_path.write_text(
                 """<?xml version="1.0" encoding="utf-8"?>
-<Project xmlns="http://www.radan.com/ns/project">
-  <Name>BLANK_PROJECT</Name>
+<RadanProject xmlns="http://www.radan.com/ns/project">
+  <JobName>Template</JobName>
+  <OriginalName>Template.rpd</OriginalName>
   <Truck>BLANK_TRUCK</Truck>
+  <RadanSchedule>
+    <JobDetails>
+      <JobName>Template</JobName>
+      <NestFolder>C:\\Example\\Template\\nests</NestFolder>
+      <RemnantSaveFolder>C:\\Example\\Template\\remnants</RemnantSaveFolder>
+    </JobDetails>
+  </RadanSchedule>
   <Parts />
-</Project>
+</RadanProject>
 """,
                 encoding="utf-8",
             )
@@ -142,6 +309,11 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             content = result.paths.rpd_path.read_text(encoding="utf-8")
             self.assertIn("F55334 PAINT PACK", content)
             self.assertIn("F55334", content)
+            self.assertIn("F55334 PAINT PACK.rpd", content)
+            self.assertIn(str(result.paths.project_dir / "nests"), content)
+            self.assertIn(str(result.paths.project_dir / "remnants"), content)
+            self.assertTrue((result.paths.project_dir / "nests").exists())
+            self.assertTrue((result.paths.project_dir / "remnants").exists())
 
             _tree, parts, _debug = rpd_io.load_rpd(str(result.paths.rpd_path))
             self.assertEqual(parts, [])
@@ -156,6 +328,32 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertTrue(match.is_unique)
             self.assertEqual(match.chosen_path, source)
+
+    def test_build_kit_status_uses_files_in_w_folder_as_release_signal(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            empty_folder = fabrication_root / "F55334" / "PAINT PACK"
+            empty_folder.mkdir(parents=True)
+
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            empty_status = build_kit_status("F55334", "PAINT PACK", settings)
+            self.assertTrue(empty_status.fabrication_folder_exists)
+            self.assertFalse(empty_status.fabrication_has_files)
+            self.assertIn("Not released", empty_status.status_summary)
+            self.assertNotIn("Spreadsheet missing", empty_status.status_summary)
+
+            released_file = empty_folder / "TruckBom.xlsx"
+            released_file.write_text("bom", encoding="utf-8")
+
+            released_status = build_kit_status("F55334", "PAINT PACK", settings)
+            self.assertTrue(released_status.fabrication_has_files)
+            self.assertIn("Released", released_status.status_summary)
+            self.assertIn("Spreadsheet ready", released_status.status_summary)
 
     def test_detect_preview_pdf_finds_matching_nest_summary_on_l(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -217,7 +415,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(match.chosen_path, packet_pdf)
             self.assertEqual(tuple(path.name for path in match.candidates), (packet_pdf.name,))
 
-    def test_copy_inventor_outputs_to_project_places_files_in_l_project_folder(self) -> None:
+    def test_move_inventor_outputs_to_project_places_files_in_l_project_folder(self) -> None:
         with workspace_tempdir() as temp_root:
             w_folder = temp_root / "W" / "F55334" / "PAINT PACK"
             l_project = temp_root / "L" / "F55334" / "PAINT PACK" / "F55334 PAINT PACK"
@@ -231,14 +429,16 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             source_csv.write_text("csv", encoding="utf-8")
             source_report.write_text("report", encoding="utf-8")
 
-            outputs, copied = copy_inventor_outputs_to_project(spreadsheet, l_project)
+            outputs, moved = move_inventor_outputs_to_project(spreadsheet, l_project)
 
             self.assertEqual(
-                tuple(path.name for path in copied),
+                tuple(path.name for path in moved),
                 ("TruckBom_Radan.csv", "TruckBom_report.txt"),
             )
             self.assertTrue(outputs.target_csv_path.exists())
             self.assertTrue(outputs.target_report_path.exists())
+            self.assertFalse(source_csv.exists())
+            self.assertFalse(source_report.exists())
 
     def test_discover_trucks_uses_release_root_only(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -284,6 +484,16 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertTrue(is_hidden_truck("F55334", settings))
         self.assertFalse(is_hidden_truck("F55335", settings))
 
+    def test_sort_truck_numbers_uses_saved_fabrication_order(self) -> None:
+        settings = ExplorerSettings(truck_order=["F55335", "f55333", "bad-value"])
+
+        ordered = sort_truck_numbers_by_fabrication_order(
+            ["F55334", "F55333", "F55336", "F55335"],
+            settings,
+        )
+
+        self.assertEqual(ordered, ["F55335", "F55333", "F55334", "F55336"])
+
     def test_canonicalize_hidden_kits_maps_dashboard_alias_to_radan_name(self) -> None:
         hidden_kits = canonicalize_hidden_kit_entries(
             ["F55334::BODY", "F55334::PAINT PACK"],
@@ -308,6 +518,24 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             {
                 "PAINT PACK": "P01 = Paint pack vent",
                 "PUMPHOUSE": "P77 = Pump slot",
+            },
+        )
+
+    def test_canonicalize_client_numbers_by_truck_normalizes_keys(self) -> None:
+        client_numbers = canonicalize_client_numbers_by_truck(
+            {
+                "f55334": "12345",
+                "F55335": "  67890  ",
+                "bad-value": "ignore",
+                "F55336": "   ",
+            }
+        )
+
+        self.assertEqual(
+            client_numbers,
+            {
+                "F55334": "12345",
+                "F55335": "67890",
             },
         )
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import json
+import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -33,33 +37,58 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from flow_bridge import (
+    FlowTruckInsight,
+    empty_flow_truck_insight,
+    flow_kit_insight_for_explorer_kit,
+    load_flow_truck_insight,
+)
 from models import (
+    canonicalize_client_numbers_by_truck,
     canonicalize_hidden_kit_entries,
     ExplorerSettings,
+    InventorOutputPaths,
     KitStatus,
-    PdfMatch,
     build_hidden_kit_key,
     normalize_hidden_truck_entries,
-    normalize_kit_template_entries,
+    normalize_hidden_truck_number,
+    normalize_truck_order_entries,
 )
-from pdf_preview import PdfPreviewPane
 from services import (
     collect_kit_statuses,
     configured_kit_mappings,
-    copy_inventor_outputs_to_project,
     create_kit_scaffold,
     detect_print_packet_pdf,
     discover_trucks,
     filter_kit_statuses,
     filter_truck_numbers,
     find_fabrication_truck_dir,
+    inventor_output_paths,
     is_hidden_kit,
     is_hidden_truck,
+    launch_inventor_to_radan,
     launch_launcher,
+    move_inventor_outputs_to_project,
+    open_external_target,
     open_path,
-    run_inventor_to_radan,
+    sort_truck_numbers_by_fabrication_order,
 )
 from settings_store import load_settings, save_settings
+
+
+@dataclass
+class PendingInventorJob:
+    truck_number: str
+    kit_name: str
+    spreadsheet_path: Path
+    project_dir: Path
+    outputs: InventorOutputPaths
+    process: subprocess.Popen[object]
+    started_at_monotonic: float
+    first_output_seen_at_monotonic: float | None = None
+    last_output_signature: tuple[tuple[str, int, int], ...] | None = None
+    stable_polls: int = 0
+    launcher_exit_code: int | None = None
 
 
 class MultilineEditorDialog(QDialog):
@@ -88,16 +117,19 @@ class MultilineEditorDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    FLOW_GANTT_HEIGHT = 176
     TABLE_COLUMNS = (
         "Kit",
-        "L Folder",
-        "Project",
-        "RPD",
-        "W Folder",
-        "Spreadsheet",
-        "Import CSV",
-        "Summary",
+        "Project File",
+        "Nest Summary",
+        "Release",
+        "Flow",
+        "Punch Code",
     )
+    PROJECT_FILE_COLUMN = 1
+    NEST_SUMMARY_COLUMN = 2
+    FLOW_COLUMN = 4
+    PUNCH_CODE_COLUMN = 5
 
     def __init__(
         self,
@@ -125,19 +157,41 @@ class MainWindow(QMainWindow):
         self._hot_reload_cancel_button: QPushButton | None = None
         self._hot_reload_timer = None
         self._hot_reload_end_time: float | None = None
-        self._punch_codes_save_timer = QTimer(self)
-        self._punch_codes_save_timer.setSingleShot(True)
-        self._punch_codes_save_timer.timeout.connect(self._save_punch_codes_only)
-        self._active_punch_codes_kit_name = ""
-        self._punch_codes_dirty = False
-        self._punch_codes_loaded_from_legacy = False
+        self._updating_kit_table = False
+        self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
+        self._pending_inventor_job: PendingInventorJob | None = None
+        self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
+        self._flow_cache_by_truck: dict[str, FlowTruckInsight] = {}
+        self._flow_gantt_source_bytes: bytes | None = None
+        self._flow_gantt_source_pixmap: QPixmap | None = None
+        self._status_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_status_future: Future[list[KitStatus]] | None = None
+        self._pending_status_truck_number: str = ""
+        self._status_request_serial = 0
+        self._pending_status_request_serial = 0
+        self._flow_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_flow_future: Future[FlowTruckInsight] | None = None
+        self._pending_flow_truck_number: str = ""
+        self._flow_request_serial = 0
+        self._pending_flow_request_serial = 0
+        self._inventor_watch_timer = QTimer(self)
+        self._inventor_watch_timer.setInterval(1500)
+        self._inventor_watch_timer.timeout.connect(self._poll_pending_inventor_job)
+        self._status_watch_timer = QTimer(self)
+        self._status_watch_timer.setInterval(120)
+        self._status_watch_timer.timeout.connect(self._poll_pending_status_future)
+        self._flow_watch_timer = QTimer(self)
+        self._flow_watch_timer.setInterval(120)
+        self._flow_watch_timer.timeout.connect(self._poll_pending_flow_future)
 
         self._build_ui()
+        self._apply_dashboard_style()
         self._load_settings_into_form()
         self.refresh_trucks()
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("main_root")
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(10)
@@ -187,11 +241,135 @@ class MainWindow(QMainWindow):
             self._hot_reload_timer = self.startTimer(800)
             self._poll_hot_reload_request()
 
+    def _apply_dashboard_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget#main_root {
+                background-color: #EEF3F8;
+            }
+            QGroupBox {
+                background-color: #F8FAFC;
+                border: 1px solid #D5DEE7;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 10px;
+                color: #0F172A;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 0 4px;
+                background-color: #F8FAFC;
+                color: #0F172A;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QPushButton {
+                color: #0F172A;
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #F1F5F9;
+                border-color: #94A3B8;
+            }
+            QPushButton:pressed {
+                background-color: #E2E8F0;
+            }
+            QPushButton:checked {
+                background-color: #DBEAFE;
+                border-color: #60A5FA;
+            }
+            QPushButton:disabled {
+                color: #94A3B8;
+                background-color: #F8FAFC;
+                border-color: #E2E8F0;
+            }
+            QLineEdit, QPlainTextEdit {
+                color: #0F172A;
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 6px 8px;
+            }
+            QListWidget, QTableWidget {
+                background: #FFFFFF;
+                color: #0F172A;
+                alternate-background-color: #F8FAFC;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                gridline-color: #E2E8F0;
+                selection-background-color: #E2E8F0;
+                selection-color: #0F172A;
+            }
+            QListWidget::item:selected, QTableWidget::item:selected {
+                background: #E2E8F0;
+                color: #0F172A;
+            }
+            QTableWidget::item:hover, QListWidget::item:hover {
+                background: #EEF4FB;
+                color: #0F172A;
+            }
+            QHeaderView::section, QTableCornerButton::section {
+                background: #E2E8F0;
+                color: #334155;
+                border: 1px solid #CBD5E1;
+                padding: 6px;
+                font-weight: 700;
+            }
+            QLabel {
+                color: #334155;
+            }
+            QCheckBox {
+                color: #334155;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #94A3B8;
+                border-radius: 3px;
+                background: #FFFFFF;
+            }
+            QCheckBox::indicator:checked {
+                background: #93C5FD;
+                border-color: #60A5FA;
+            }
+            QSplitter::handle {
+                background: #E2E8F0;
+            }
+            QStatusBar {
+                background: #F8FAFC;
+                color: #475569;
+                border-top: 1px solid #D5DEE7;
+            }
+            QStatusBar::item {
+                border: none;
+            }
+            QScrollArea#flow_gantt_scroll {
+                background: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+            }
+            QLabel#flow_gantt_label {
+                background: #FFFFFF;
+            }
+            """
+        )
+
     def timerEvent(self, event):  # type: ignore[override]
         if self._hot_reload_timer is not None and event.timerId() == self._hot_reload_timer:
             self._poll_hot_reload_request()
             return
         super().timerEvent(event)
+
+    def resizeEvent(self, event):  # type: ignore[override]
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._rescale_flow_gantt_pixmap)
 
     def _build_left_panel(self) -> QWidget:
         box = QWidget()
@@ -206,8 +384,13 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_trucks)
         self.new_truck_button = QPushButton("Add Truck")
         self.new_truck_button.clicked.connect(self.create_new_truck)
+        self.show_hidden_trucks_button = QPushButton("Show Hidden (0)")
+        self.show_hidden_trucks_button.setCheckable(True)
+        self.show_hidden_trucks_button.setToolTip("Temporarily show trucks hidden from the active list.")
+        self.show_hidden_trucks_button.toggled.connect(self._apply_truck_filter)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.show_hidden_trucks_button)
         header.addWidget(self.refresh_button)
         header.addWidget(self.new_truck_button)
 
@@ -215,16 +398,31 @@ class MainWindow(QMainWindow):
         self.search_edit.setPlaceholderText("Filter trucks...")
         self.search_edit.textChanged.connect(self._apply_truck_filter)
 
-        self.show_hidden_trucks_checkbox = QCheckBox("Show hidden trucks")
-        self.show_hidden_trucks_checkbox.toggled.connect(self._apply_truck_filter)
+        truck_controls = QVBoxLayout()
+        truck_controls.setContentsMargins(0, 0, 0, 0)
+        truck_controls.setSpacing(6)
+        self.move_truck_up_button = QPushButton("↑")
+        self.move_truck_up_button.setToolTip("Move selected truck earlier in fabrication order")
+        self.move_truck_up_button.clicked.connect(lambda: self._move_selected_truck(-1))
+        self.move_truck_down_button = QPushButton("↓")
+        self.move_truck_down_button.setToolTip("Move selected truck later in fabrication order")
+        self.move_truck_down_button.clicked.connect(lambda: self._move_selected_truck(1))
+        truck_controls.addWidget(self.move_truck_up_button)
+        truck_controls.addWidget(self.move_truck_down_button)
+        truck_controls.addStretch(1)
 
         self.truck_list = QListWidget()
         self.truck_list.currentItemChanged.connect(self._on_truck_changed)
 
+        list_row = QHBoxLayout()
+        list_row.setContentsMargins(0, 0, 0, 0)
+        list_row.setSpacing(8)
+        list_row.addWidget(self.truck_list, 1)
+        list_row.addLayout(truck_controls)
+
         layout.addLayout(header)
         layout.addWidget(self.search_edit)
-        layout.addWidget(self.show_hidden_trucks_checkbox)
-        layout.addWidget(self.truck_list, 1)
+        layout.addLayout(list_row, 1)
         box.setMinimumWidth(320)
         return box
 
@@ -234,15 +432,29 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        layout.addWidget(self._build_settings_group())
-        layout.addWidget(self._build_actions_group())
+        main_column = QWidget()
+        main_layout = QVBoxLayout(main_column)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(10)
+        main_layout.addWidget(self._build_actions_group())
+        main_layout.addWidget(self._build_table_group(), 1)
 
-        workspace_splitter = QSplitter(Qt.Vertical)
-        workspace_splitter.addWidget(self._build_table_group())
-        workspace_splitter.addWidget(self._build_detail_panel())
-        workspace_splitter.setStretchFactor(0, 3)
-        workspace_splitter.setStretchFactor(1, 2)
-        layout.addWidget(workspace_splitter, 1)
+        sidebar_column = QWidget()
+        sidebar_column.setMinimumWidth(280)
+        sidebar_layout = QVBoxLayout(sidebar_column)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(10)
+        sidebar_layout.addWidget(self._build_reserved_group(), 1)
+
+        content_splitter = QSplitter(Qt.Horizontal)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.addWidget(main_column)
+        content_splitter.addWidget(sidebar_column)
+        content_splitter.setStretchFactor(0, 1)
+        content_splitter.setStretchFactor(1, 0)
+        content_splitter.setSizes([1180, 320])
+
+        layout.addWidget(content_splitter, 1)
         return box
 
     def _build_settings_group(self) -> QWidget:
@@ -252,7 +464,6 @@ class MainWindow(QMainWindow):
 
         self.release_root_edit = QLineEdit()
         self.fabrication_root_edit = QLineEdit()
-        self.rpd_template_edit = QLineEdit()
         self.radan_kitter_edit = QLineEdit()
         self.inventor_entry_edit = QLineEdit()
         self.create_support_folders_checkbox = QCheckBox("Create _bak / _out / _kits support folders")
@@ -261,14 +472,6 @@ class MainWindow(QMainWindow):
         browse_release.clicked.connect(lambda: self._pick_directory(self.release_root_edit))
         browse_fabrication = QPushButton("Browse")
         browse_fabrication.clicked.connect(lambda: self._pick_directory(self.fabrication_root_edit))
-        browse_template = QPushButton("Browse")
-        browse_template.clicked.connect(
-            lambda: self._pick_file(
-                self.rpd_template_edit,
-                "Select blank template RPD",
-                "RADAN Project (*.rpd);;All Files (*.*)",
-            )
-        )
         browse_kitter = QPushButton("Browse")
         browse_kitter.clicked.connect(
             lambda: self._pick_file(
@@ -281,20 +484,11 @@ class MainWindow(QMainWindow):
         browse_inventor.clicked.connect(
             lambda: self._pick_file(
                 self.inventor_entry_edit,
-                "Select inventor_to_radan entry",
-                "Python or Batch (*.py *.bat *.cmd);;All Files (*.*)",
+                "Select inventor_to_radan launcher",
+                "Batch or Python (*.bat *.cmd *.py);;All Files (*.*)",
             )
         )
 
-        self.template_summary_label = QLabel()
-        self.replacements_summary_label = QLabel()
-        self.template_summary_label.setWordWrap(True)
-        self.replacements_summary_label.setWordWrap(True)
-
-        edit_templates_button = QPushButton("Edit Kit Mappings")
-        edit_templates_button.clicked.connect(self.edit_kit_templates)
-        edit_rules_button = QPushButton("Edit Template Rules")
-        edit_rules_button.clicked.connect(self.edit_template_rules)
         save_button = QPushButton("Save Settings")
         save_button.clicked.connect(self.save_settings_from_form)
 
@@ -307,25 +501,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.fabrication_root_edit, row, 1)
         layout.addWidget(browse_fabrication, row, 2)
         row += 1
-        layout.addWidget(QLabel("Blank Template RPD"), row, 0)
-        layout.addWidget(self.rpd_template_edit, row, 1)
-        layout.addWidget(browse_template, row, 2)
-        row += 1
         layout.addWidget(QLabel("RADAN Kitter Launcher"), row, 0)
         layout.addWidget(self.radan_kitter_edit, row, 1)
         layout.addWidget(browse_kitter, row, 2)
         row += 1
-        layout.addWidget(QLabel("Inventor Entry"), row, 0)
+        layout.addWidget(QLabel("Inventor Launcher"), row, 0)
         layout.addWidget(self.inventor_entry_edit, row, 1)
         layout.addWidget(browse_inventor, row, 2)
         row += 1
         layout.addWidget(self.create_support_folders_checkbox, row, 0, 1, 3)
-        row += 1
-        layout.addWidget(self.template_summary_label, row, 0, 1, 2)
-        layout.addWidget(edit_templates_button, row, 2)
-        row += 1
-        layout.addWidget(self.replacements_summary_label, row, 0, 1, 2)
-        layout.addWidget(edit_rules_button, row, 2)
         row += 1
         layout.addWidget(save_button, row, 2)
 
@@ -337,50 +521,100 @@ class MainWindow(QMainWindow):
 
         self.current_truck_label = QLabel("Selected Truck: (none)")
         self.current_truck_label.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.current_flow_label = QLabel("Flow: (none)")
+        self.current_flow_label.setWordWrap(True)
+        self.current_flow_label.setStyleSheet("font-size: 12px; color: #475569;")
+        self.flow_gantt_label = QLabel()
+        self.flow_gantt_label.setObjectName("flow_gantt_label")
+        self.flow_gantt_label.setAlignment(Qt.AlignCenter)
+        self.flow_gantt_scroll = QScrollArea()
+        self.flow_gantt_scroll.setObjectName("flow_gantt_scroll")
+        self.flow_gantt_scroll.setWidget(self.flow_gantt_label)
+        self.flow_gantt_scroll.setWidgetResizable(True)
+        self.flow_gantt_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.flow_gantt_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.flow_gantt_scroll.setFixedHeight(self.FLOW_GANTT_HEIGHT)
+        self.flow_gantt_scroll.setVisible(False)
+        actions_helper_label = QLabel("Hover a button for details.")
+        actions_helper_label.setStyleSheet("color: #6C757D;")
 
         truck_row = QHBoxLayout()
-        self.create_missing_button = QPushButton("Create Missing Kits")
+        self.create_missing_button = QPushButton("Create Missing")
+        self.create_missing_button.setToolTip(
+            "Create any missing L-side kit folders and project files for every canonical kit on the selected truck."
+        )
         self.create_missing_button.clicked.connect(self.create_missing_kits_for_selected_truck)
-        self.create_selected_button = QPushButton("Create / Repair Selected")
+        self.create_selected_button = QPushButton("Repair Selected")
+        self.create_selected_button.setToolTip(
+            "Create or repair the L-side folders and project files for the selected kit rows only."
+        )
         self.create_selected_button.clicked.connect(self.create_selected_kits)
-        self.open_truck_release_button = QPushButton("Open Truck Release")
+        self.open_truck_release_button = QPushButton("Open L Truck")
+        self.open_truck_release_button.setToolTip("Open the selected truck folder on L.")
         self.open_truck_release_button.clicked.connect(self.open_selected_truck_release)
-        self.open_truck_fabrication_button = QPushButton("Open Truck W Folder")
+        self.open_truck_fabrication_button = QPushButton("Open W Truck")
+        self.open_truck_fabrication_button.setToolTip("Open the selected truck folder on W.")
         self.open_truck_fabrication_button.clicked.connect(self.open_selected_truck_fabrication)
+        self.edit_truck_client_button = QPushButton("Client")
+        self.edit_truck_client_button.setToolTip("Store or update the client number for the selected truck.")
+        self.edit_truck_client_button.clicked.connect(self.edit_current_truck_client_number)
         self.toggle_truck_hidden_button = QPushButton("Hide Truck")
+        self.toggle_truck_hidden_button.setToolTip(
+            "Hide or unhide the selected truck in the explorer without deleting anything."
+        )
         self.toggle_truck_hidden_button.clicked.connect(self.toggle_current_truck_hidden)
         truck_row.addWidget(self.create_missing_button)
         truck_row.addWidget(self.create_selected_button)
         truck_row.addWidget(self.open_truck_release_button)
         truck_row.addWidget(self.open_truck_fabrication_button)
+        truck_row.addWidget(self.edit_truck_client_button)
         truck_row.addWidget(self.toggle_truck_hidden_button)
         truck_row.addStretch(1)
 
         kit_row = QHBoxLayout()
-        self.open_rpd_button = QPushButton("Open RPD")
+        self.open_rpd_button = QPushButton("Open Project")
+        self.open_rpd_button.setToolTip("Open the selected kit project file on L.")
         self.open_rpd_button.clicked.connect(self.open_selected_rpd)
-        self.open_release_folder_button = QPushButton("Open Release Folder")
+        self.open_release_folder_button = QPushButton("Open L Kit")
+        self.open_release_folder_button.setToolTip("Open the selected kit folder on L.")
         self.open_release_folder_button.clicked.connect(self.open_selected_release_folder)
-        self.open_fabrication_folder_button = QPushButton("Open W Folder")
+        self.open_fabrication_folder_button = QPushButton("Open W Kit")
+        self.open_fabrication_folder_button.setToolTip("Open the selected kit source folder on W.")
         self.open_fabrication_folder_button.clicked.connect(self.open_selected_fabrication_folder)
-        self.open_spreadsheet_button = QPushButton("Open Spreadsheet")
+        self.open_spreadsheet_button = QPushButton("BOM")
+        self.open_spreadsheet_button.setToolTip("Open the single spreadsheet found for the selected kit on W.")
         self.open_spreadsheet_button.clicked.connect(self.open_selected_spreadsheet)
-        self.open_import_csv_button = QPushButton("Open Import CSV")
-        self.open_import_csv_button.clicked.connect(self.open_selected_import_csv)
+        self.open_flow_pdf_button = QPushButton("Flow PDF")
+        self.open_flow_pdf_button.setToolTip(
+            "Open the linked PDF for the selected mapped flow kit from the fabrication flow dashboard."
+        )
+        self.open_flow_pdf_button.clicked.connect(self.open_selected_flow_pdf)
+        self.open_nest_summary_button = QPushButton("Open Nest Summary")
+        self.open_nest_summary_button.setToolTip("Open the selected kit Nest Summary PDF on L.")
+        self.open_nest_summary_button.clicked.connect(self.open_selected_nest_summary)
         self.open_print_packet_button = QPushButton("Open Print Packet")
+        self.open_print_packet_button.setToolTip("Open the selected kit Print Packet PDF on L.")
         self.open_print_packet_button.clicked.connect(self.open_selected_print_packet)
-        self.launch_kitter_button = QPushButton("Launch RADAN Kitter")
+        self.launch_kitter_button = QPushButton("Run Kitter")
+        self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
-        self.launch_inventor_button = QPushButton("Run Inventor -> Radan -> Copy to L")
+        self.launch_inventor_button = QPushButton("Run Inventor Tool")
+        self.launch_inventor_button.setToolTip(
+            "Run the Inventor-to-RADAN launcher on the selected spreadsheet, then move the generated output into the matching L project folder."
+        )
         self.launch_inventor_button.clicked.connect(self.run_selected_inventor_flow)
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
+        self.toggle_selected_kits_hidden_button.setToolTip(
+            "Hide or unhide the selected kits in the explorer without deleting anything."
+        )
         self.toggle_selected_kits_hidden_button.clicked.connect(self.toggle_selected_kits_hidden)
         for button in (
             self.open_rpd_button,
             self.open_release_folder_button,
             self.open_fabrication_folder_button,
             self.open_spreadsheet_button,
-            self.open_import_csv_button,
+            self.open_flow_pdf_button,
+            self.open_nest_summary_button,
             self.open_print_packet_button,
             self.launch_kitter_button,
             self.launch_inventor_button,
@@ -390,6 +624,9 @@ class MainWindow(QMainWindow):
         kit_row.addStretch(1)
 
         layout.addWidget(self.current_truck_label)
+        layout.addWidget(self.current_flow_label)
+        layout.addWidget(self.flow_gantt_scroll)
+        layout.addWidget(actions_helper_label)
         layout.addLayout(truck_row)
         layout.addLayout(kit_row)
         return group
@@ -407,106 +644,62 @@ class MainWindow(QMainWindow):
         self.kit_table = QTableWidget(0, len(self.TABLE_COLUMNS))
         self.kit_table.setHorizontalHeaderLabels(self.TABLE_COLUMNS)
         self.kit_table.setAlternatingRowColors(True)
+        self.kit_table.setWordWrap(False)
         self.kit_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.kit_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.kit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.kit_table.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.EditKeyPressed
+            | QAbstractItemView.SelectedClicked
+        )
         self.kit_table.itemSelectionChanged.connect(self._on_kit_selection_changed)
+        self.kit_table.itemClicked.connect(self._on_kit_table_item_clicked)
+        self.kit_table.itemChanged.connect(self._on_kit_table_item_changed)
+        self.kit_table.itemDoubleClicked.connect(self._on_kit_table_item_double_clicked)
         self.kit_table.verticalHeader().setVisible(False)
+        self.kit_table.verticalHeader().setDefaultSectionSize(26)
+        self.kit_table.verticalHeader().setMinimumSectionSize(22)
         header = self.kit_table.horizontalHeader()
-        for column in range(len(self.TABLE_COLUMNS) - 1):
+        for column in range(len(self.TABLE_COLUMNS)):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(len(self.TABLE_COLUMNS) - 1, QHeaderView.Stretch)
+        header.setSectionResizeMode(self.PUNCH_CODE_COLUMN, QHeaderView.Stretch)
 
         layout.addLayout(controls)
         layout.addWidget(self.kit_table)
         return group
 
-    def _build_detail_panel(self) -> QWidget:
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_preview_group())
-        splitter.addWidget(self._build_punch_codes_group())
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 1)
-        return splitter
-
-    def _build_preview_group(self) -> QWidget:
-        group = QGroupBox("Nest Summary")
+    def _build_reserved_group(self) -> QWidget:
+        group = QGroupBox("Reserved")
         layout = QVBoxLayout(group)
-        self.pdf_preview = PdfPreviewPane(open_path_cb=self._open_path_with_message)
-        layout.addWidget(self.pdf_preview)
-        return group
+        layout.setContentsMargins(10, 10, 10, 10)
 
-    def _build_punch_codes_group(self) -> QWidget:
-        group = QGroupBox("Punch Codes")
-        layout = QVBoxLayout(group)
+        reserved_label = QLabel("Reserved for a future detail pane.")
+        reserved_label.setAlignment(Qt.AlignCenter)
+        reserved_label.setStyleSheet("color: #94A3B8;")
 
-        self.punch_codes_kit_label = QLabel("Selected kit: (none)")
-        self.punch_codes_kit_label.setStyleSheet("font-size: 14px; font-weight: 700;")
-
-        helper = QLabel(
-            "Store punch-code notes for the selected kit here. Notes are saved per kit."
-        )
-        helper.setWordWrap(True)
-
-        self.punch_codes_edit = QPlainTextEdit()
-        self.punch_codes_edit.setPlaceholderText(
-            "Select a kit to view or edit its punch codes."
-        )
-        self.punch_codes_edit.setEnabled(False)
-        self.punch_codes_edit.textChanged.connect(self._on_punch_codes_changed)
-
-        controls = QHBoxLayout()
-        self.punch_codes_status_label = QLabel("No kit selected")
-        save_button = QPushButton("Save Kit Punch Codes")
-        save_button.clicked.connect(self._save_punch_codes_only)
-        controls.addWidget(self.punch_codes_status_label)
-        controls.addStretch(1)
-        controls.addWidget(save_button)
-
-        layout.addWidget(self.punch_codes_kit_label)
-        layout.addWidget(helper)
-        layout.addWidget(self.punch_codes_edit, 1)
-        layout.addLayout(controls)
+        layout.addStretch(1)
+        layout.addWidget(reserved_label)
+        layout.addStretch(1)
+        group.setMinimumHeight(120)
         return group
 
     def _load_settings_into_form(self) -> None:
-        self.release_root_edit.setText(self.settings.release_root)
-        self.fabrication_root_edit.setText(self.settings.fabrication_root)
-        self.rpd_template_edit.setText(self.settings.rpd_template_path)
-        self.radan_kitter_edit.setText(self.settings.radan_kitter_launcher)
-        self.inventor_entry_edit.setText(self.settings.inventor_to_radan_entry)
-        self.create_support_folders_checkbox.setChecked(self.settings.create_support_folders)
-        self._refresh_settings_summaries()
-        self._load_punch_codes_for_status(None)
-
-    def _refresh_settings_summaries(self) -> None:
-        kit_count = len(configured_kit_mappings(self.settings))
-        self.template_summary_label.setText(f"Kit mappings loaded: {kit_count}")
-        rule_count = len(
-            [
-                line
-                for line in self.settings.template_replacements_text.splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ]
-        )
-        self.replacements_summary_label.setText(
-            "Template replacement rules: "
-            f"{rule_count} "
-            "(placeholders: {truck_number}, {kit_name}, {project_name}, {rpd_stem})"
-        )
+        return
 
     def _settings_from_form(self) -> ExplorerSettings:
         return ExplorerSettings(
-            release_root=self.release_root_edit.text().strip(),
-            fabrication_root=self.fabrication_root_edit.text().strip(),
-            radan_kitter_launcher=self.radan_kitter_edit.text().strip(),
-            inventor_to_radan_entry=self.inventor_entry_edit.text().strip(),
-            rpd_template_path=self.rpd_template_edit.text().strip(),
+            release_root=self.settings.release_root,
+            fabrication_root=self.settings.fabrication_root,
+            radan_kitter_launcher=self.settings.radan_kitter_launcher,
+            inventor_to_radan_entry=self.settings.inventor_to_radan_entry,
+            rpd_template_path=self.settings.rpd_template_path,
             template_replacements_text=self.settings.template_replacements_text,
             punch_codes_text=self.settings.punch_codes_text,
-            punch_codes_by_kit=self._current_punch_codes_map(),
-            create_support_folders=self.create_support_folders_checkbox.isChecked(),
+            punch_codes_by_kit=dict(self.settings.punch_codes_by_kit),
+            client_numbers_by_truck=dict(self.settings.client_numbers_by_truck),
+            create_support_folders=self.settings.create_support_folders,
             kit_templates=list(self.settings.kit_templates),
+            truck_order=list(self.settings.truck_order),
             hidden_trucks=list(self.settings.hidden_trucks),
             hidden_kits=list(self.settings.hidden_kits),
         )
@@ -514,28 +707,8 @@ class MainWindow(QMainWindow):
     def save_settings_from_form(self) -> None:
         self.settings = self._settings_from_form()
         save_path = save_settings(self.settings)
-        self._refresh_settings_summaries()
         self.log(f"Saved settings to {save_path}")
         self.refresh_trucks()
-
-    def edit_kit_templates(self) -> None:
-        dialog = MultilineEditorDialog(
-            title="Edit Kit Mappings",
-            value="\n".join(self.settings.kit_templates),
-            helper_text=(
-                "Enter one L-side kit mapping per line.\n"
-                "Use `DASHBOARD NAME | RADAN NAME` when you want a friendlier label in the UI.\n"
-                "Add `=> W\\nested\\relative\\path` when the W-side folder is nested.\n"
-                "Examples:\n"
-                "BODY | PAINT PACK\n"
-                "CONSOLE PACK => LASER\\CONSOLE\\PACK"
-            ),
-            parent=self,
-        )
-        if dialog.exec() != QDialog.Accepted:
-            return
-        self.settings.kit_templates = normalize_kit_template_entries(dialog.value().splitlines())
-        self.save_settings_from_form()
 
     def edit_template_rules(self) -> None:
         dialog = MultilineEditorDialog(
@@ -569,14 +742,22 @@ class MainWindow(QMainWindow):
 
     def refresh_trucks(self) -> None:
         current = self.current_truck_number()
-        self.settings = self._settings_from_form()
-        self._all_trucks = discover_trucks(self.settings)
+        self._status_cache_by_truck.clear()
+        self._flow_cache_by_truck.clear()
+        self._all_trucks = sort_truck_numbers_by_fabrication_order(
+            discover_trucks(self.settings),
+            self.settings,
+        )
+        release_root = Path(self.settings.release_root)
+        if not release_root.exists():
+            self.log(f"Release root not found: {release_root}")
         self._apply_truck_filter()
         if current and self._select_truck(current):
             return
         if self.truck_list.count():
             self.truck_list.setCurrentRow(0)
         else:
+            self._current_flow_truck_insight = empty_flow_truck_insight()
             self._set_current_statuses([])
 
     def _apply_truck_filter(self) -> None:
@@ -586,20 +767,28 @@ class MainWindow(QMainWindow):
         visible_trucks = filter_truck_numbers(
             self._all_trucks,
             self.settings,
-            show_hidden=self.show_hidden_trucks_checkbox.isChecked(),
+            show_hidden=self.show_hidden_trucks_button.isChecked(),
         )
         hidden_foreground = QColor("#6C757D")
         for truck_number in visible_trucks:
-            if wanted and wanted not in truck_number.casefold():
+            client_number = self._client_number_for_truck(truck_number)
+            if wanted and wanted not in truck_number.casefold() and wanted not in client_number.casefold():
                 continue
             item = QListWidgetItem(truck_number)
+            tooltip_parts: list[str] = []
+            if client_number:
+                tooltip_parts.append(f"Client: {client_number}")
             if is_hidden_truck(truck_number, self.settings):
                 item.setForeground(hidden_foreground)
-                item.setToolTip("Hidden truck")
+                tooltip_parts.append("Hidden truck")
+            if tooltip_parts:
+                item.setToolTip("\n".join(tooltip_parts))
             self.truck_list.addItem(item)
+        self._refresh_show_hidden_trucks_button()
         if current and not self._select_truck(current) and self.truck_list.count():
             self.truck_list.setCurrentRow(0)
         self._refresh_hidden_action_labels()
+        self._refresh_truck_order_buttons()
 
     def _select_truck(self, truck_number: str) -> bool:
         for row in range(self.truck_list.count()):
@@ -614,22 +803,115 @@ class MainWindow(QMainWindow):
         return item.text().strip() if item else ""
 
     def _on_truck_changed(self) -> None:
-        self._save_punch_codes_only()
         truck_number = self.current_truck_number()
-        self.current_truck_label.setText(
-            f"Selected Truck: {truck_number if truck_number else '(none)'}"
-        )
+        self._refresh_current_truck_heading()
+        self._refresh_truck_order_buttons()
         if not truck_number:
+            self._current_flow_truck_insight = empty_flow_truck_insight()
             self._set_current_statuses([])
             return
-        self._set_current_statuses(collect_kit_statuses(truck_number, self.settings))
+        cached_statuses = self._status_cache_by_truck.get(truck_number.casefold())
+        if cached_statuses is not None:
+            self._set_current_statuses(list(cached_statuses))
+        else:
+            self._set_current_statuses([], cache=False)
+            self.log(f"Loading kit statuses for {truck_number}...")
+            self._status_request_serial += 1
+            self._pending_status_request_serial = self._status_request_serial
+            self._pending_status_truck_number = truck_number
+            self._pending_status_future = self._status_executor.submit(collect_kit_statuses, truck_number, self.settings)
+            self._status_watch_timer.start()
 
-    def _set_current_statuses(self, statuses: list[KitStatus]) -> None:
+        cached_flow = self._flow_cache_by_truck.get(truck_number.casefold())
+        if cached_flow is not None:
+            self._current_flow_truck_insight = cached_flow
+            self._refresh_current_truck_heading()
+            return
+
+        self._current_flow_truck_insight = FlowTruckInsight(
+            available=False,
+            truck_number=truck_number,
+            summary_text="Flow: loading...",
+            issue="loading",
+            tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
+        )
+        self._refresh_current_truck_heading()
+        self._flow_request_serial += 1
+        self._pending_flow_request_serial = self._flow_request_serial
+        self._pending_flow_truck_number = truck_number
+        self._pending_flow_future = self._flow_executor.submit(load_flow_truck_insight, truck_number)
+        self._flow_watch_timer.start()
+
+    def _set_current_statuses(self, statuses: list[KitStatus], *, cache: bool = True) -> None:
         self._all_statuses = list(statuses)
+        truck_number = self.current_truck_number()
+        if cache and truck_number:
+            self._status_cache_by_truck[truck_number.casefold()] = list(statuses)
+        self._render_current_statuses()
+
+    def _poll_pending_status_future(self) -> None:
+        future = self._pending_status_future
+        if future is None:
+            self._status_watch_timer.stop()
+            return
+        if not future.done():
+            return
+
+        truck_number = self._pending_status_truck_number
+        request_serial = self._pending_status_request_serial
+        self._pending_status_future = None
+        self._pending_status_truck_number = ""
+        self._status_watch_timer.stop()
+
+        try:
+            statuses = future.result()
+        except Exception as exc:
+            self.log(f"Could not load kit statuses for {truck_number}: {exc}")
+            statuses = []
+
+        if truck_number:
+            self._status_cache_by_truck[truck_number.casefold()] = list(statuses)
+        if request_serial != self._status_request_serial:
+            return
+        if truck_number.casefold() != self.current_truck_number().casefold():
+            return
+        self._set_current_statuses(list(statuses))
+
+    def _poll_pending_flow_future(self) -> None:
+        future = self._pending_flow_future
+        if future is None:
+            self._flow_watch_timer.stop()
+            return
+        if not future.done():
+            return
+
+        truck_number = self._pending_flow_truck_number
+        request_serial = self._pending_flow_request_serial
+        self._pending_flow_future = None
+        self._pending_flow_truck_number = ""
+        self._flow_watch_timer.stop()
+        try:
+            insight = future.result()
+        except Exception as exc:
+            insight = FlowTruckInsight(
+                available=False,
+                truck_number=truck_number,
+                summary_text="Flow: unavailable.",
+                issue="load_failed",
+                tooltip_text=str(exc),
+            )
+
+        if truck_number:
+            self._flow_cache_by_truck[truck_number.casefold()] = insight
+        if request_serial != self._flow_request_serial:
+            return
+        if truck_number.casefold() != self.current_truck_number().casefold():
+            return
+        self._current_flow_truck_insight = insight
+        self._refresh_current_truck_heading()
         self._render_current_statuses()
 
     def _render_current_statuses(self) -> None:
-        self._save_punch_codes_only()
         previous_kit_name = self._current_status().kit_name if self._current_status() is not None else ""
         visible_statuses = filter_kit_statuses(
             self._all_statuses,
@@ -637,9 +919,13 @@ class MainWindow(QMainWindow):
             show_hidden=self.show_hidden_kits_checkbox.isChecked(),
         )
         self._current_statuses = visible_statuses
+        self._updating_kit_table = True
         self.kit_table.setRowCount(len(visible_statuses))
-        for row, status in enumerate(visible_statuses):
-            self._populate_status_row(row, status)
+        try:
+            for row, status in enumerate(visible_statuses):
+                self._populate_status_row(row, status)
+        finally:
+            self._updating_kit_table = False
 
         selected_row = -1
         if previous_kit_name:
@@ -653,111 +939,12 @@ class MainWindow(QMainWindow):
             self.kit_table.selectRow(0)
         else:
             self.kit_table.setRowCount(0)
-        self._sync_detail_panels()
+        for row in range(len(visible_statuses)):
+            self.kit_table.setRowHeight(row, 26)
         self._refresh_hidden_action_labels()
 
     def _on_kit_selection_changed(self) -> None:
-        self._save_punch_codes_only()
-        self._sync_detail_panels()
         self._refresh_hidden_action_labels()
-
-    def _sync_detail_panels(self) -> None:
-        status = self._current_status()
-        if status is None:
-            self.pdf_preview.set_pdf_match(self._empty_preview_match())
-            self._load_punch_codes_for_status(None)
-            return
-        self.pdf_preview.set_pdf_match(status.preview_pdf_match)
-        self._load_punch_codes_for_status(status)
-
-    def _empty_preview_match(self) -> PdfMatch:
-        return PdfMatch(chosen_path=None, candidates=(), issue="no_selection")
-
-    def _on_punch_codes_changed(self) -> None:
-        if not self._active_punch_codes_kit_name:
-            return
-        self._punch_codes_dirty = True
-        self._set_punch_codes_status("Saving...")
-        self._punch_codes_save_timer.start(700)
-
-    def _save_punch_codes_only(self) -> None:
-        if not self._active_punch_codes_kit_name:
-            return
-        self._punch_codes_save_timer.stop()
-        self.settings = self._settings_from_form()
-        save_settings(self.settings)
-        if self._punch_codes_loaded_from_legacy and not self._punch_codes_dirty:
-            self._set_punch_codes_status("Using legacy shared note")
-            return
-        self._punch_codes_loaded_from_legacy = False
-        self._punch_codes_dirty = False
-        if self._active_punch_codes_kit_name in self.settings.punch_codes_by_kit:
-            self._set_punch_codes_status(f"Saved {time.strftime('%H:%M:%S')}")
-        else:
-            self._set_punch_codes_status("No note for this kit")
-
-    def _set_punch_codes_status(self, text: str) -> None:
-        self.punch_codes_status_label.setText(text)
-
-    def _current_punch_codes_map(self) -> dict[str, str]:
-        punch_codes_by_kit = dict(self.settings.punch_codes_by_kit)
-        active_key = self._active_punch_codes_kit_name.strip()
-        if not active_key:
-            return punch_codes_by_kit
-        if self._punch_codes_loaded_from_legacy and not self._punch_codes_dirty:
-            return punch_codes_by_kit
-
-        text = self.punch_codes_edit.toPlainText()
-        if text.strip():
-            punch_codes_by_kit[active_key] = text
-        else:
-            punch_codes_by_kit.pop(active_key, None)
-        return punch_codes_by_kit
-
-    def _load_punch_codes_for_status(self, status: KitStatus | None) -> None:
-        self._punch_codes_save_timer.stop()
-        self.punch_codes_edit.blockSignals(True)
-        try:
-            if status is None:
-                self._active_punch_codes_kit_name = ""
-                self._punch_codes_dirty = False
-                self._punch_codes_loaded_from_legacy = False
-                self.punch_codes_kit_label.setText("Selected kit: (none)")
-                self.punch_codes_edit.clear()
-                self.punch_codes_edit.setEnabled(False)
-                self.punch_codes_edit.setPlaceholderText("Select a kit to view or edit its punch codes.")
-                self._set_punch_codes_status("No kit selected")
-                return
-
-            display_name = status.paths.display_name
-            kit_name = status.paths.kit_name
-            label_text = f"Selected kit: {display_name}"
-            if display_name.casefold() != kit_name.casefold():
-                label_text += f" (RADAN: {kit_name})"
-            self.punch_codes_kit_label.setText(label_text)
-            self.punch_codes_edit.setEnabled(True)
-            self.punch_codes_edit.setPlaceholderText(
-                f"Example for {display_name}:\nP01 = Roof vent pattern\nP02 = Pump panel slots\n..."
-            )
-
-            note_text = self.settings.punch_codes_by_kit.get(kit_name, "")
-            using_legacy = False
-            if not note_text and self.settings.punch_codes_text.strip():
-                note_text = self.settings.punch_codes_text
-                using_legacy = True
-
-            self._active_punch_codes_kit_name = kit_name
-            self._punch_codes_dirty = False
-            self._punch_codes_loaded_from_legacy = using_legacy
-            self.punch_codes_edit.setPlainText(note_text)
-            if using_legacy:
-                self._set_punch_codes_status("Using legacy shared note")
-            elif note_text.strip():
-                self._set_punch_codes_status("Saved")
-            else:
-                self._set_punch_codes_status("No note for this kit")
-        finally:
-            self.punch_codes_edit.blockSignals(False)
 
     def _make_item(
         self,
@@ -767,75 +954,158 @@ class MainWindow(QMainWindow):
         foreground: QColor | None = None,
     ) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         if background is not None:
             item.setBackground(background)
         if foreground is not None:
             item.setForeground(foreground)
         return item
 
+    def _make_open_link_item(
+        self,
+        *,
+        exists: bool,
+        tooltip: str,
+        background: QColor,
+        hidden_foreground: QColor | None,
+    ) -> QTableWidgetItem:
+        link_foreground = hidden_foreground if hidden_foreground is not None else QColor("#0F172A")
+        item = self._make_item(
+            "Open" if exists else "",
+            background=background,
+            foreground=link_foreground,
+        )
+        if tooltip:
+            item.setToolTip(tooltip)
+        return item
+
+    def _punch_code_text_for_kit(self, kit_name: str) -> str:
+        return str(self.settings.punch_codes_by_kit.get(kit_name) or "")
+
+    def _on_kit_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_kit_table or item.column() != self.PUNCH_CODE_COLUMN:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self._current_statuses):
+            return
+        kit_name = self._current_statuses[row].kit_name
+        text = item.text().strip()
+        updated = dict(self.settings.punch_codes_by_kit)
+        if text:
+            updated[kit_name] = text
+        else:
+            updated.pop(kit_name, None)
+        self.settings.punch_codes_by_kit = updated
+        save_settings(self.settings)
+        self.log(f"Saved punch code for {self._current_statuses[row].paths.display_name}.")
+
+    def _on_kit_table_item_clicked(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        if row < 0 or row >= len(self._current_statuses):
+            return
+        status = self._current_statuses[row]
+        if item.column() == self.PROJECT_FILE_COLUMN:
+            if status.rpd_exists and status.paths.rpd_path is not None:
+                self._open_rpd_for_status(status)
+            return
+        if item.column() == self.NEST_SUMMARY_COLUMN:
+            if status.preview_pdf_match.chosen_path is not None:
+                self._open_nest_summary_for_status(status)
+
+    def _on_kit_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        if row < 0 or row >= len(self._current_statuses):
+            return
+        status = self._current_statuses[row]
+        if item.column() == self.PROJECT_FILE_COLUMN:
+            if status.rpd_exists and status.paths.rpd_path is not None:
+                self._open_rpd_for_status(status)
+            return
+        if item.column() == self.NEST_SUMMARY_COLUMN:
+            if status.preview_pdf_match.chosen_path is not None:
+                self._open_nest_summary_for_status(status)
+
     def _populate_status_row(self, row: int, status: KitStatus) -> None:
         green = QColor("#D8F3DC")
         yellow = QColor("#FFF3BF")
         red = QColor("#F8D7DA")
+        blue = QColor("#D6E4FF")
+        neutral = QColor("#E9ECEF")
         muted = QColor("#6C757D")
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
         hidden_foreground = muted if hidden else None
 
-        spreadsheet_text = "(missing)"
-        spreadsheet_color = red
-        if status.spreadsheet_match.is_unique and status.spreadsheet_match.chosen_path is not None:
-            spreadsheet_text = status.spreadsheet_match.chosen_path.name
-            spreadsheet_color = green
-        elif status.spreadsheet_match.candidates:
-            spreadsheet_text = ", ".join(path.name for path in status.spreadsheet_match.candidates)
-            spreadsheet_color = yellow
+        release_text = "W missing"
+        release_color = red
+        if status.fabrication_has_files:
+            release_text = "Released"
+            release_color = green
+        elif status.fabrication_folder_exists:
+            release_text = "Not released"
+            release_color = yellow
 
-        import_csv_text = "(not generated)"
-        import_csv_color = red
-        if (
-            status.inventor_outputs is not None
-            and status.inventor_outputs.target_csv_path is not None
-            and status.inventor_outputs.target_csv_path.exists()
-        ):
-            import_csv_text = status.inventor_outputs.target_csv_path.name
-            import_csv_color = green
-        elif status.inventor_outputs is not None and status.inventor_outputs.target_csv_path is not None:
-            import_csv_text = status.inventor_outputs.target_csv_path.name
-            import_csv_color = yellow
+        nest_summary_color = red
+        if status.preview_pdf_match.chosen_path is not None:
+            nest_summary_color = green if len(status.preview_pdf_match.candidates) == 1 else yellow
+        elif status.preview_pdf_match.candidates:
+            nest_summary_color = yellow
+
+        punch_code_item = self._make_item(
+            self._punch_code_text_for_kit(status.kit_name),
+            foreground=hidden_foreground,
+        )
+        punch_code_item.setFlags(punch_code_item.flags() | Qt.ItemFlag.ItemIsEditable)
+        punch_code_item.setToolTip("Double-click to edit punch code notes for this kit.")
+
+        project_file_item = self._make_open_link_item(
+            exists=bool(status.rpd_exists and status.paths.rpd_path is not None),
+            tooltip=(
+                f"Click to open project file:\n{status.paths.rpd_path}"
+                if status.rpd_exists and status.paths.rpd_path is not None
+                else "No project file found on L for this kit."
+            ),
+            background=green if status.rpd_exists else red,
+            hidden_foreground=hidden_foreground,
+        )
+        nest_summary_item = self._make_open_link_item(
+            exists=status.preview_pdf_match.chosen_path is not None,
+            tooltip=(
+                f"Click to open Nest Summary:\n{status.preview_pdf_match.chosen_path}"
+                if status.preview_pdf_match.chosen_path is not None
+                else "No Nest Summary PDF found on L for this kit."
+            ),
+            background=nest_summary_color,
+            hidden_foreground=hidden_foreground,
+        )
+
+        flow_insight = flow_kit_insight_for_explorer_kit(status.kit_name, self._current_flow_truck_insight)
+        flow_background = neutral
+        if flow_insight.status_key == "red":
+            flow_background = red
+        elif flow_insight.status_key == "yellow":
+            flow_background = yellow
+        elif flow_insight.status_key == "green":
+            flow_background = green
+        elif flow_insight.status_key == "blue":
+            flow_background = blue
+        flow_item = self._make_item(
+            flow_insight.display_text,
+            background=flow_background,
+            foreground=hidden_foreground,
+        )
+        if flow_insight.tooltip_text:
+            flow_item.setToolTip(flow_insight.tooltip_text)
 
         items = (
             self._make_item(
                 f"{status.paths.display_name} [hidden]" if hidden else status.paths.display_name,
                 foreground=hidden_foreground,
             ),
-            self._make_item(
-                "Yes" if status.release_folder_exists else "Missing",
-                background=green if status.release_folder_exists else red,
-                foreground=hidden_foreground,
-            ),
-            self._make_item(
-                "Yes" if status.project_folder_exists else "Missing",
-                background=green if status.project_folder_exists else red,
-                foreground=hidden_foreground,
-            ),
-            self._make_item(
-                f"{status.paths.rpd_path.name} ({status.rpd_size_bytes} B)"
-                if status.rpd_exists and status.paths.rpd_path is not None
-                else "(missing)",
-                background=green if status.rpd_exists else red,
-                foreground=hidden_foreground,
-            ),
-            self._make_item(
-                status.paths.fabrication_relative_path + (" (found)" if status.fabrication_folder_exists else " (missing)"),
-                background=green if status.fabrication_folder_exists else red,
-                foreground=hidden_foreground,
-            ),
-            self._make_item(spreadsheet_text, background=spreadsheet_color, foreground=hidden_foreground),
-            self._make_item(import_csv_text, background=import_csv_color, foreground=hidden_foreground),
-            self._make_item(
-                f"{status.status_summary} | Hidden" if hidden else status.status_summary,
-                foreground=hidden_foreground,
-            ),
+            project_file_item,
+            nest_summary_item,
+            self._make_item(release_text, background=release_color, foreground=hidden_foreground),
+            flow_item,
+            punch_code_item,
         )
         if status.paths.display_name.casefold() != status.kit_name.casefold():
             items[0].setToolTip(f"RADAN name: {status.kit_name}")
@@ -857,13 +1127,87 @@ class MainWindow(QMainWindow):
         return selected[0] if selected else None
 
     def _ensure_saved_settings(self) -> None:
-        self.settings = self._settings_from_form()
+        return
+
+    def _clear_flow_gantt(self) -> None:
+        self._flow_gantt_source_bytes = None
+        self._flow_gantt_source_pixmap = None
+        self.flow_gantt_label.clear()
+        self.flow_gantt_label.resize(0, 0)
+        self.flow_gantt_scroll.setVisible(False)
+
+    def _rescale_flow_gantt_pixmap(self) -> None:
+        source = self._flow_gantt_source_pixmap
+        if source is None or source.isNull():
+            return
+        viewport_width = max(32, int(self.flow_gantt_scroll.viewport().width()))
+        viewport_height = max(32, int(self.flow_gantt_scroll.viewport().height()))
+        pixmap = source.scaled(
+            viewport_width,
+            viewport_height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.flow_gantt_label.setPixmap(pixmap)
+        self.flow_gantt_label.setFixedSize(viewport_width, viewport_height)
+        self.flow_gantt_scroll.setVisible(True)
+
+    def _set_flow_gantt_png(self, png_bytes: bytes | None) -> None:
+        if not png_bytes:
+            self._clear_flow_gantt()
+            return
+        if self._flow_gantt_source_bytes != png_bytes:
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(png_bytes):
+                self._clear_flow_gantt()
+                return
+            self._flow_gantt_source_bytes = png_bytes
+            self._flow_gantt_source_pixmap = pixmap
+        self._rescale_flow_gantt_pixmap()
+        QTimer.singleShot(0, self._rescale_flow_gantt_pixmap)
+
+    def _client_number_for_truck(self, truck_number: str) -> str:
+        key = normalize_hidden_truck_number(truck_number)
+        if not key:
+            return ""
+        return str(self.settings.client_numbers_by_truck.get(key) or "").strip()
+
+    def _refresh_current_truck_heading(self) -> None:
+        truck_number = self.current_truck_number()
+        if not truck_number:
+            self.current_truck_label.setText("Selected Truck: (none)")
+            self.current_flow_label.setText("Flow: (none)")
+            self.current_flow_label.setToolTip("")
+            self._clear_flow_gantt()
+            return
+        client_number = self._client_number_for_truck(truck_number)
+        if client_number:
+            self.current_truck_label.setText(f"Selected Truck: {truck_number} | Client: {client_number}")
+        else:
+            self.current_truck_label.setText(f"Selected Truck: {truck_number}")
+
+        flow_summary = str(self._current_flow_truck_insight.summary_text or "").strip()
+        if flow_summary:
+            if flow_summary.casefold().startswith("flow:"):
+                self.current_flow_label.setText(flow_summary)
+            else:
+                self.current_flow_label.setText(f"Flow: {flow_summary}")
+        else:
+            self.current_flow_label.setText("Flow: unavailable.")
+        self.current_flow_label.setToolTip(str(self._current_flow_truck_insight.tooltip_text or flow_summary))
+        self._set_flow_gantt_png(self._current_flow_truck_insight.gantt_png_bytes)
 
     def _refresh_hidden_action_labels(self) -> None:
         truck_number = self.current_truck_number()
         truck_hidden = bool(truck_number and is_hidden_truck(truck_number, self.settings))
         self.toggle_truck_hidden_button.setEnabled(bool(truck_number))
-        self.toggle_truck_hidden_button.setText("Unhide Truck" if truck_hidden else "Hide Truck")
+        self.toggle_truck_hidden_button.setText("Show Truck" if truck_hidden else "Hide Truck")
+        self.edit_truck_client_button.setEnabled(bool(truck_number))
+        self.edit_truck_client_button.setText(
+            "Client"
+        )
+        self._refresh_show_hidden_trucks_button()
+        self._refresh_current_truck_heading()
 
         selected_statuses = self._selected_statuses()
         selected_hidden = bool(selected_statuses) and all(
@@ -872,8 +1216,80 @@ class MainWindow(QMainWindow):
         )
         self.toggle_selected_kits_hidden_button.setEnabled(bool(selected_statuses))
         self.toggle_selected_kits_hidden_button.setText(
-            "Unhide Selected Kits" if selected_hidden else "Hide Selected Kits"
+            "Show Kits" if selected_hidden else "Hide Kits"
         )
+
+    def _refresh_show_hidden_trucks_button(self) -> None:
+        hidden_count = len(normalize_hidden_truck_entries(self.settings.hidden_trucks))
+        showing_hidden = self.show_hidden_trucks_button.isChecked()
+        if hidden_count == 0 and showing_hidden:
+            self.show_hidden_trucks_button.blockSignals(True)
+            self.show_hidden_trucks_button.setChecked(False)
+            self.show_hidden_trucks_button.blockSignals(False)
+            showing_hidden = False
+        label_prefix = "Hide Hidden" if showing_hidden else "Show Hidden"
+        self.show_hidden_trucks_button.setText(f"{label_prefix} ({hidden_count})")
+        if hidden_count:
+            self.show_hidden_trucks_button.setEnabled(True)
+            self.show_hidden_trucks_button.setToolTip(
+                f"{hidden_count} hidden truck(s). Toggle to {'hide' if showing_hidden else 'show'} them in the truck list."
+            )
+            return
+        if showing_hidden:
+            self.show_hidden_trucks_button.setEnabled(True)
+            self.show_hidden_trucks_button.setToolTip("No trucks are hidden right now.")
+            return
+        self.show_hidden_trucks_button.setEnabled(False)
+        self.show_hidden_trucks_button.setToolTip("No trucks are hidden right now.")
+
+    def _refresh_truck_order_buttons(self) -> None:
+        row = self.truck_list.currentRow()
+        count = self.truck_list.count()
+        self.move_truck_up_button.setEnabled(count > 0 and row > 0)
+        self.move_truck_down_button.setEnabled(count > 0 and 0 <= row < count - 1)
+
+    def _visible_truck_numbers(self) -> list[str]:
+        return [
+            self.truck_list.item(row).text().strip()
+            for row in range(self.truck_list.count())
+            if self.truck_list.item(row) is not None
+        ]
+
+    def _persist_truck_order(self) -> None:
+        self.settings.truck_order = normalize_truck_order_entries(self._all_trucks)
+        save_settings(self.settings)
+
+    def _move_selected_truck(self, direction: int) -> None:
+        current_row = self.truck_list.currentRow()
+        if current_row < 0:
+            return
+        target_row = current_row + direction
+        visible_trucks = self._visible_truck_numbers()
+        if target_row < 0 or target_row >= len(visible_trucks):
+            return
+
+        current_truck = visible_trucks[current_row]
+        target_truck = visible_trucks[target_row]
+        try:
+            all_current_index = next(
+                index for index, truck_number in enumerate(self._all_trucks)
+                if truck_number.casefold() == current_truck.casefold()
+            )
+            all_target_index = next(
+                index for index, truck_number in enumerate(self._all_trucks)
+                if truck_number.casefold() == target_truck.casefold()
+            )
+        except StopIteration:
+            return
+
+        self._all_trucks[all_current_index], self._all_trucks[all_target_index] = (
+            self._all_trucks[all_target_index],
+            self._all_trucks[all_current_index],
+        )
+        self._persist_truck_order()
+        self._apply_truck_filter()
+        self._select_truck(current_truck)
+        self.log(f"Updated fabrication truck order: {current_truck}")
 
     def _save_hidden_state(self) -> None:
         self.settings.hidden_trucks = normalize_hidden_truck_entries(self.settings.hidden_trucks)
@@ -904,9 +1320,44 @@ class MainWindow(QMainWindow):
 
         self._save_hidden_state()
         self.refresh_trucks()
-        if hidden or self.show_hidden_trucks_checkbox.isChecked():
+        if hidden or self.show_hidden_trucks_button.isChecked():
             self._select_truck(truck_number)
         self.log(f"{action_text} truck {truck_number} from the explorer list.")
+
+    def edit_current_truck_client_number(self) -> None:
+        truck_number = self.current_truck_number()
+        if not truck_number:
+            QMessageBox.information(self, "Client Number", "Select a truck first.")
+            return
+
+        self._ensure_saved_settings()
+        current_value = self._client_number_for_truck(truck_number)
+        client_number, ok = QInputDialog.getText(
+            self,
+            "Client Number",
+            f"Client number for {truck_number}:",
+            text=current_value,
+        )
+        if not ok:
+            return
+
+        truck_key = normalize_hidden_truck_number(truck_number)
+        client_text = client_number.strip()
+        if client_text:
+            self.settings.client_numbers_by_truck[truck_key] = client_text
+            action_text = f"Set client number for {truck_number} to {client_text}."
+        else:
+            self.settings.client_numbers_by_truck.pop(truck_key, None)
+            action_text = f"Cleared client number for {truck_number}."
+
+        self.settings.client_numbers_by_truck = canonicalize_client_numbers_by_truck(
+            self.settings.client_numbers_by_truck
+        )
+        save_settings(self.settings)
+        self._apply_truck_filter()
+        self._select_truck(truck_number)
+        self._refresh_current_truck_heading()
+        self.log(action_text)
 
     def toggle_selected_kits_hidden(self) -> None:
         selected_statuses = self._selected_statuses()
@@ -1002,10 +1453,17 @@ class MainWindow(QMainWindow):
             return
         self._ensure_saved_settings()
         created = 0
+        errors: list[str] = []
         for status in self._current_statuses:
-            result = create_kit_scaffold(truck_number, status.kit_name, self.settings)
+            try:
+                result = create_kit_scaffold(truck_number, status.kit_name, self.settings)
+            except Exception as exc:
+                errors.append(f"{status.paths.display_name}: {exc}")
+                continue
             created += len(result.created_paths)
         self._set_current_statuses(collect_kit_statuses(truck_number, self.settings))
+        if errors:
+            QMessageBox.warning(self, "Create Missing Kits", "\n".join(errors))
         self.log(f"Ensured all kit scaffolds for {truck_number}. Paths touched: {created}")
 
     def create_selected_kits(self) -> None:
@@ -1021,11 +1479,18 @@ class MainWindow(QMainWindow):
         self._ensure_saved_settings()
         created = 0
         notes: list[str] = []
+        errors: list[str] = []
         for status in selected:
-            result = create_kit_scaffold(truck_number, status.kit_name, self.settings)
+            try:
+                result = create_kit_scaffold(truck_number, status.kit_name, self.settings)
+            except Exception as exc:
+                errors.append(f"{status.paths.display_name}: {exc}")
+                continue
             created += len(result.created_paths)
             notes.extend(result.notes)
         self._set_current_statuses(collect_kit_statuses(truck_number, self.settings))
+        if errors:
+            QMessageBox.warning(self, "Create / Repair Selected", "\n".join(errors))
         if notes:
             self.log(" | ".join(notes))
         self.log(f"Ensured {len(selected)} selected kit scaffold(s). Paths touched: {created}")
@@ -1035,9 +1500,9 @@ class MainWindow(QMainWindow):
         if not truck_number:
             QMessageBox.information(self, "Open Truck Release", "Select a truck first.")
             return
-        release_root = Path(self.release_root_edit.text().strip()) if self.release_root_edit.text().strip() else None
-        if release_root is None:
-            QMessageBox.warning(self, "Open Truck Release", "Release root is not configured.")
+        release_root = Path(self.settings.release_root)
+        if not release_root.exists():
+            QMessageBox.warning(self, "Open Truck Release", f"Release root not found:\n{release_root}")
             return
         self._open_path_with_message(release_root / truck_number)
 
@@ -1054,8 +1519,18 @@ class MainWindow(QMainWindow):
 
     def open_selected_rpd(self) -> None:
         status = self._current_status()
-        if status is None or status.paths.rpd_path is None:
-            QMessageBox.information(self, "Open RPD", "Select a kit first.")
+        if status is None:
+            QMessageBox.information(self, "Open Project File", "Select a kit first.")
+            return
+        self._open_rpd_for_status(status)
+
+    def _open_rpd_for_status(self, status: KitStatus) -> None:
+        if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
+            QMessageBox.warning(
+                self,
+                "Open Project File",
+                "Could not find the project file on the L side for this kit.",
+            )
             return
         self._open_path_with_message(status.paths.rpd_path)
 
@@ -1088,12 +1563,54 @@ class MainWindow(QMainWindow):
             return
         self._open_path_with_message(spreadsheet_path)
 
-    def open_selected_import_csv(self) -> None:
+    def open_selected_flow_pdf(self) -> None:
         status = self._current_status()
-        if status is None or status.inventor_outputs is None or status.inventor_outputs.target_csv_path is None:
-            QMessageBox.information(self, "Open Import CSV", "Select a kit with an inventor output target.")
+        if status is None:
+            QMessageBox.information(self, "Open Flow PDF", "Select a kit first.")
             return
-        self._open_path_with_message(status.inventor_outputs.target_csv_path)
+
+        flow_insight = flow_kit_insight_for_explorer_kit(status.kit_name, self._current_flow_truck_insight)
+        if not flow_insight.flow_kit_name:
+            QMessageBox.information(
+                self,
+                "Open Flow PDF",
+                "This kit is not tracked as its own scheduled flow kit in the fabrication flow dashboard.",
+            )
+            return
+
+        pdf_link = str(flow_insight.pdf_link or "").strip()
+        if not pdf_link:
+            QMessageBox.warning(
+                self,
+                "Open Flow PDF",
+                f"No linked PDF is set in the fabrication flow dashboard for {flow_insight.flow_kit_name}.",
+            )
+            return
+
+        try:
+            open_external_target(pdf_link)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Flow PDF", str(exc))
+            return
+        self.log(f"Opened flow PDF {pdf_link}")
+
+    def _open_nest_summary_for_status(self, status: KitStatus) -> None:
+        summary_path = status.preview_pdf_match.chosen_path
+        if summary_path is None:
+            QMessageBox.warning(
+                self,
+                "Open Nest Summary",
+                "Could not find a Nest Summary PDF on the L side for this kit.",
+            )
+            return
+        self._open_path_with_message(summary_path)
+
+    def open_selected_nest_summary(self) -> None:
+        status = self._current_status()
+        if status is None:
+            QMessageBox.information(self, "Open Nest Summary", "Select a kit first.")
+            return
+        self._open_nest_summary_for_status(status)
 
     def open_selected_print_packet(self) -> None:
         status = self._current_status()
@@ -1117,7 +1634,7 @@ class MainWindow(QMainWindow):
         if status is None or status.paths.rpd_path is None:
             QMessageBox.information(self, "Launch RADAN Kitter", "Select a kit first.")
             return
-        launcher_text = self.radan_kitter_edit.text().strip()
+        launcher_text = self.settings.radan_kitter_launcher.strip()
         if not launcher_text:
             QMessageBox.warning(self, "Launch RADAN Kitter", "RADAN Kitter launcher is not configured.")
             return
@@ -1129,72 +1646,172 @@ class MainWindow(QMainWindow):
         self.log(f"Launched RADAN Kitter on {status.paths.rpd_path}")
 
     def run_selected_inventor_flow(self) -> None:
+        if self._pending_inventor_job is not None:
+            QMessageBox.information(
+                self,
+                "Run Inventor Tool",
+                "An Inventor output watch is already active. Let it finish before starting another one.",
+            )
+            return
+
         status = self._current_status()
         if status is None:
-            QMessageBox.information(self, "Run Inventor -> Radan", "Select a kit first.")
+            QMessageBox.information(self, "Run Inventor Tool", "Select a kit first.")
             return
         spreadsheet_path = status.spreadsheet_match.chosen_path
         if spreadsheet_path is None:
             QMessageBox.warning(
                 self,
-                "Run Inventor -> Radan",
+                "Run Inventor Tool",
                 "This kit does not have exactly one spreadsheet candidate in the W folder.",
             )
             return
         if status.paths.project_dir is None:
             QMessageBox.warning(
                 self,
-                "Run Inventor -> Radan",
+                "Run Inventor Tool",
                 "The L-side project folder is not available for this kit.",
             )
             return
 
         self._ensure_saved_settings()
-        entry_text = self.inventor_entry_edit.text().strip()
+        entry_text = self.settings.inventor_to_radan_entry.strip()
         if not entry_text:
-            QMessageBox.warning(self, "Run Inventor -> Radan", "Inventor entry is not configured.")
+            QMessageBox.warning(self, "Run Inventor Tool", "Inventor launcher is not configured.")
             return
         entry_path = Path(entry_text)
         try:
-            completed = run_inventor_to_radan(entry_path, spreadsheet_path)
+            process = launch_inventor_to_radan(entry_path, spreadsheet_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Run Inventor -> Radan", str(exc))
+            QMessageBox.critical(self, "Run Inventor Tool", str(exc))
             return
 
-        copied_paths: tuple[Path, ...] = ()
-        copy_error = ""
-        try:
-            _outputs, copied_paths = copy_inventor_outputs_to_project(
-                spreadsheet_path,
-                status.paths.project_dir,
-            )
-        except Exception as exc:
-            copy_error = str(exc)
-
-        self._set_current_statuses(collect_kit_statuses(self.current_truck_number(), self.settings))
-        self.log(
-            f"Inventor tool finished for {spreadsheet_path} with return code {completed.returncode}."
+        self._pending_inventor_job = PendingInventorJob(
+            truck_number=status.paths.truck_number,
+            kit_name=status.kit_name,
+            spreadsheet_path=spreadsheet_path,
+            project_dir=status.paths.project_dir,
+            outputs=inventor_output_paths(spreadsheet_path, status.paths.project_dir),
+            process=process,
+            started_at_monotonic=time.monotonic(),
         )
-        if copied_paths:
-            self.log("Copied inventor outputs to L: " + ", ".join(str(path) for path in copied_paths))
+        self.launch_inventor_button.setEnabled(False)
+        self.launch_inventor_button.setText("Watching Inventor...")
+        self._inventor_watch_timer.start()
+        self.log(
+            f"Launched Inventor tool for {spreadsheet_path.name}. "
+            "Finish the external prompts; output will be moved to L automatically when ready."
+        )
+        QMessageBox.information(
+            self,
+            "Run Inventor Tool",
+            "Inventor has been launched in its own window.\n\n"
+            "Complete its prompts there. This explorer will keep watching and move the generated output to L once the files exist and stop changing.",
+        )
 
-        message_parts = [f"Return code: {completed.returncode}"]
-        if copied_paths:
-            message_parts.append("Copied to L:")
-            message_parts.extend(str(path) for path in copied_paths)
-        if copy_error:
-            message_parts.append(f"Copy step: {copy_error}")
-        if completed.stderr.strip():
-            message_parts.append("stderr:")
-            message_parts.append(completed.stderr.strip())
+    @staticmethod
+    def _inventor_output_signature(outputs: InventorOutputPaths) -> tuple[tuple[str, int, int], ...] | None:
+        if not outputs.source_csv_path.exists():
+            return None
+        signature: list[tuple[str, int, int]] = []
+        try:
+            csv_stat = outputs.source_csv_path.stat()
+        except OSError:
+            return
+        signature.append(
+            (
+                outputs.source_csv_path.name,
+                int(csv_stat.st_size),
+                int(csv_stat.st_mtime_ns),
+            )
+        )
+        if outputs.source_report_path.exists():
+            try:
+                report_stat = outputs.source_report_path.stat()
+            except OSError:
+                report_stat = None
+            if report_stat is not None:
+                signature.append(
+                    (
+                        outputs.source_report_path.name,
+                        int(report_stat.st_size),
+                        int(report_stat.st_mtime_ns),
+                    )
+                )
+        return tuple(signature)
 
-        if completed.returncode not in (0, 2):
-            QMessageBox.warning(self, "Run Inventor -> Radan", "\n".join(message_parts))
+    def _finish_pending_inventor_job(self, *, reset_button: bool = True) -> None:
+        self._pending_inventor_job = None
+        self._inventor_watch_timer.stop()
+        if reset_button:
+            self.launch_inventor_button.setEnabled(True)
+            self.launch_inventor_button.setText("Run Inventor Tool")
+
+    def _poll_pending_inventor_job(self) -> None:
+        job = self._pending_inventor_job
+        if job is None:
+            self._inventor_watch_timer.stop()
             return
-        if copy_error and not copied_paths:
-            QMessageBox.warning(self, "Run Inventor -> Radan", "\n".join(message_parts))
+
+        if job.launcher_exit_code is None:
+            try:
+                job.launcher_exit_code = job.process.poll()
+            except Exception:
+                job.launcher_exit_code = None
+
+        signature = self._inventor_output_signature(job.outputs)
+        now = time.monotonic()
+        if signature is not None:
+            if job.first_output_seen_at_monotonic is None:
+                job.first_output_seen_at_monotonic = now
+                job.last_output_signature = signature
+                job.stable_polls = 0
+                self.log(f"Inventor output appeared for {job.spreadsheet_path.name}; waiting for it to settle.")
+                return
+            if signature == job.last_output_signature:
+                job.stable_polls += 1
+            else:
+                job.last_output_signature = signature
+                job.stable_polls = 0
+
+            if job.stable_polls < 2:
+                return
+
+            moved_paths: tuple[Path, ...] = ()
+            try:
+                _outputs, moved_paths = move_inventor_outputs_to_project(
+                    job.spreadsheet_path,
+                    job.project_dir,
+                )
+            except Exception as exc:
+                self._finish_pending_inventor_job()
+                QMessageBox.warning(
+                    self,
+                    "Run Inventor Tool",
+                    "The output appeared, but moving it to L failed.\n\n"
+                    f"{exc}",
+                )
+                return
+
+            if job.truck_number.casefold() == self.current_truck_number().casefold():
+                self._set_current_statuses(collect_kit_statuses(job.truck_number, self.settings))
+            self._finish_pending_inventor_job()
+            self.log("Moved inventor outputs from W to L: " + ", ".join(str(path) for path in moved_paths))
+            QMessageBox.information(
+                self,
+                "Run Inventor Tool",
+                "Inventor output was moved to L.\n\n" + "\n".join(str(path) for path in moved_paths),
+            )
             return
-        QMessageBox.information(self, "Run Inventor -> Radan", "\n".join(message_parts))
+
+        if now - job.started_at_monotonic > 45 * 60:
+            self._finish_pending_inventor_job()
+            QMessageBox.warning(
+                self,
+                "Run Inventor Tool",
+                "Timed out waiting for Inventor output files to appear in W.\n\n"
+                "The launcher was started, but no settled output was found to move.",
+            )
 
     def _open_path_with_message(self, path: Path) -> None:
         try:

@@ -19,8 +19,11 @@ from models import (
     SpreadsheetMatch,
     build_hidden_kit_key,
     build_kit_mappings,
+    canonicalize_kit_name,
+    kit_name_variants,
     normalize_hidden_kit_entries,
     normalize_hidden_truck_entries,
+    normalize_truck_order_entries,
 )
 
 SUPPORTED_SPREADSHEET_SUFFIXES = {".xlsx", ".xls", ".csv"}
@@ -78,6 +81,31 @@ def filter_truck_numbers(
     return [truck_number for truck_number in truck_numbers if not is_hidden_truck(truck_number, settings)]
 
 
+def sort_truck_numbers_by_fabrication_order(
+    truck_numbers: list[str],
+    settings: ExplorerSettings,
+) -> list[str]:
+    configured_order = normalize_truck_order_entries(settings.truck_order)
+    order_index = {truck_number.casefold(): index for index, truck_number in enumerate(configured_order)}
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for truck_number in truck_numbers:
+        key = clean_text(truck_number).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(truck_number)
+
+    return sorted(
+        deduped,
+        key=lambda truck_number: (
+            0 if truck_number.casefold() in order_index else 1,
+            order_index.get(truck_number.casefold(), 0),
+            natural_sort_key(truck_number),
+        ),
+    )
+
+
 def filter_kit_statuses(
     statuses: list[KitStatus],
     settings: ExplorerSettings,
@@ -94,7 +122,7 @@ def filter_kit_statuses(
 
 
 def resolve_kit_mapping(kit_name: str, settings: ExplorerSettings) -> KitMapping:
-    wanted = clean_text(kit_name)
+    wanted = canonicalize_kit_name(kit_name)
     for mapping in configured_kit_mappings(settings):
         if mapping.kit_name.casefold() == wanted.casefold():
             return mapping
@@ -114,6 +142,29 @@ def _path_from_setting(value: str) -> Path | None:
     return Path(text)
 
 
+def _existing_named_child(parent: Path | None, candidate_names: tuple[str, ...], *, want_dir: bool) -> Path | None:
+    if parent is None or not parent.exists() or not candidate_names:
+        return None
+
+    wanted_by_key = {str(name or "").strip().casefold(): str(name or "").strip() for name in candidate_names if str(name or "").strip()}
+    if not wanted_by_key:
+        return None
+
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return None
+
+    for child in children:
+        if want_dir and not child.is_dir():
+            continue
+        if not want_dir and not child.is_file():
+            continue
+        if child.name.casefold() in wanted_by_key:
+            return child
+    return None
+
+
 def build_kit_paths(truck_number: str, kit_name: str, settings: ExplorerSettings) -> KitPaths:
     truck_text = clean_text(truck_number)
     mapping = resolve_kit_mapping(kit_name, settings)
@@ -126,14 +177,34 @@ def build_kit_paths(truck_number: str, kit_name: str, settings: ExplorerSettings
     if not kit_text:
         raise ValueError("Kit name cannot be empty.")
 
-    project_name = f"{truck_text} {kit_text}".strip()
+    kit_name_candidates = kit_name_variants(kit_text) or (kit_text,)
+    project_name_candidates = tuple(f"{truck_text} {name}".strip() for name in kit_name_candidates)
+    project_name = project_name_candidates[0]
     release_root = _path_from_setting(settings.release_root)
     fabrication_root = _path_from_setting(settings.fabrication_root)
 
     release_truck_dir = release_root / truck_text if release_root else None
     release_kit_dir = release_truck_dir / kit_text if release_truck_dir else None
+    existing_release_kit_dir = _existing_named_child(release_truck_dir, kit_name_candidates, want_dir=True)
+    if existing_release_kit_dir is not None:
+        release_kit_dir = existing_release_kit_dir
+
     project_dir = release_kit_dir / project_name if release_kit_dir else None
+    existing_project_dir = _existing_named_child(release_kit_dir, project_name_candidates, want_dir=True)
+    if existing_project_dir is not None:
+        project_dir = existing_project_dir
+        project_name = existing_project_dir.name
+
     rpd_path = project_dir / f"{project_name}.rpd" if project_dir else None
+    rpd_name_candidates = tuple(f"{name}.rpd" for name in project_name_candidates)
+    if project_dir is not None:
+        existing_rpd_path = _existing_named_child(
+            project_dir,
+            (f"{project_name}.rpd",) + rpd_name_candidates,
+            want_dir=False,
+        )
+        if existing_rpd_path is not None:
+            rpd_path = existing_rpd_path
 
     fabrication_truck_dir = fabrication_root / truck_text if fabrication_root else None
     fabrication_relative_path = clean_text(mapping.fabrication_relative_path)
@@ -275,9 +346,58 @@ def _write_template_clone(
         )
         text = text.replace(find_text, rendered)
 
+    text = _apply_template_project_defaults(
+        text,
+        output_path=output_path,
+        project_name=project_name,
+    )
     text = re.sub(r'encoding="[^"]+"', 'encoding="utf-8"', text, count=1)
     output_path.write_text(text, encoding="utf-8")
     return "template_clone"
+
+
+def _replace_exact_xml_text(text: str, old_value: str, new_value: str) -> str:
+    pattern = rf">(\s*){re.escape(old_value)}(\s*)<"
+    return re.sub(pattern, lambda match: f">{match.group(1)}{new_value}{match.group(2)}<", text)
+
+
+def _replace_xml_element_value(text: str, tag_name: str, new_value: str) -> str:
+    pattern = rf"(<{tag_name}>)(.*?)(</{tag_name}>)"
+    return re.sub(
+        pattern,
+        lambda match: f"{match.group(1)}{new_value}{match.group(3)}",
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def _apply_template_project_defaults(
+    text: str,
+    *,
+    output_path: Path,
+    project_name: str,
+) -> str:
+    project_dir = output_path.parent
+    text = _replace_exact_xml_text(text, "Template.rpd", output_path.name)
+    text = _replace_exact_xml_text(text, "Template", project_name)
+    text = _replace_xml_element_value(text, "JobName", project_name)
+    text = _replace_xml_element_value(text, "NestFolder", str(project_dir / "nests"))
+    text = _replace_xml_element_value(text, "RemnantSaveFolder", str(project_dir / "remnants"))
+    return text
+
+
+def _clone_template_subfolders(template_root: Path, project_dir: Path) -> tuple[Path, ...]:
+    created: list[Path] = []
+    for folder in sorted((path for path in template_root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts)):
+        relative = folder.relative_to(template_root)
+        if not relative.parts:
+            continue
+        target = project_dir / relative
+        if target.exists():
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        created.append(target)
+    return tuple(created)
 
 
 def _write_minimal_rpd(output_path: Path, *, project_name: str) -> str:
@@ -329,6 +449,7 @@ def create_kit_scaffold(
                 replacements_text=settings.template_replacements_text,
             )
             notes.append(f"Cloned template RPD from {template_path}")
+            created.extend(_clone_template_subfolders(template_path.parent, paths.project_dir))
         else:
             template_mode = _write_minimal_rpd(paths.rpd_path, project_name=paths.project_name)
             notes.append("Wrote a minimal placeholder RPD because no template file is configured.")
@@ -447,6 +568,24 @@ def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
     return PdfMatch(chosen_path=paths_only[0], candidates=paths_only)
 
 
+def fabrication_folder_has_files(folder: Path | None) -> bool:
+    if folder is None or not folder.exists():
+        return False
+    stack: list[Path] = [folder]
+    while stack:
+        current = stack.pop()
+        try:
+            children = list(current.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_file():
+                return True
+            if child.is_dir():
+                stack.append(child)
+    return False
+
+
 def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSettings) -> KitStatus:
     paths = build_kit_paths(truck_number, kit_name, settings)
     release_folder_exists = bool(paths.release_kit_dir and paths.release_kit_dir.exists())
@@ -454,6 +593,7 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
     rpd_exists = bool(paths.rpd_path and paths.rpd_path.exists())
     rpd_size_bytes = paths.rpd_path.stat().st_size if rpd_exists and paths.rpd_path is not None else 0
     fabrication_folder_exists = bool(paths.fabrication_kit_dir and paths.fabrication_kit_dir.exists())
+    fabrication_has_files = fabrication_folder_has_files(paths.fabrication_kit_dir)
     spreadsheet_match = detect_spreadsheet(paths.fabrication_kit_dir)
     preview_pdf_match = detect_preview_pdf(paths)
     outputs = None
@@ -462,18 +602,20 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
 
     summary_parts: list[str] = []
     summary_parts.append("RPD ready" if rpd_exists else "RPD missing")
+    if fabrication_has_files:
+        summary_parts.append("Released")
+    elif fabrication_folder_exists:
+        summary_parts.append("Not released")
+    else:
+        summary_parts.append("W folder missing")
     if spreadsheet_match.is_unique:
         summary_parts.append("Spreadsheet ready")
     elif spreadsheet_match.issue == "multiple_spreadsheets":
         summary_parts.append("Spreadsheet ambiguous")
-    elif fabrication_folder_exists:
+    elif fabrication_has_files:
         summary_parts.append("Spreadsheet missing")
-    else:
-        summary_parts.append("W folder missing")
     if preview_pdf_match.chosen_path is not None:
         summary_parts.append("Nest Summary")
-    if outputs is not None and outputs.target_csv_path is not None and outputs.target_csv_path.exists():
-        summary_parts.append("Import CSV on L")
 
     return KitStatus(
         kit_name=kit_name,
@@ -483,6 +625,7 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
         rpd_exists=rpd_exists,
         rpd_size_bytes=rpd_size_bytes,
         fabrication_folder_exists=fabrication_folder_exists,
+        fabrication_has_files=fabrication_has_files,
         spreadsheet_match=spreadsheet_match,
         preview_pdf_match=preview_pdf_match,
         inventor_outputs=outputs,
@@ -491,11 +634,10 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
 
 
 def collect_kit_statuses(truck_number: str, settings: ExplorerSettings) -> list[KitStatus]:
-    statuses = [
+    return [
         build_kit_status(truck_number, mapping.kit_name, settings)
         for mapping in configured_kit_mappings(settings)
     ]
-    return sorted(statuses, key=lambda status: natural_sort_key(status.paths.display_name))
 
 
 def open_path(path: Path) -> None:
@@ -503,6 +645,16 @@ def open_path(path: Path) -> None:
     if not target.exists():
         raise FileNotFoundError(str(target))
     os.startfile(str(target))  # type: ignore[attr-defined]
+
+
+def open_external_target(target: str | Path) -> None:
+    text = clean_text(target).strip('"')
+    if not text:
+        raise FileNotFoundError("No external target was provided.")
+    if "://" in text:
+        os.startfile(text)  # type: ignore[attr-defined]
+        return
+    open_path(Path(text))
 
 
 def launch_launcher(launcher_path: Path | str, argument_path: Path | str) -> None:
@@ -525,6 +677,33 @@ def _python_executable() -> str:
     return sys.executable
 
 
+def launch_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.Popen[object]:
+    entry = Path(str(entry_path))
+    spreadsheet = Path(str(spreadsheet_path))
+    if not entry.exists():
+        raise FileNotFoundError(str(entry))
+    if not spreadsheet.exists():
+        raise FileNotFoundError(str(spreadsheet))
+
+    suffix = entry.suffix.casefold()
+    if suffix == ".py":
+        command = [_python_executable(), str(entry), str(spreadsheet)]
+    elif suffix in {".bat", ".cmd"}:
+        command = ["cmd.exe", "/c", str(entry), str(spreadsheet)]
+    else:
+        command = [str(entry), str(spreadsheet)]
+
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(entry.parent),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if suffix in {".bat", ".cmd"}:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    return subprocess.Popen(command, **popen_kwargs)
+
+
 def run_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.CompletedProcess[str]:
     entry = Path(str(entry_path))
     spreadsheet = Path(str(spreadsheet_path))
@@ -541,15 +720,28 @@ def run_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) 
     else:
         command = [str(entry), str(spreadsheet)]
 
+    run_kwargs = {
+        "cwd": str(entry.parent),
+        "text": True,
+    }
+    if suffix in {".bat", ".cmd"}:
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        return subprocess.run(command, **run_kwargs)
     return subprocess.run(
         command,
-        cwd=str(entry.parent),
-        text=True,
         capture_output=True,
+        **run_kwargs,
     )
 
 
-def copy_inventor_outputs_to_project(
+def _move_or_replace(source_path: Path, target_path: Path) -> Path:
+    if target_path.exists():
+        target_path.unlink()
+    shutil.move(str(source_path), str(target_path))
+    return target_path
+
+
+def move_inventor_outputs_to_project(
     spreadsheet_path: Path,
     project_dir: Path | None,
 ) -> tuple[InventorOutputPaths, tuple[Path, ...]]:
@@ -563,12 +755,12 @@ def copy_inventor_outputs_to_project(
     if not outputs.source_csv_path.exists():
         raise FileNotFoundError(str(outputs.source_csv_path))
 
-    copied: list[Path] = []
-    shutil.copyfile(outputs.source_csv_path, outputs.target_csv_path)
-    copied.append(outputs.target_csv_path)
+    moved: list[Path] = []
+    _move_or_replace(outputs.source_csv_path, outputs.target_csv_path)
+    moved.append(outputs.target_csv_path)
 
     if outputs.source_report_path.exists():
-        shutil.copyfile(outputs.source_report_path, outputs.target_report_path)
-        copied.append(outputs.target_report_path)
+        _move_or_replace(outputs.source_report_path, outputs.target_report_path)
+        moved.append(outputs.target_report_path)
 
-    return outputs, tuple(copied)
+    return outputs, tuple(moved)
