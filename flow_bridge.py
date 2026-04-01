@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 import subprocess
@@ -302,4 +302,40 @@ def flow_kit_insight_for_explorer_kit(
         tooltip_text=f"{mapped_flow_kit_name} is not active on this truck in the fabrication flow dashboard.",
         status_key="missing",
         tracked=False,
+    )
+
+
+def normalize_flow_insight_for_local_release(
+    flow_insight: FlowKitInsight,
+    *,
+    fabrication_folder_exists: bool,
+    fabrication_has_files: bool,
+) -> FlowKitInsight:
+    if fabrication_has_files:
+        return flow_insight
+
+    display_key = str(flow_insight.display_text or "").strip().casefold()
+    if not flow_insight.tracked:
+        return flow_insight
+    if not display_key:
+        return flow_insight
+    if display_key.startswith("unreleased"):
+        return flow_insight
+    if display_key in {"inactive", "complete", "unavailable", "no flow truck", "not tracked"}:
+        return flow_insight
+
+    local_release_text = "Not released" if fabrication_folder_exists else "W missing"
+    local_status_key = "red" if (not fabrication_folder_exists or flow_insight.status_key == "red") else "yellow"
+    tooltip_lines = [
+        f"Local release: {local_release_text}",
+        f"Flow status: {flow_insight.display_text}",
+    ]
+    if flow_insight.tooltip_text:
+        tooltip_lines.append(flow_insight.tooltip_text)
+
+    return replace(
+        flow_insight,
+        display_text=local_release_text,
+        tooltip_text="\n".join(tooltip_lines),
+        status_key=local_status_key,
     )

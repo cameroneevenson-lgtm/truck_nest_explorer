@@ -42,6 +42,7 @@ from flow_bridge import (
     empty_flow_truck_insight,
     flow_kit_insight_for_explorer_kit,
     load_flow_truck_insight,
+    normalize_flow_insight_for_local_release,
 )
 from models import (
     canonicalize_client_numbers_by_truck,
@@ -296,21 +297,34 @@ class MainWindow(QMainWindow):
                 border-radius: 6px;
                 padding: 6px 8px;
             }
-            QListWidget, QTableWidget {
+            QListWidget#truck_list, QTableWidget#kit_table {
                 background: #FFFFFF;
                 color: #0F172A;
                 alternate-background-color: #F8FAFC;
                 border: 1px solid #CBD5E1;
                 border-radius: 6px;
                 gridline-color: #E2E8F0;
-                selection-background-color: #E2E8F0;
                 selection-color: #0F172A;
             }
-            QListWidget::item:selected, QTableWidget::item:selected {
+            QListWidget#truck_list {
+                selection-background-color: #E2E8F0;
+            }
+            QListWidget#truck_list::item:selected {
                 background: #E2E8F0;
                 color: #0F172A;
             }
-            QTableWidget::item:hover, QListWidget::item:hover {
+            QTableWidget#kit_table {
+                selection-background-color: rgba(148, 163, 184, 0.18);
+            }
+            QTableWidget#kit_table::item:selected {
+                background: rgba(148, 163, 184, 0.18);
+                color: #0F172A;
+            }
+            QTableWidget#kit_table::item:hover {
+                background: rgba(226, 232, 240, 0.20);
+                color: #0F172A;
+            }
+            QListWidget#truck_list::item:hover {
                 background: #EEF4FB;
                 color: #0F172A;
             }
@@ -412,6 +426,7 @@ class MainWindow(QMainWindow):
         truck_controls.addStretch(1)
 
         self.truck_list = QListWidget()
+        self.truck_list.setObjectName("truck_list")
         self.truck_list.currentItemChanged.connect(self._on_truck_changed)
 
         list_row = QHBoxLayout()
@@ -642,6 +657,7 @@ class MainWindow(QMainWindow):
         controls.addStretch(1)
 
         self.kit_table = QTableWidget(0, len(self.TABLE_COLUMNS))
+        self.kit_table.setObjectName("kit_table")
         self.kit_table.setHorizontalHeaderLabels(self.TABLE_COLUMNS)
         self.kit_table.setAlternatingRowColors(True)
         self.kit_table.setWordWrap(False)
@@ -1079,6 +1095,11 @@ class MainWindow(QMainWindow):
         )
 
         flow_insight = flow_kit_insight_for_explorer_kit(status.kit_name, self._current_flow_truck_insight)
+        flow_insight = normalize_flow_insight_for_local_release(
+            flow_insight,
+            fabrication_folder_exists=status.fabrication_folder_exists,
+            fabrication_has_files=status.fabrication_has_files,
+        )
         flow_background = neutral
         if flow_insight.status_key == "red":
             flow_background = red

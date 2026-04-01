@@ -20,6 +20,7 @@ import rpd_io  # type: ignore[import-not-found]
 from flow_bridge import (
     flow_kit_insight_for_explorer_kit,
     map_explorer_kit_to_flow_kit,
+    normalize_flow_insight_for_local_release,
     parse_flow_probe_payload,
 )
 from models import (
@@ -113,6 +114,68 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         untracked_insight = flow_kit_insight_for_explorer_kit("STEP PACK", truck_insight)
         self.assertEqual(untracked_insight.display_text, "Not tracked")
         self.assertEqual(untracked_insight.status_key, "missing")
+
+    def test_normalize_flow_insight_for_local_release_prefers_local_unreleased_signal(self) -> None:
+        truck_insight = parse_flow_probe_payload(
+            {
+                "available": True,
+                "truck_number": "F56139",
+                "kits": [
+                    {
+                        "flow_kit_name": "Body",
+                        "display_text": "Bend | On track",
+                        "tooltip_text": "Flow kit: Body\nHead: Bend",
+                        "status_key": "green",
+                    },
+                    {
+                        "flow_kit_name": "Console",
+                        "display_text": "Weld | Late",
+                        "tooltip_text": "Flow kit: Console\nHead: Weld",
+                        "status_key": "red",
+                    },
+                ],
+            }
+        )
+
+        body_insight = normalize_flow_insight_for_local_release(
+            flow_kit_insight_for_explorer_kit("PAINT PACK", truck_insight),
+            fabrication_folder_exists=True,
+            fabrication_has_files=False,
+        )
+        self.assertEqual(body_insight.display_text, "Not released")
+        self.assertEqual(body_insight.status_key, "yellow")
+        self.assertIn("Local release: Not released", body_insight.tooltip_text)
+        self.assertIn("Flow status: Bend | On track", body_insight.tooltip_text)
+
+        console_insight = normalize_flow_insight_for_local_release(
+            flow_kit_insight_for_explorer_kit("CONSOLE PACK", truck_insight),
+            fabrication_folder_exists=False,
+            fabrication_has_files=False,
+        )
+        self.assertEqual(console_insight.display_text, "W missing")
+        self.assertEqual(console_insight.status_key, "red")
+        self.assertIn("Flow status: Weld | Late", console_insight.tooltip_text)
+
+        already_unreleased = normalize_flow_insight_for_local_release(
+            parse_flow_probe_payload(
+                {
+                    "available": True,
+                    "truck_number": "F56139",
+                    "kits": [
+                        {
+                            "flow_kit_name": "Body",
+                            "display_text": "Unreleased | Hold 0.6w",
+                            "tooltip_text": "Flow kit: Body",
+                            "status_key": "yellow",
+                        }
+                    ],
+                }
+            ).kit_insights_by_flow_name["body"],
+            fabrication_folder_exists=True,
+            fabrication_has_files=False,
+        )
+        self.assertEqual(already_unreleased.display_text, "Unreleased | Hold 0.6w")
+        self.assertEqual(already_unreleased.status_key, "yellow")
 
     def test_build_kit_paths_matches_expected_layout(self) -> None:
         settings = ExplorerSettings(
