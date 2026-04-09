@@ -146,22 +146,29 @@ def _existing_named_child(parent: Path | None, candidate_names: tuple[str, ...],
     if parent is None or not parent.exists() or not candidate_names:
         return None
 
-    wanted_by_key = {str(name or "").strip().casefold(): str(name or "").strip() for name in candidate_names if str(name or "").strip()}
+    wanted_by_key = {
+        str(name or "").strip().casefold(): str(name or "").strip()
+        for name in candidate_names
+        if str(name or "").strip()
+    }
     if not wanted_by_key:
         return None
 
     try:
-        children = list(parent.iterdir())
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                if entry.name.casefold() not in wanted_by_key:
+                    continue
+                try:
+                    if want_dir and not entry.is_dir():
+                        continue
+                    if not want_dir and not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                return Path(entry.path)
     except OSError:
         return None
-
-    for child in children:
-        if want_dir and not child.is_dir():
-            continue
-        if not want_dir and not child.is_file():
-            continue
-        if child.name.casefold() in wanted_by_key:
-            return child
     return None
 
 
@@ -239,9 +246,16 @@ def discover_trucks(settings: ExplorerSettings) -> list[str]:
     root = _path_from_setting(settings.release_root)
     if root is None or not root.exists():
         return []
-    for child in root.iterdir():
-        if child.is_dir() and TRUCK_FOLDER_PATTERN.fullmatch(child.name):
-            names.add(child.name)
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir() and TRUCK_FOLDER_PATTERN.fullmatch(entry.name):
+                        names.add(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        return []
     return sorted(names, key=natural_sort_key)
 
 
@@ -253,11 +267,18 @@ def find_fabrication_truck_dir(truck_number: str, settings: ExplorerSettings) ->
     if fabrication_root is None or not fabrication_root.exists():
         return None
 
-    for child in fabrication_root.iterdir():
-        if not child.is_dir():
-            continue
-        if child.name.casefold() == wanted.casefold():
-            return child
+    try:
+        with os.scandir(fabrication_root) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if entry.name.casefold() == wanted.casefold():
+                    return Path(entry.path)
+    except OSError:
+        return None
     return None
 
 
@@ -272,18 +293,25 @@ def detect_spreadsheet(folder: Path | None) -> SpreadsheetMatch:
     if not folder.exists():
         return SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
 
-    candidates = tuple(
-        sorted(
-            (
-                path
-                for path in folder.iterdir()
-                if path.is_file()
-                and path.suffix.casefold() in SUPPORTED_SPREADSHEET_SUFFIXES
-                and not _is_generated_spreadsheet(path)
-            ),
-            key=lambda path: natural_sort_key(path.name),
-        )
-    )
+    discovered: list[Path] = []
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                path = Path(entry.path)
+                if path.suffix.casefold() not in SUPPORTED_SPREADSHEET_SUFFIXES:
+                    continue
+                if _is_generated_spreadsheet(path):
+                    continue
+                discovered.append(path)
+    except OSError:
+        return SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
+
+    candidates = tuple(sorted(discovered, key=lambda path: natural_sort_key(path.name)))
     if len(candidates) == 1:
         return SpreadsheetMatch(chosen_path=candidates[0], candidates=candidates)
     if not candidates:
@@ -489,15 +517,18 @@ def _shallow_descendant_files(root: Path, *, max_depth: int) -> list[tuple[Path,
     while stack:
         folder, depth = stack.pop()
         try:
-            children = list(folder.iterdir())
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file():
+                            discovered.append((Path(entry.path), depth))
+                            continue
+                        if entry.is_dir() and depth < max_depth:
+                            stack.append((Path(entry.path), depth + 1))
+                    except OSError:
+                        continue
         except OSError:
             continue
-        for child in children:
-            if child.is_file():
-                discovered.append((child, depth))
-                continue
-            if child.is_dir() and depth < max_depth:
-                stack.append((child, depth + 1))
     return discovered
 
 
@@ -575,14 +606,17 @@ def fabrication_folder_has_files(folder: Path | None) -> bool:
     while stack:
         current = stack.pop()
         try:
-            children = list(current.iterdir())
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file():
+                            return True
+                        if entry.is_dir():
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
         except OSError:
             continue
-        for child in children:
-            if child.is_file():
-                return True
-            if child.is_dir():
-                stack.append(child)
     return False
 
 

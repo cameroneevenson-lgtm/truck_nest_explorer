@@ -185,6 +185,42 @@ def build_hidden_kit_key(truck_number: object, kit_name: object) -> str:
     return f"{truck_text}{HIDDEN_KIT_SEPARATOR}{kit_text}"
 
 
+def resolve_punch_code_text(
+    values: dict[str, str],
+    truck_number: object,
+    kit_name: object,
+) -> str:
+    key = build_hidden_kit_key(truck_number, kit_name)
+    if key and key in values:
+        return str(values.get(key) or "")
+    legacy_key = canonicalize_kit_name(kit_name)
+    if not legacy_key:
+        return ""
+    return str(values.get(legacy_key) or "")
+
+
+def materialize_legacy_punch_codes_for_kit(
+    values: dict[str, str],
+    truck_numbers: list[object] | None,
+    kit_name: object,
+) -> dict[str, str]:
+    canonical_kit_name = canonicalize_kit_name(kit_name)
+    updated = dict(values)
+    if not canonical_kit_name or canonical_kit_name not in updated:
+        return updated
+
+    legacy_value = str(updated.pop(canonical_kit_name) or "")
+    if not legacy_value.strip():
+        return updated
+
+    for truck_number in truck_numbers or []:
+        key = build_hidden_kit_key(truck_number, canonical_kit_name)
+        if not key or key in updated:
+            continue
+        updated[key] = legacy_value
+    return updated
+
+
 def normalize_hidden_kit_entries(values: list[object] | None) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -251,7 +287,14 @@ def canonicalize_punch_codes_by_kit(
         value_text = str(raw_value or "")
         if not key_text or not value_text.strip():
             continue
-        canonical_key = kit_name_lookup.get(key_text.casefold(), key_text)
+        if HIDDEN_KIT_SEPARATOR in key_text:
+            truck_part, kit_part = key_text.split(HIDDEN_KIT_SEPARATOR, 1)
+            canonical_kit_name = kit_name_lookup.get(kit_part.strip().casefold(), kit_part.strip())
+            canonical_key = build_hidden_kit_key(truck_part, canonical_kit_name)
+            if not canonical_key:
+                continue
+        else:
+            canonical_key = kit_name_lookup.get(key_text.casefold(), key_text)
         cleaned[canonical_key] = value_text
     return cleaned
 

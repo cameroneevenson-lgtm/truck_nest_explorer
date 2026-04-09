@@ -118,6 +118,7 @@ def main(argv: list[str]) -> int:
     from stages import stage_from_id, stage_label
 
     database = FabricationDatabase(db_path)
+    database.initialize()
     trucks = database.load_trucks_with_kits(active_only=False)
     target_truck = next(
         (

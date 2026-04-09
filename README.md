@@ -116,7 +116,7 @@ F55334 PAINT PACK nest summary.pdf
 Punch codes are edited directly in the kit table.
 
 - Double-click the `Punch Code` cell for a kit to edit it.
-- Notes are saved per kit, not as one shared note.
+- Notes are saved per truck and kit, so the same kit on another truck can use a different code.
 - Notes save when you commit the cell edit.
 - The content is stored in the app settings file under `_runtime\settings.json`.
 

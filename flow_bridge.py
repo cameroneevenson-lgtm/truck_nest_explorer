@@ -19,7 +19,13 @@ EXPLORER_TO_FLOW_KIT_NAME = {
     "CONSOLE PACK": "Console",
     "INTERIOR PACK": "Interior",
     "EXTERIOR PACK": "Exterior",
+    "CHASSIS PACK": "Chassis",
     "PUMP HOUSE": "Pumphouse",
+    "PUMP COVERING": "Pump Covering",
+    "PUMP MOUNTS": "Pump Mounts",
+    "PUMP BRACKETS": "Pump Brackets",
+    "STEP PACK": "Step Pack",
+    "OPERATIONAL PANELS": "Operational Panels",
 }
 VALID_FLOW_STATUS_KEYS = {"red", "yellow", "green", "blue", "black", "missing"}
 

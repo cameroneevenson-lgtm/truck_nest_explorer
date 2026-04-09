@@ -29,6 +29,8 @@ from models import (
     build_hidden_kit_key,
     canonicalize_hidden_kit_entries,
     canonicalize_punch_codes_by_kit,
+    materialize_legacy_punch_codes_for_kit,
+    resolve_punch_code_text,
 )
 from services import (
     build_kit_paths,
@@ -65,14 +67,15 @@ def workspace_tempdir() -> Path:
 class TruckNestExplorerServicesTests(unittest.TestCase):
     def test_map_explorer_kit_to_flow_kit_uses_built_in_schedule_rollups(self) -> None:
         self.assertEqual(map_explorer_kit_to_flow_kit("PAINT PACK"), "Body")
+        self.assertEqual(map_explorer_kit_to_flow_kit("CHASSIS PACK"), "Chassis")
         self.assertEqual(map_explorer_kit_to_flow_kit("PUMP HOUSE"), "Pumphouse")
-        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP MOUNTS"), "")
-        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP COVERINGS"), "")
-        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP BRACKETS"), "")
-        self.assertEqual(map_explorer_kit_to_flow_kit("OPERATIONAL PANELS"), "")
-        self.assertEqual(map_explorer_kit_to_flow_kit("STEPS PACK"), "")
-        self.assertEqual(map_explorer_kit_to_flow_kit("STEPS"), "")
-        self.assertEqual(map_explorer_kit_to_flow_kit("STEP PACK"), "")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP MOUNTS"), "Pump Mounts")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP COVERINGS"), "Pump Covering")
+        self.assertEqual(map_explorer_kit_to_flow_kit("PUMP BRACKETS"), "Pump Brackets")
+        self.assertEqual(map_explorer_kit_to_flow_kit("OPERATIONAL PANELS"), "Operational Panels")
+        self.assertEqual(map_explorer_kit_to_flow_kit("STEPS PACK"), "Step Pack")
+        self.assertEqual(map_explorer_kit_to_flow_kit("STEPS"), "Step Pack")
+        self.assertEqual(map_explorer_kit_to_flow_kit("STEP PACK"), "Step Pack")
 
     def test_flow_kit_insight_for_explorer_kit_uses_probe_payload_and_fails_safe(self) -> None:
         gantt_png = b"fake-png"
@@ -89,6 +92,12 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                         "tooltip_text": "Flow kit: Body",
                         "status_key": "yellow",
                         "pdf_link": r"docs\body.pdf",
+                    },
+                    {
+                        "flow_kit_name": "Pump Mounts",
+                        "display_text": "Weld | On track",
+                        "tooltip_text": "Flow kit: Pump Mounts",
+                        "status_key": "green",
                     }
                 ],
             }
@@ -107,11 +116,15 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertEqual(inactive_pump_insight.display_text, "Inactive")
         self.assertEqual(inactive_pump_insight.status_key, "missing")
 
-        untracked_pump_subkit = flow_kit_insight_for_explorer_kit("PUMP MOUNTS", truck_insight)
-        self.assertEqual(untracked_pump_subkit.display_text, "Not tracked")
-        self.assertEqual(untracked_pump_subkit.status_key, "missing")
+        tracked_pump_subkit = flow_kit_insight_for_explorer_kit("PUMP MOUNTS", truck_insight)
+        self.assertEqual(tracked_pump_subkit.display_text, "Weld | On track")
+        self.assertEqual(tracked_pump_subkit.status_key, "green")
 
-        untracked_insight = flow_kit_insight_for_explorer_kit("STEP PACK", truck_insight)
+        inactive_step_pack = flow_kit_insight_for_explorer_kit("STEP PACK", truck_insight)
+        self.assertEqual(inactive_step_pack.display_text, "Inactive")
+        self.assertEqual(inactive_step_pack.status_key, "missing")
+
+        untracked_insight = flow_kit_insight_for_explorer_kit("UNKNOWN KIT", truck_insight)
         self.assertEqual(untracked_insight.display_text, "Not tracked")
         self.assertEqual(untracked_insight.status_key, "missing")
 
@@ -569,8 +582,10 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         punch_codes = canonicalize_punch_codes_by_kit(
             {
                 "BODY": "P01 = Body vent",
+                "f55334::BODY": "P02 = Truck-specific body vent",
                 "PAINT PACK": "P01 = Paint pack vent",
                 "PUMPHOUSE": "P77 = Pump slot",
+                "bad-value::PUMPHOUSE": "ignore",
                 "": "ignore",
             },
             ["BODY | PAINT PACK", "PUMPHOUSE"],
@@ -580,7 +595,41 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             punch_codes,
             {
                 "PAINT PACK": "P01 = Paint pack vent",
+                "F55334::PAINT PACK": "P02 = Truck-specific body vent",
                 "PUMPHOUSE": "P77 = Pump slot",
+            },
+        )
+
+    def test_resolve_punch_code_text_prefers_truck_specific_entry(self) -> None:
+        punch_codes = {
+            "PAINT PACK": "P01 = Shared paint pack vent",
+            "F55334::PAINT PACK": "P99 = Truck-specific vent",
+        }
+
+        self.assertEqual(
+            resolve_punch_code_text(punch_codes, "F55334", "PAINT PACK"),
+            "P99 = Truck-specific vent",
+        )
+        self.assertEqual(
+            resolve_punch_code_text(punch_codes, "F55335", "PAINT PACK"),
+            "P01 = Shared paint pack vent",
+        )
+
+    def test_materialize_legacy_punch_codes_expands_shared_value_to_other_trucks(self) -> None:
+        punch_codes = materialize_legacy_punch_codes_for_kit(
+            {
+                "PAINT PACK": "P01 = Shared paint pack vent",
+                "F55334::PAINT PACK": "P99 = Truck-specific vent",
+            },
+            ["F55334", "F55335"],
+            "PAINT PACK",
+        )
+
+        self.assertEqual(
+            punch_codes,
+            {
+                "F55334::PAINT PACK": "P99 = Truck-specific vent",
+                "F55335::PAINT PACK": "P01 = Shared paint pack vent",
             },
         )
 

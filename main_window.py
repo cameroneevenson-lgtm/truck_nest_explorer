@@ -51,9 +51,11 @@ from models import (
     InventorOutputPaths,
     KitStatus,
     build_hidden_kit_key,
+    materialize_legacy_punch_codes_for_kit,
     normalize_hidden_truck_entries,
     normalize_hidden_truck_number,
     normalize_truck_order_entries,
+    resolve_punch_code_text,
 )
 from services import (
     collect_kit_statuses,
@@ -165,6 +167,10 @@ class MainWindow(QMainWindow):
         self._flow_cache_by_truck: dict[str, FlowTruckInsight] = {}
         self._flow_gantt_source_bytes: bytes | None = None
         self._flow_gantt_source_pixmap: QPixmap | None = None
+        self._truck_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_truck_future: Future[list[str]] | None = None
+        self._truck_request_serial = 0
+        self._pending_truck_request_serial = 0
         self._status_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_status_future: Future[list[KitStatus]] | None = None
         self._pending_status_truck_number: str = ""
@@ -178,6 +184,9 @@ class MainWindow(QMainWindow):
         self._inventor_watch_timer = QTimer(self)
         self._inventor_watch_timer.setInterval(1500)
         self._inventor_watch_timer.timeout.connect(self._poll_pending_inventor_job)
+        self._truck_watch_timer = QTimer(self)
+        self._truck_watch_timer.setInterval(120)
+        self._truck_watch_timer.timeout.connect(self._poll_pending_truck_future)
         self._status_watch_timer = QTimer(self)
         self._status_watch_timer.setInterval(120)
         self._status_watch_timer.timeout.connect(self._poll_pending_status_future)
@@ -188,7 +197,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_dashboard_style()
         self._load_settings_into_form()
-        self.refresh_trucks()
+        QTimer.singleShot(0, self.refresh_trucks)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -757,24 +766,63 @@ class MainWindow(QMainWindow):
             line_edit.setText(path)
 
     def refresh_trucks(self) -> None:
-        current = self.current_truck_number()
         self._status_cache_by_truck.clear()
         self._flow_cache_by_truck.clear()
-        self._all_trucks = sort_truck_numbers_by_fabrication_order(
-            discover_trucks(self.settings),
-            self.settings,
+        previous_future = self._pending_truck_future
+        if previous_future is not None and not previous_future.done():
+            previous_future.cancel()
+
+        settings_snapshot = self._settings_from_form()
+        self._truck_request_serial += 1
+        self._pending_truck_request_serial = self._truck_request_serial
+        self._pending_truck_future = self._truck_executor.submit(
+            self._discover_truck_numbers,
+            settings_snapshot,
         )
+        self.refresh_button.setEnabled(False)
+        self.statusBar().showMessage("Loading trucks...")
+        self._truck_watch_timer.start()
+
+    def _discover_truck_numbers(self, settings: ExplorerSettings) -> list[str]:
+        return sort_truck_numbers_by_fabrication_order(
+            discover_trucks(settings),
+            settings,
+        )
+
+    def _poll_pending_truck_future(self) -> None:
+        future = self._pending_truck_future
+        if future is None:
+            self._truck_watch_timer.stop()
+            return
+        if not future.done():
+            return
+
+        request_serial = self._pending_truck_request_serial
+        self._pending_truck_future = None
+        self._truck_watch_timer.stop()
+        self.refresh_button.setEnabled(True)
+
+        try:
+            trucks = future.result()
+        except Exception as exc:
+            self.log(f"Could not load trucks: {exc}")
+            trucks = []
+
+        if request_serial != self._truck_request_serial:
+            return
+
+        self._all_trucks = trucks
         release_root = Path(self.settings.release_root)
         if not release_root.exists():
             self.log(f"Release root not found: {release_root}")
         self._apply_truck_filter()
-        if current and self._select_truck(current):
-            return
-        if self.truck_list.count():
-            self.truck_list.setCurrentRow(0)
-        else:
+        if not self.truck_list.count():
             self._current_flow_truck_insight = empty_flow_truck_insight()
-            self._set_current_statuses([])
+            self._set_current_statuses([], cache=False)
+
+        truck_count = len(self._all_trucks)
+        noun = "truck" if truck_count == 1 else "trucks"
+        self.statusBar().showMessage(f"Loaded {truck_count} {noun}.", 3000)
 
     def _apply_truck_filter(self) -> None:
         wanted = self.search_edit.text().strip().casefold()
@@ -995,8 +1043,12 @@ class MainWindow(QMainWindow):
             item.setToolTip(tooltip)
         return item
 
-    def _punch_code_text_for_kit(self, kit_name: str) -> str:
-        return str(self.settings.punch_codes_by_kit.get(kit_name) or "")
+    def _punch_code_text_for_status(self, status: KitStatus) -> str:
+        return resolve_punch_code_text(
+            self.settings.punch_codes_by_kit,
+            status.paths.truck_number,
+            status.kit_name,
+        )
 
     def _on_kit_table_item_changed(self, item: QTableWidgetItem) -> None:
         if self._updating_kit_table or item.column() != self.PUNCH_CODE_COLUMN:
@@ -1004,16 +1056,23 @@ class MainWindow(QMainWindow):
         row = item.row()
         if row < 0 or row >= len(self._current_statuses):
             return
-        kit_name = self._current_statuses[row].kit_name
+        status = self._current_statuses[row]
+        punch_code_key = build_hidden_kit_key(status.paths.truck_number, status.kit_name)
+        if not punch_code_key:
+            return
         text = item.text().strip()
-        updated = dict(self.settings.punch_codes_by_kit)
+        updated = materialize_legacy_punch_codes_for_kit(
+            self.settings.punch_codes_by_kit,
+            self._all_trucks,
+            status.kit_name,
+        )
         if text:
-            updated[kit_name] = text
+            updated[punch_code_key] = text
         else:
-            updated.pop(kit_name, None)
+            updated.pop(punch_code_key, None)
         self.settings.punch_codes_by_kit = updated
         save_settings(self.settings)
-        self.log(f"Saved punch code for {self._current_statuses[row].paths.display_name}.")
+        self.log(f"Saved punch code for {status.paths.display_name}.")
 
     def _on_kit_table_item_clicked(self, item: QTableWidgetItem) -> None:
         row = item.row()
@@ -1067,11 +1126,11 @@ class MainWindow(QMainWindow):
             nest_summary_color = yellow
 
         punch_code_item = self._make_item(
-            self._punch_code_text_for_kit(status.kit_name),
+            self._punch_code_text_for_status(status),
             foreground=hidden_foreground,
         )
         punch_code_item.setFlags(punch_code_item.flags() | Qt.ItemFlag.ItemIsEditable)
-        punch_code_item.setToolTip("Double-click to edit punch code notes for this kit.")
+        punch_code_item.setToolTip("Double-click to edit punch code notes for this truck.")
 
         project_file_item = self._make_open_link_item(
             exists=bool(status.rpd_exists and status.paths.rpd_path is not None),
