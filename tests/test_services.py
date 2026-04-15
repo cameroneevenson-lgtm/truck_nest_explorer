@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import uuid
+from unittest.mock import patch
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
@@ -23,8 +24,10 @@ from flow_bridge import (
     normalize_flow_insight_for_local_release,
     parse_flow_probe_payload,
 )
+from flow_schedule_probe import include_kit_in_embedded_gantt
 from models import (
     canonicalize_client_numbers_by_truck,
+    canonicalize_notes_by_kit,
     ExplorerSettings,
     build_hidden_kit_key,
     canonicalize_hidden_kit_entries,
@@ -32,8 +35,10 @@ from models import (
     materialize_legacy_punch_codes_for_kit,
     resolve_punch_code_text,
 )
+from settings_store import load_settings, save_settings
 from services import (
     build_kit_paths,
+    build_launch_command,
     build_kit_status,
     collect_kit_statuses,
     create_kit_scaffold,
@@ -46,6 +51,7 @@ from services import (
     find_fabrication_truck_dir,
     is_hidden_kit,
     is_hidden_truck,
+    launch_tool,
     move_inventor_outputs_to_project,
     sort_truck_numbers_by_fabrication_order,
 )
@@ -65,6 +71,27 @@ def workspace_tempdir() -> Path:
 
 
 class TruckNestExplorerServicesTests(unittest.TestCase):
+    def test_default_dashboard_launcher_targets_fabrication_flow_dashboard(self) -> None:
+        settings = ExplorerSettings()
+        self.assertEqual(settings.dashboard_launcher, r"C:\Tools\fabrication_flow_dashboard\run_app.bat")
+
+    def test_build_launch_command_uses_cmd_for_batch_files(self) -> None:
+        command = build_launch_command(r"C:\Tools\fabrication_flow_dashboard\run_app.bat")
+        self.assertEqual(command, ["cmd.exe", "/c", r"C:\Tools\fabrication_flow_dashboard\run_app.bat"])
+
+    def test_launch_tool_starts_dashboard_launcher_in_its_own_folder(self) -> None:
+        with workspace_tempdir() as temp_dir:
+            launcher_path = temp_dir / "run_app.bat"
+            launcher_path.write_text("@echo off\r\necho launched\r\n", encoding="utf-8")
+
+            with patch("services.subprocess.Popen") as popen_mock:
+                launch_tool(launcher_path)
+
+            popen_mock.assert_called_once_with(
+                ["cmd.exe", "/c", str(launcher_path)],
+                cwd=str(temp_dir),
+            )
+
     def test_map_explorer_kit_to_flow_kit_uses_built_in_schedule_rollups(self) -> None:
         self.assertEqual(map_explorer_kit_to_flow_kit("PAINT PACK"), "Body")
         self.assertEqual(map_explorer_kit_to_flow_kit("CHASSIS PACK"), "Chassis")
@@ -72,10 +99,21 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertEqual(map_explorer_kit_to_flow_kit("PUMP MOUNTS"), "Pump Mounts")
         self.assertEqual(map_explorer_kit_to_flow_kit("PUMP COVERINGS"), "Pump Covering")
         self.assertEqual(map_explorer_kit_to_flow_kit("PUMP BRACKETS"), "Pump Brackets")
+        self.assertEqual(map_explorer_kit_to_flow_kit("console"), "Console")
         self.assertEqual(map_explorer_kit_to_flow_kit("OPERATIONAL PANELS"), "Operational Panels")
+        self.assertEqual(map_explorer_kit_to_flow_kit("OPS PANELS"), "Operational Panels")
         self.assertEqual(map_explorer_kit_to_flow_kit("STEPS PACK"), "Step Pack")
         self.assertEqual(map_explorer_kit_to_flow_kit("STEPS"), "Step Pack")
         self.assertEqual(map_explorer_kit_to_flow_kit("STEP PACK"), "Step Pack")
+
+    def test_embedded_gantt_excludes_small_kit_lanes(self) -> None:
+        self.assertTrue(include_kit_in_embedded_gantt("Body"))
+        self.assertTrue(include_kit_in_embedded_gantt("Console"))
+        self.assertFalse(include_kit_in_embedded_gantt("Chassis"))
+        self.assertFalse(include_kit_in_embedded_gantt("Pump Mounts"))
+        self.assertFalse(include_kit_in_embedded_gantt("Pump Coverings"))
+        self.assertFalse(include_kit_in_embedded_gantt("Steps"))
+        self.assertFalse(include_kit_in_embedded_gantt("Operational Panels"))
 
     def test_flow_kit_insight_for_explorer_kit_uses_probe_payload_and_fails_safe(self) -> None:
         gantt_png = b"fake-png"
@@ -240,6 +278,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             str(steps_paths.fabrication_kit_dir),
             r"W:\LASER\For Battleshield Fabrication\F55334\STEP PACK",
         )
+
+    def test_build_kit_paths_accepts_console_and_ops_panel_aliases(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            console_project_dir = release_root / "F55974" / "CONSOLE" / "F55974 CONSOLE"
+            ops_project_dir = release_root / "F55974" / "OPS PANELS" / "F55974 OPS PANELS"
+            console_project_dir.mkdir(parents=True)
+            ops_project_dir.mkdir(parents=True)
+
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            console_paths = build_kit_paths("F55974", "console", settings)
+            ops_panel_paths = build_kit_paths("F55974", "OPS PANELS", settings)
+
+            self.assertEqual(console_paths.kit_name, "CONSOLE PACK")
+            self.assertEqual(console_paths.release_kit_dir, console_project_dir.parent)
+            self.assertEqual(console_paths.project_dir, console_project_dir)
+            self.assertEqual(
+                str(console_paths.fabrication_kit_dir),
+                str(fabrication_root / "F55974" / "CONSOLE PACK"),
+            )
+            self.assertEqual(ops_panel_paths.kit_name, "OPERATIONAL PANELS")
+            self.assertEqual(ops_panel_paths.release_kit_dir, ops_project_dir.parent)
+            self.assertEqual(ops_panel_paths.project_dir, ops_project_dir)
+            self.assertEqual(
+                str(ops_panel_paths.fabrication_kit_dir),
+                str(fabrication_root / "F55974" / "PUMP PACK" / "OPERATIONAL PANELS"),
+            )
 
     def test_build_kit_paths_prefers_existing_plural_coverings_release_path(self) -> None:
         with workspace_tempdir() as temp_dir:
@@ -633,6 +703,26 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             },
         )
 
+    def test_canonicalize_notes_map_uses_canonical_kit_name(self) -> None:
+        notes = canonicalize_notes_by_kit(
+            {
+                "BODY": "General body note",
+                "f55334::BODY": "Truck-specific body note",
+                "PAINT PACK": "General paint note",
+                "bad-value::PUMPHOUSE": "ignore",
+                "": "ignore",
+            },
+            ["BODY | PAINT PACK", "PUMPHOUSE"],
+        )
+
+        self.assertEqual(
+            notes,
+            {
+                "PAINT PACK": "General paint note",
+                "F55334::PAINT PACK": "Truck-specific body note",
+            },
+        )
+
     def test_canonicalize_client_numbers_by_truck_normalizes_keys(self) -> None:
         client_numbers = canonicalize_client_numbers_by_truck(
             {
@@ -676,9 +766,34 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             all_statuses = filter_kit_statuses(kit_statuses, settings, show_hidden=True)
 
             self.assertEqual([status.kit_name for status in visible], ["PUMPHOUSE"])
-            self.assertEqual([status.kit_name for status in all_statuses], ["PAINT PACK", "PUMPHOUSE"])
-            self.assertTrue(is_hidden_kit("F55334", "PAINT PACK", settings))
-            self.assertFalse(is_hidden_kit("F55334", "PUMPHOUSE", settings))
+        self.assertEqual([status.kit_name for status in all_statuses], ["PAINT PACK", "PUMPHOUSE"])
+        self.assertTrue(is_hidden_kit("F55334", "PAINT PACK", settings))
+        self.assertFalse(is_hidden_kit("F55334", "PUMPHOUSE", settings))
+
+    def test_save_and_load_settings_round_trip_notes_by_kit(self) -> None:
+        with workspace_tempdir() as temp_root:
+            runtime_dir = temp_root / "runtime"
+            settings_path = runtime_dir / "settings.json"
+            settings = ExplorerSettings(
+                notes_by_kit={
+                    "f55334::BODY": "Truck-specific body note",
+                    "PAINT PACK": "Shared paint note",
+                    "bad-value::PUMPHOUSE": "ignore",
+                },
+                kit_templates=["BODY | PAINT PACK", "PUMPHOUSE"],
+            )
+
+            with patch("settings_store.RUNTIME_DIR", runtime_dir), patch("settings_store.SETTINGS_PATH", settings_path):
+                save_settings(settings)
+                loaded = load_settings()
+
+            self.assertEqual(
+                loaded.notes_by_kit,
+                {
+                    "F55334::PAINT PACK": "Truck-specific body note",
+                    "PAINT PACK": "Shared paint note",
+                },
+            )
 
 
 def detect_status_from_paths(paths):

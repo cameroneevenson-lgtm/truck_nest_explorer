@@ -4,6 +4,7 @@ A PySide6 desktop tool for browsing truck kit folders, creating L-side kit scaff
 
 It also includes:
 
+- a direct `Flow App` action that launches `fabrication_flow_dashboard`
 - on-demand opening of the best matching Nest Summary PDF found in the L-side project area
 - editable per-kit punch-code notes directly in the kit table
 - saved client numbers per truck

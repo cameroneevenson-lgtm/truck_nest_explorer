@@ -691,18 +691,43 @@ def open_external_target(target: str | Path) -> None:
     open_path(Path(text))
 
 
-def launch_launcher(launcher_path: Path | str, argument_path: Path | str) -> None:
-    launcher = Path(str(launcher_path))
-    argument = Path(str(argument_path))
-    if not launcher.exists():
-        raise FileNotFoundError(str(launcher))
-    if not argument.exists():
-        raise FileNotFoundError(str(argument))
+def build_launch_command(
+    entry_path: Path | str,
+    argument_path: Path | str | None = None,
+) -> list[str]:
+    entry = Path(str(entry_path))
+    suffix = entry.suffix.casefold()
+    if suffix == ".py":
+        command = [_python_executable(), str(entry)]
+    elif suffix in {".bat", ".cmd"}:
+        command = ["cmd.exe", "/c", str(entry)]
+    else:
+        command = [str(entry)]
+    if argument_path is not None:
+        command.append(str(Path(str(argument_path))))
+    return command
+
+
+def launch_tool(
+    entry_path: Path | str,
+    argument_path: Path | str | None = None,
+) -> None:
+    entry = Path(str(entry_path))
+    if not entry.exists():
+        raise FileNotFoundError(str(entry))
+    if argument_path is not None:
+        argument = Path(str(argument_path))
+        if not argument.exists():
+            raise FileNotFoundError(str(argument))
 
     subprocess.Popen(
-        ["cmd.exe", "/c", str(launcher), str(argument)],
-        cwd=str(launcher.parent),
+        build_launch_command(entry, argument_path=argument_path),
+        cwd=str(entry.parent),
     )
+
+
+def launch_launcher(launcher_path: Path | str, argument_path: Path | str) -> None:
+    launch_tool(launcher_path, argument_path=argument_path)
 
 
 def _python_executable() -> str:

@@ -9,6 +9,29 @@ import sys
 
 APP_DIR = Path(__file__).resolve().parent
 FLOW_APP_DIR = APP_DIR.parent / "fabrication_flow_dashboard"
+EMBEDDED_GANTT_SMALL_KIT_KEYS = frozenset(
+    {
+        "chassis",
+        "pump covering",
+        "pump mounts",
+        "pump brackets",
+        "step pack",
+        "operational panels",
+    }
+)
+
+
+def _normalize_embedded_gantt_kit_key(kit_name: object) -> str:
+    text = str(kit_name or "").strip().casefold()
+    if text == "pump coverings":
+        return "pump covering"
+    if text in {"steps", "steps pack"}:
+        return "step pack"
+    return text
+
+
+def include_kit_in_embedded_gantt(kit_name: object) -> bool:
+    return _normalize_embedded_gantt_kit_key(kit_name) not in EMBEDDED_GANTT_SMALL_KIT_KEYS
 
 
 def _emit(payload: dict[str, object]) -> int:
@@ -158,6 +181,7 @@ def main(argv: list[str]) -> int:
         trucks=[target_truck],
         schedule_insights=insights,
         max_rows=max(1, len(getattr(target_truck, "kits", [])) * 2),
+        include_small_kits=False,
     )
     truck_start_week = None
     if getattr(target_truck, "id", None) is not None:
@@ -172,6 +196,8 @@ def main(argv: list[str]) -> int:
         completed_rows: list[OverlayRow] = []
         for kit in getattr(target_truck, "kits", []):
             if not bool(getattr(kit, "is_active", True)):
+                continue
+            if not include_kit_in_embedded_gantt(getattr(kit, "kit_name", "")):
                 continue
             if stage_from_id(getattr(kit, "front_stage_id", None)) != Stage.COMPLETE:
                 continue

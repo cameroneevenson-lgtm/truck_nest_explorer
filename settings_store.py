@@ -8,6 +8,7 @@ from models import (
     DEFAULT_KIT_TEMPLATES,
     canonicalize_client_numbers_by_truck,
     canonicalize_hidden_kit_entries,
+    canonicalize_notes_by_kit,
     canonicalize_punch_codes_by_kit,
     ExplorerSettings,
     normalize_hidden_truck_entries,
@@ -45,12 +46,14 @@ def load_settings() -> ExplorerSettings:
     return ExplorerSettings(
         release_root=default_settings.release_root,
         fabrication_root=default_settings.fabrication_root,
+        dashboard_launcher=default_settings.dashboard_launcher,
         radan_kitter_launcher=default_settings.radan_kitter_launcher,
         inventor_to_radan_entry=default_settings.inventor_to_radan_entry,
         rpd_template_path=default_settings.rpd_template_path,
         template_replacements_text="",
         punch_codes_text=str(payload.get("punch_codes_text") or ""),
         punch_codes_by_kit=canonicalize_punch_codes_by_kit(payload.get("punch_codes_by_kit"), kit_templates),
+        notes_by_kit=canonicalize_notes_by_kit(payload.get("notes_by_kit"), kit_templates),
         client_numbers_by_truck=canonicalize_client_numbers_by_truck(payload.get("client_numbers_by_truck")),
         create_support_folders=default_settings.create_support_folders,
         kit_templates=kit_templates,
@@ -66,6 +69,7 @@ def save_settings(settings: ExplorerSettings) -> Path:
     payload = asdict(settings)
     payload["release_root"] = default_settings.release_root
     payload["fabrication_root"] = default_settings.fabrication_root
+    payload["dashboard_launcher"] = default_settings.dashboard_launcher
     payload["radan_kitter_launcher"] = default_settings.radan_kitter_launcher
     payload["inventor_to_radan_entry"] = default_settings.inventor_to_radan_entry
     payload["rpd_template_path"] = default_settings.rpd_template_path
@@ -74,6 +78,10 @@ def save_settings(settings: ExplorerSettings) -> Path:
     payload["kit_templates"] = _normalize_kit_templates(DEFAULT_KIT_TEMPLATES)
     payload["punch_codes_by_kit"] = canonicalize_punch_codes_by_kit(
         settings.punch_codes_by_kit,
+        settings.kit_templates,
+    )
+    payload["notes_by_kit"] = canonicalize_notes_by_kit(
+        settings.notes_by_kit,
         settings.kit_templates,
     )
     payload["client_numbers_by_truck"] = canonicalize_client_numbers_by_truck(

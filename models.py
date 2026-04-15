@@ -6,6 +6,7 @@ import re
 
 DEFAULT_RELEASE_ROOT = r"L:\BATTLESHIELD\F-LARGE FLEET"
 DEFAULT_FABRICATION_ROOT = r"W:\LASER\For Battleshield Fabrication"
+DEFAULT_DASHBOARD_LAUNCHER = r"C:\Tools\fabrication_flow_dashboard\run_app.bat"
 DEFAULT_RADAN_KITTER_LAUNCHER = r"C:\Tools\radan_kitter\radan_kitter.bat"
 DEFAULT_INVENTOR_TO_RADAN_ENTRY = r"C:\Tools\inventor_to_radan\inventor_to_radan.bat"
 DEFAULT_SUPPORT_FOLDERS = ("_bak", "_out", "_kits")
@@ -25,6 +26,8 @@ DEFAULT_KIT_TEMPLATES = [
 TRUCK_NUMBER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 HIDDEN_KIT_SEPARATOR = "::"
 KIT_NAME_ALIASES = {
+    "CONSOLE": "CONSOLE PACK",
+    "OPS PANELS": "OPERATIONAL PANELS",
     "PUMP COVERINGS": "PUMP COVERING",
     "STEPS PACK": "STEP PACK",
     "STEPS": "STEP PACK",
@@ -299,16 +302,50 @@ def canonicalize_punch_codes_by_kit(
     return cleaned
 
 
+def canonicalize_notes_by_kit(
+    values: object,
+    kit_template_values: list[object] | None,
+) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+
+    kit_name_lookup: dict[str, str] = {}
+    for mapping in build_kit_mappings(kit_template_values):
+        kit_name_lookup[mapping.display_name.casefold()] = mapping.kit_name
+        kit_name_lookup[mapping.kit_name.casefold()] = mapping.kit_name
+    for alias_name, canonical_name in KIT_NAME_ALIASES.items():
+        kit_name_lookup[alias_name.casefold()] = canonical_name
+
+    cleaned: dict[str, str] = {}
+    for raw_key, raw_value in values.items():
+        key_text = str(raw_key or "").strip()
+        value_text = str(raw_value or "")
+        if not key_text or not value_text.strip():
+            continue
+        if HIDDEN_KIT_SEPARATOR in key_text:
+            truck_part, kit_part = key_text.split(HIDDEN_KIT_SEPARATOR, 1)
+            canonical_kit_name = kit_name_lookup.get(kit_part.strip().casefold(), kit_part.strip())
+            canonical_key = build_hidden_kit_key(truck_part, canonical_kit_name)
+            if not canonical_key:
+                continue
+        else:
+            canonical_key = kit_name_lookup.get(key_text.casefold(), key_text)
+        cleaned[canonical_key] = value_text
+    return cleaned
+
+
 @dataclass
 class ExplorerSettings:
     release_root: str = DEFAULT_RELEASE_ROOT
     fabrication_root: str = DEFAULT_FABRICATION_ROOT
+    dashboard_launcher: str = DEFAULT_DASHBOARD_LAUNCHER
     radan_kitter_launcher: str = DEFAULT_RADAN_KITTER_LAUNCHER
     inventor_to_radan_entry: str = DEFAULT_INVENTOR_TO_RADAN_ENTRY
     rpd_template_path: str = ""
     template_replacements_text: str = ""
     punch_codes_text: str = ""
     punch_codes_by_kit: dict[str, str] = field(default_factory=dict)
+    notes_by_kit: dict[str, str] = field(default_factory=dict)
     client_numbers_by_truck: dict[str, str] = field(default_factory=dict)
     create_support_folders: bool = True
     kit_templates: list[str] = field(default_factory=lambda: list(DEFAULT_KIT_TEMPLATES))
