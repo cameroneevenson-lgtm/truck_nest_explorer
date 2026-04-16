@@ -34,6 +34,26 @@ def include_kit_in_embedded_gantt(kit_name: object) -> bool:
     return _normalize_embedded_gantt_kit_key(kit_name) not in EMBEDDED_GANTT_SMALL_KIT_KEYS
 
 
+def _overlay_row_kit_name(row: object) -> str:
+    parts = str(getattr(row, "row_label", "") or "").split("|", 1)
+    if len(parts) != 2:
+        return ""
+    return parts[1].strip()
+
+
+def split_overlay_rows_for_embedded_gantt(rows: list[object]) -> tuple[list[object], dict[str, object]]:
+    embedded_rows: list[object] = []
+    rows_by_kit_name: dict[str, object] = {}
+    for row in rows:
+        kit_name = _overlay_row_kit_name(row)
+        if not kit_name:
+            continue
+        rows_by_kit_name[kit_name.casefold()] = row
+        if include_kit_in_embedded_gantt(kit_name):
+            embedded_rows.append(row)
+    return embedded_rows, rows_by_kit_name
+
+
 def _emit(payload: dict[str, object]) -> int:
     print(json.dumps(payload, separators=(",", ":")))
     return 0
@@ -177,12 +197,13 @@ def main(argv: list[str]) -> int:
             float(getattr(window, "end_week", 0.0) or 0.0),
         )
 
-    overlay_rows = build_overlay_rows(
+    all_overlay_rows = build_overlay_rows(
         trucks=[target_truck],
         schedule_insights=insights,
         max_rows=max(1, len(getattr(target_truck, "kits", [])) * 2),
-        include_small_kits=False,
+        include_small_kits=True,
     )
+    overlay_rows, rows_by_kit_name = split_overlay_rows_for_embedded_gantt(all_overlay_rows)
     truck_start_week = None
     if getattr(target_truck, "id", None) is not None:
         truck_start_week = insights.truck_planned_start_week_by_id.get(int(target_truck.id))
@@ -255,16 +276,6 @@ def main(argv: list[str]) -> int:
         if completed_rows:
             overlay_rows = list(overlay_rows) + completed_rows
             overlay_rows.sort(key=_overlay_sort_key)
-
-    rows_by_kit_name = {}
-    for row in overlay_rows:
-        parts = str(getattr(row, "row_label", "") or "").split("|", 1)
-        if len(parts) != 2:
-            continue
-        row_kit_name = parts[1].strip()
-        if not row_kit_name:
-            continue
-        rows_by_kit_name[row_kit_name.casefold()] = row
 
     gantt_png_base64 = ""
     if overlay_rows:

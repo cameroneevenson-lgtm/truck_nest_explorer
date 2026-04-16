@@ -13,6 +13,7 @@ DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 APP_DIR = Path(__file__).resolve().parent
 FLOW_APP_DIR = APP_DIR.parent / "fabrication_flow_dashboard"
 FLOW_PROBE_PATH = APP_DIR / "flow_schedule_probe.py"
+FLOW_DB_PATH = FLOW_APP_DIR / "fabrication_flow.db"
 
 EXPLORER_TO_FLOW_KIT_NAME = {
     "PAINT PACK": "Body",
@@ -79,6 +80,23 @@ def _python_executable() -> str:
     if DEFAULT_VENV_PYTHON.exists():
         return str(DEFAULT_VENV_PYTHON)
     return sys.executable
+
+
+def _file_cache_token(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return f"{path.name}:missing"
+    return f"{path.name}:{int(stat.st_mtime_ns)}:{int(stat.st_size)}"
+
+
+def flow_probe_cache_token() -> str:
+    return "|".join(
+        (
+            _file_cache_token(FLOW_PROBE_PATH),
+            _file_cache_token(FLOW_DB_PATH),
+        )
+    )
 
 
 def _normalize_status_key(value: object) -> str:

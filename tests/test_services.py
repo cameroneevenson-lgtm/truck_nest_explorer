@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import sys
+from types import SimpleNamespace
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +25,7 @@ from flow_bridge import (
     normalize_flow_insight_for_local_release,
     parse_flow_probe_payload,
 )
-from flow_schedule_probe import include_kit_in_embedded_gantt
+from flow_schedule_probe import include_kit_in_embedded_gantt, split_overlay_rows_for_embedded_gantt
 from models import (
     canonicalize_client_numbers_by_truck,
     canonicalize_notes_by_kit,
@@ -114,6 +115,18 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertFalse(include_kit_in_embedded_gantt("Pump Coverings"))
         self.assertFalse(include_kit_in_embedded_gantt("Steps"))
         self.assertFalse(include_kit_in_embedded_gantt("Operational Panels"))
+
+    def test_split_overlay_rows_for_embedded_gantt_keeps_small_kit_status_lookup(self) -> None:
+        rows = [
+            SimpleNamespace(row_label="F55334 | Pump Covering", status_key="red"),
+            SimpleNamespace(row_label="F55334 | Exterior", status_key="yellow"),
+        ]
+
+        embedded_rows, rows_by_kit_name = split_overlay_rows_for_embedded_gantt(rows)
+
+        self.assertEqual([row.row_label for row in embedded_rows], ["F55334 | Exterior"])
+        self.assertEqual(rows_by_kit_name["pump covering"].status_key, "red")
+        self.assertEqual(rows_by_kit_name["exterior"].status_key, "yellow")
 
     def test_flow_kit_insight_for_explorer_kit_uses_probe_payload_and_fails_safe(self) -> None:
         gantt_png = b"fake-png"

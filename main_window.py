@@ -41,6 +41,7 @@ from flow_bridge import (
     FlowTruckInsight,
     empty_flow_truck_insight,
     flow_kit_insight_for_explorer_kit,
+    flow_probe_cache_token,
     load_flow_truck_insight,
     normalize_flow_insight_for_local_release,
 )
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
         "Kit",
         "Project File",
         "Nest Summary",
+        "Print Packet",
         "Release",
         "Flow",
         "Punch Code",
@@ -133,9 +135,10 @@ class MainWindow(QMainWindow):
     )
     PROJECT_FILE_COLUMN = 1
     NEST_SUMMARY_COLUMN = 2
-    FLOW_COLUMN = 4
-    PUNCH_CODE_COLUMN = 5
-    NOTES_COLUMN = 6
+    PRINT_PACKET_COLUMN = 3
+    FLOW_COLUMN = 5
+    PUNCH_CODE_COLUMN = 6
+    NOTES_COLUMN = 7
 
     def __init__(
         self,
@@ -167,7 +170,7 @@ class MainWindow(QMainWindow):
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
         self._pending_inventor_job: PendingInventorJob | None = None
         self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
-        self._flow_cache_by_truck: dict[str, FlowTruckInsight] = {}
+        self._flow_cache_by_truck: dict[str, tuple[str, FlowTruckInsight]] = {}
         self._flow_gantt_source_bytes: bytes | None = None
         self._flow_gantt_source_pixmap: QPixmap | None = None
         self._truck_executor = ThreadPoolExecutor(max_workers=1)
@@ -175,15 +178,9 @@ class MainWindow(QMainWindow):
         self._truck_request_serial = 0
         self._pending_truck_request_serial = 0
         self._status_executor = ThreadPoolExecutor(max_workers=1)
-        self._pending_status_future: Future[list[KitStatus]] | None = None
-        self._pending_status_truck_number: str = ""
-        self._status_request_serial = 0
-        self._pending_status_request_serial = 0
+        self._pending_status_by_truck: dict[str, tuple[str, Future[list[KitStatus]]]] = {}
         self._flow_executor = ThreadPoolExecutor(max_workers=1)
-        self._pending_flow_future: Future[FlowTruckInsight] | None = None
-        self._pending_flow_truck_number: str = ""
-        self._flow_request_serial = 0
-        self._pending_flow_request_serial = 0
+        self._pending_flow_by_truck: dict[str, tuple[str, str, Future[FlowTruckInsight]]] = {}
         self._inventor_watch_timer = QTimer(self)
         self._inventor_watch_timer.setInterval(1500)
         self._inventor_watch_timer.timeout.connect(self._poll_pending_inventor_job)
@@ -327,6 +324,10 @@ class MainWindow(QMainWindow):
             }
             QTableWidget#kit_table {
                 selection-background-color: rgba(148, 163, 184, 0.18);
+            }
+            QTableWidget#kit_table QLineEdit {
+                padding: 2px 6px;
+                margin: 0px;
             }
             QTableWidget#kit_table::item:selected {
                 background: rgba(148, 163, 184, 0.18);
@@ -603,9 +604,6 @@ class MainWindow(QMainWindow):
         truck_row.addStretch(1)
 
         kit_row = QHBoxLayout()
-        self.open_rpd_button = QPushButton("Open Project")
-        self.open_rpd_button.setToolTip("Open the selected kit project file on L.")
-        self.open_rpd_button.clicked.connect(self.open_selected_rpd)
         self.open_release_folder_button = QPushButton("Open L Kit")
         self.open_release_folder_button.setToolTip("Open the selected kit folder on L.")
         self.open_release_folder_button.clicked.connect(self.open_selected_release_folder)
@@ -615,17 +613,11 @@ class MainWindow(QMainWindow):
         self.open_spreadsheet_button = QPushButton("BOM")
         self.open_spreadsheet_button.setToolTip("Open the single spreadsheet found for the selected kit on W.")
         self.open_spreadsheet_button.clicked.connect(self.open_selected_spreadsheet)
-        self.open_flow_pdf_button = QPushButton("Flow PDF")
+        self.open_flow_pdf_button = QPushButton("Flow Link")
         self.open_flow_pdf_button.setToolTip(
-            "Open the linked PDF for the selected mapped flow kit from the fabrication flow dashboard."
+            "Open the linked file or URL for the selected mapped flow kit from the fabrication flow dashboard."
         )
         self.open_flow_pdf_button.clicked.connect(self.open_selected_flow_pdf)
-        self.open_nest_summary_button = QPushButton("Open Nest Summary")
-        self.open_nest_summary_button.setToolTip("Open the selected kit Nest Summary PDF on L.")
-        self.open_nest_summary_button.clicked.connect(self.open_selected_nest_summary)
-        self.open_print_packet_button = QPushButton("Open Print Packet")
-        self.open_print_packet_button.setToolTip("Open the selected kit Print Packet PDF on L.")
-        self.open_print_packet_button.clicked.connect(self.open_selected_print_packet)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
@@ -640,13 +632,10 @@ class MainWindow(QMainWindow):
         )
         self.toggle_selected_kits_hidden_button.clicked.connect(self.toggle_selected_kits_hidden)
         for button in (
-            self.open_rpd_button,
             self.open_release_folder_button,
             self.open_fabrication_folder_button,
             self.open_spreadsheet_button,
             self.open_flow_pdf_button,
-            self.open_nest_summary_button,
-            self.open_print_packet_button,
             self.launch_kitter_button,
             self.launch_inventor_button,
             self.toggle_selected_kits_hidden_button,
@@ -783,7 +772,7 @@ class MainWindow(QMainWindow):
         if status.spreadsheet_match.chosen_path is not None:
             actions.append("BOM")
         if str(flow_insight.pdf_link or "").strip():
-            actions.append("Flow PDF")
+            actions.append("Flow Link")
         if status.preview_pdf_match.chosen_path is not None:
             actions.append("Open Nest Summary")
         if packet_match.chosen_path is not None:
@@ -896,10 +885,7 @@ class MainWindow(QMainWindow):
         if not flow_summary:
             flow_summary = "Unavailable"
 
-        loading_statuses = (
-            self._pending_status_future is not None
-            and self._pending_status_truck_number.casefold() == truck_number.casefold()
-        )
+        loading_statuses = truck_number.casefold() in self._pending_status_by_truck
 
         detail_lines = [
             f"Truck: {truck_number}",
@@ -1011,6 +997,8 @@ class MainWindow(QMainWindow):
     def refresh_trucks(self) -> None:
         self._status_cache_by_truck.clear()
         self._flow_cache_by_truck.clear()
+        self._pending_status_by_truck.clear()
+        self._pending_flow_by_truck.clear()
         previous_future = self._pending_truck_future
         if previous_future is not None and not previous_future.done():
             previous_future.cancel()
@@ -1111,29 +1099,51 @@ class MainWindow(QMainWindow):
 
     def _on_truck_changed(self) -> None:
         truck_number = self.current_truck_number()
+        truck_key = truck_number.casefold()
         self._refresh_current_truck_heading()
         self._refresh_truck_order_buttons()
         if not truck_number:
             self._current_flow_truck_insight = empty_flow_truck_insight()
             self._set_current_statuses([])
             return
-        cached_statuses = self._status_cache_by_truck.get(truck_number.casefold())
+        cached_statuses = self._status_cache_by_truck.get(truck_key)
         if cached_statuses is not None:
             self._set_current_statuses(list(cached_statuses))
         else:
             self._set_current_statuses([], cache=False)
-            self.log(f"Loading kit statuses for {truck_number}...")
-            self._status_request_serial += 1
-            self._pending_status_request_serial = self._status_request_serial
-            self._pending_status_truck_number = truck_number
-            self._pending_status_future = self._status_executor.submit(collect_kit_statuses, truck_number, self.settings)
-            self._status_watch_timer.start()
+            pending_status = self._pending_status_by_truck.get(truck_key)
+            if pending_status is None:
+                self.log(f"Loading kit statuses for {truck_number}...")
+                self._pending_status_by_truck[truck_key] = (
+                    truck_number,
+                    self._status_executor.submit(collect_kit_statuses, truck_number, self.settings),
+                )
+                self._status_watch_timer.start()
 
-        cached_flow = self._flow_cache_by_truck.get(truck_number.casefold())
+        current_flow_token = flow_probe_cache_token()
+        cached_flow = self._flow_cache_by_truck.get(truck_key)
         if cached_flow is not None:
-            self._current_flow_truck_insight = cached_flow
-            self._refresh_current_truck_heading()
-            return
+            cached_token, cached_insight = cached_flow
+            if cached_token == current_flow_token:
+                self._current_flow_truck_insight = cached_insight
+                self._refresh_current_truck_heading()
+                return
+            self._flow_cache_by_truck.pop(truck_key, None)
+
+        pending_flow = self._pending_flow_by_truck.get(truck_key)
+        if pending_flow is not None:
+            _pending_truck_number, pending_token, _future = pending_flow
+            if pending_token == current_flow_token:
+                self._current_flow_truck_insight = FlowTruckInsight(
+                    available=False,
+                    truck_number=truck_number,
+                    summary_text="Flow: loading...",
+                    issue="loading",
+                    tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
+                )
+                self._refresh_current_truck_heading()
+                return
+            self._pending_flow_by_truck.pop(truck_key, None)
 
         self._current_flow_truck_insight = FlowTruckInsight(
             available=False,
@@ -1143,10 +1153,11 @@ class MainWindow(QMainWindow):
             tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
         )
         self._refresh_current_truck_heading()
-        self._flow_request_serial += 1
-        self._pending_flow_request_serial = self._flow_request_serial
-        self._pending_flow_truck_number = truck_number
-        self._pending_flow_future = self._flow_executor.submit(load_flow_truck_insight, truck_number)
+        self._pending_flow_by_truck[truck_key] = (
+            truck_number,
+            current_flow_token,
+            self._flow_executor.submit(load_flow_truck_insight, truck_number),
+        )
         self._flow_watch_timer.start()
 
     def _set_current_statuses(self, statuses: list[KitStatus], *, cache: bool = True) -> None:
@@ -1157,66 +1168,68 @@ class MainWindow(QMainWindow):
         self._render_current_statuses()
 
     def _poll_pending_status_future(self) -> None:
-        future = self._pending_status_future
-        if future is None:
+        if not self._pending_status_by_truck:
             self._status_watch_timer.stop()
             return
-        if not future.done():
+        completed: list[tuple[str, str, Future[list[KitStatus]]]] = []
+        for truck_key, (truck_number, future) in list(self._pending_status_by_truck.items()):
+            if not future.done():
+                continue
+            completed.append((truck_key, truck_number, future))
+            self._pending_status_by_truck.pop(truck_key, None)
+        if not self._pending_status_by_truck:
+            self._status_watch_timer.stop()
+        if not completed:
             return
 
-        truck_number = self._pending_status_truck_number
-        request_serial = self._pending_status_request_serial
-        self._pending_status_future = None
-        self._pending_status_truck_number = ""
-        self._status_watch_timer.stop()
+        current_key = self.current_truck_number().casefold()
+        for truck_key, truck_number, future in completed:
+            try:
+                statuses = future.result()
+            except Exception as exc:
+                self.log(f"Could not load kit statuses for {truck_number}: {exc}")
+                statuses = []
 
-        try:
-            statuses = future.result()
-        except Exception as exc:
-            self.log(f"Could not load kit statuses for {truck_number}: {exc}")
-            statuses = []
-
-        if truck_number:
-            self._status_cache_by_truck[truck_number.casefold()] = list(statuses)
-        if request_serial != self._status_request_serial:
-            return
-        if truck_number.casefold() != self.current_truck_number().casefold():
-            return
-        self._set_current_statuses(list(statuses))
+            self._status_cache_by_truck[truck_key] = list(statuses)
+            if truck_key != current_key:
+                continue
+            self._set_current_statuses(list(statuses))
 
     def _poll_pending_flow_future(self) -> None:
-        future = self._pending_flow_future
-        if future is None:
+        if not self._pending_flow_by_truck:
             self._flow_watch_timer.stop()
             return
-        if not future.done():
+        completed: list[tuple[str, str, str, Future[FlowTruckInsight]]] = []
+        for truck_key, (truck_number, cache_token, future) in list(self._pending_flow_by_truck.items()):
+            if not future.done():
+                continue
+            completed.append((truck_key, truck_number, cache_token, future))
+            self._pending_flow_by_truck.pop(truck_key, None)
+        if not self._pending_flow_by_truck:
+            self._flow_watch_timer.stop()
+        if not completed:
             return
 
-        truck_number = self._pending_flow_truck_number
-        request_serial = self._pending_flow_request_serial
-        self._pending_flow_future = None
-        self._pending_flow_truck_number = ""
-        self._flow_watch_timer.stop()
-        try:
-            insight = future.result()
-        except Exception as exc:
-            insight = FlowTruckInsight(
-                available=False,
-                truck_number=truck_number,
-                summary_text="Flow: unavailable.",
-                issue="load_failed",
-                tooltip_text=str(exc),
-            )
+        current_key = self.current_truck_number().casefold()
+        current_token = flow_probe_cache_token()
+        for truck_key, truck_number, cache_token, future in completed:
+            try:
+                insight = future.result()
+            except Exception as exc:
+                insight = FlowTruckInsight(
+                    available=False,
+                    truck_number=truck_number,
+                    summary_text="Flow: unavailable.",
+                    issue="load_failed",
+                    tooltip_text=str(exc),
+                )
 
-        if truck_number:
-            self._flow_cache_by_truck[truck_number.casefold()] = insight
-        if request_serial != self._flow_request_serial:
-            return
-        if truck_number.casefold() != self.current_truck_number().casefold():
-            return
-        self._current_flow_truck_insight = insight
-        self._refresh_current_truck_heading()
-        self._render_current_statuses()
+            self._flow_cache_by_truck[truck_key] = (cache_token, insight)
+            if truck_key != current_key or cache_token != current_token:
+                continue
+            self._current_flow_truck_insight = insight
+            self._refresh_current_truck_heading()
+            self._render_current_statuses()
 
     def _render_current_statuses(self) -> None:
         previous_kit_name = self._current_status().kit_name if self._current_status() is not None else ""
@@ -1347,6 +1360,10 @@ class MainWindow(QMainWindow):
         if item.column() == self.NEST_SUMMARY_COLUMN:
             if status.preview_pdf_match.chosen_path is not None:
                 self._open_nest_summary_for_status(status)
+            return
+        if item.column() == self.PRINT_PACKET_COLUMN:
+            if detect_print_packet_pdf(status.paths).chosen_path is not None:
+                self._open_print_packet_for_status(status)
 
     def _on_kit_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         row = item.row()
@@ -1360,6 +1377,10 @@ class MainWindow(QMainWindow):
         if item.column() == self.NEST_SUMMARY_COLUMN:
             if status.preview_pdf_match.chosen_path is not None:
                 self._open_nest_summary_for_status(status)
+            return
+        if item.column() == self.PRINT_PACKET_COLUMN:
+            if detect_print_packet_pdf(status.paths).chosen_path is not None:
+                self._open_print_packet_for_status(status)
 
     def _populate_status_row(self, row: int, status: KitStatus) -> None:
         green = QColor("#D8F3DC")
@@ -1383,6 +1404,12 @@ class MainWindow(QMainWindow):
             nest_summary_color = green if len(status.preview_pdf_match.candidates) == 1 else yellow
         elif status.preview_pdf_match.candidates:
             nest_summary_color = yellow
+        packet_match = detect_print_packet_pdf(status.paths)
+        print_packet_color = red
+        if packet_match.chosen_path is not None:
+            print_packet_color = green if len(packet_match.candidates) == 1 else yellow
+        elif packet_match.candidates:
+            print_packet_color = yellow
 
         punch_code_item = self._make_item(
             self._punch_code_text_for_status(status),
@@ -1419,6 +1446,16 @@ class MainWindow(QMainWindow):
             background=nest_summary_color,
             hidden_foreground=hidden_foreground,
         )
+        print_packet_item = self._make_open_link_item(
+            exists=packet_match.chosen_path is not None,
+            tooltip=(
+                f"Click to open Print Packet:\n{packet_match.chosen_path}"
+                if packet_match.chosen_path is not None
+                else "No Print Packet PDF found on L for this kit."
+            ),
+            background=print_packet_color,
+            hidden_foreground=hidden_foreground,
+        )
 
         flow_insight = self._flow_insight_for_status(status)
         flow_background = neutral
@@ -1445,6 +1482,7 @@ class MainWindow(QMainWindow):
             ),
             project_file_item,
             nest_summary_item,
+            print_packet_item,
             self._make_item(release_text, background=release_color, foreground=hidden_foreground),
             flow_item,
             punch_code_item,
@@ -1910,14 +1948,14 @@ class MainWindow(QMainWindow):
     def open_selected_flow_pdf(self) -> None:
         status = self._current_status()
         if status is None:
-            QMessageBox.information(self, "Open Flow PDF", "Select a kit first.")
+            QMessageBox.information(self, "Open Flow Link", "Select a kit first.")
             return
 
         flow_insight = flow_kit_insight_for_explorer_kit(status.kit_name, self._current_flow_truck_insight)
         if not flow_insight.flow_kit_name:
             QMessageBox.information(
                 self,
-                "Open Flow PDF",
+                "Open Flow Link",
                 "This kit is not tracked as its own scheduled flow kit in the fabrication flow dashboard.",
             )
             return
@@ -1926,17 +1964,17 @@ class MainWindow(QMainWindow):
         if not pdf_link:
             QMessageBox.warning(
                 self,
-                "Open Flow PDF",
-                f"No linked PDF is set in the fabrication flow dashboard for {flow_insight.flow_kit_name}.",
+                "Open Flow Link",
+                f"No linked file or URL is set in the fabrication flow dashboard for {flow_insight.flow_kit_name}.",
             )
             return
 
         try:
             open_external_target(pdf_link)
         except Exception as exc:
-            QMessageBox.warning(self, "Open Flow PDF", str(exc))
+            QMessageBox.warning(self, "Open Flow Link", str(exc))
             return
-        self.log(f"Opened flow PDF {pdf_link}")
+        self.log(f"Opened flow link {pdf_link}")
 
     def _open_nest_summary_for_status(self, status: KitStatus) -> None:
         summary_path = status.preview_pdf_match.chosen_path
@@ -1948,6 +1986,18 @@ class MainWindow(QMainWindow):
             )
             return
         self._open_path_with_message(summary_path)
+
+    def _open_print_packet_for_status(self, status: KitStatus) -> None:
+        packet_match = detect_print_packet_pdf(status.paths)
+        packet_path = packet_match.chosen_path
+        if packet_path is None:
+            QMessageBox.warning(
+                self,
+                "Open Print Packet",
+                "Could not find a Print Packet PDF on the L side for this kit.",
+            )
+            return
+        self._open_path_with_message(packet_path)
 
     def open_selected_nest_summary(self) -> None:
         status = self._current_status()
@@ -1961,17 +2011,7 @@ class MainWindow(QMainWindow):
         if status is None:
             QMessageBox.information(self, "Open Print Packet", "Select a kit first.")
             return
-
-        packet_match = detect_print_packet_pdf(status.paths)
-        packet_path = packet_match.chosen_path
-        if packet_path is None:
-            QMessageBox.warning(
-                self,
-                "Open Print Packet",
-                "Could not find a Print Packet PDF on the L side for this kit.",
-            )
-            return
-        self._open_path_with_message(packet_path)
+        self._open_print_packet_for_status(status)
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()
