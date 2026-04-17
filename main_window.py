@@ -7,10 +7,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThreadPool
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -37,6 +39,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from packet_build_service import (
+    build_assembly_packet,
+    create_main_packet_worker,
+    prepare_packet_build_context,
+)
 from flow_bridge import (
     FlowTruckInsight,
     empty_flow_truck_insight,
@@ -62,6 +69,7 @@ from services import (
     collect_kit_statuses,
     configured_kit_mappings,
     create_kit_scaffold,
+    detect_assembly_packet_pdf,
     detect_print_packet_pdf,
     discover_trucks,
     filter_kit_statuses,
@@ -128,6 +136,7 @@ class MainWindow(QMainWindow):
         "Project File",
         "Nest Summary",
         "Print Packet",
+        "Assembly Packet",
         "Release",
         "Flow",
         "Punch Code",
@@ -136,9 +145,10 @@ class MainWindow(QMainWindow):
     PROJECT_FILE_COLUMN = 1
     NEST_SUMMARY_COLUMN = 2
     PRINT_PACKET_COLUMN = 3
-    FLOW_COLUMN = 5
-    PUNCH_CODE_COLUMN = 6
-    NOTES_COLUMN = 7
+    ASSEMBLY_PACKET_COLUMN = 4
+    FLOW_COLUMN = 6
+    PUNCH_CODE_COLUMN = 7
+    NOTES_COLUMN = 8
 
     def __init__(
         self,
@@ -618,6 +628,16 @@ class MainWindow(QMainWindow):
             "Open the linked file or URL for the selected mapped flow kit from the fabrication flow dashboard."
         )
         self.open_flow_pdf_button.clicked.connect(self.open_selected_flow_pdf)
+        self.build_print_packet_button = QPushButton("Build Print Packet")
+        self.build_print_packet_button.setToolTip(
+            "Build the QTY print packet from the selected kit's saved RPD."
+        )
+        self.build_print_packet_button.clicked.connect(self.build_selected_print_packet)
+        self.build_assembly_packet_button = QPushButton("Build Assembly Packet")
+        self.build_assembly_packet_button.setToolTip(
+            "Build the as-is assembly packet from the unused tabloid PDFs in the selected W-side kit folder."
+        )
+        self.build_assembly_packet_button.clicked.connect(self.build_selected_assembly_packet)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
@@ -636,6 +656,8 @@ class MainWindow(QMainWindow):
             self.open_fabrication_folder_button,
             self.open_spreadsheet_button,
             self.open_flow_pdf_button,
+            self.build_print_packet_button,
+            self.build_assembly_packet_button,
             self.launch_kitter_button,
             self.launch_inventor_button,
             self.toggle_selected_kits_hidden_button,
@@ -743,6 +765,8 @@ class MainWindow(QMainWindow):
         return missing_label
 
     def _recommended_action_for_status(self, status: KitStatus) -> str:
+        print_packet_match = detect_print_packet_pdf(status.paths)
+        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
         if not status.project_folder_exists or not status.rpd_exists:
             return "Repair Selected: the L-side project setup is incomplete."
         if status.spreadsheet_match.issue == "multiple_spreadsheets":
@@ -753,6 +777,20 @@ class MainWindow(QMainWindow):
             return "BOM: spreadsheet is ready, but the Inventor launcher is not configured."
         if status.preview_pdf_match.chosen_path is None:
             return "Open Project: review the kit because the Nest Summary is still missing."
+        if (
+            status.rpd_exists
+            and status.paths.fabrication_kit_dir is not None
+            and status.paths.fabrication_kit_dir.exists()
+            and print_packet_match.chosen_path is None
+        ):
+            return "Build Print Packet: generate the QTY packet from Explorer."
+        if (
+            status.rpd_exists
+            and status.paths.fabrication_kit_dir is not None
+            and status.paths.fabrication_kit_dir.exists()
+            and assembly_packet_match.chosen_path is None
+        ):
+            return "Build Assembly Packet: generate the unused tabloid assembly packet from Explorer."
         if status.rpd_exists and self.settings.radan_kitter_launcher.strip():
             return "Run Kitter: the project file is ready."
         return "Open Project: the kit is mostly ready and worth a quick review."
@@ -760,6 +798,7 @@ class MainWindow(QMainWindow):
     def _available_actions_for_status(self, status: KitStatus) -> str:
         flow_insight = self._flow_insight_for_status(status)
         packet_match = detect_print_packet_pdf(status.paths)
+        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
         actions: list[str] = []
         if not status.project_folder_exists or not status.rpd_exists:
             actions.append("Repair Selected")
@@ -777,6 +816,11 @@ class MainWindow(QMainWindow):
             actions.append("Open Nest Summary")
         if packet_match.chosen_path is not None:
             actions.append("Open Print Packet")
+        if assembly_packet_match.chosen_path is not None:
+            actions.append("Open Assembly Packet")
+        if status.rpd_exists and status.paths.fabrication_kit_dir is not None and status.paths.fabrication_kit_dir.exists():
+            actions.append("Build Print Packet")
+            actions.append("Build Assembly Packet")
         if status.rpd_exists and self.settings.radan_kitter_launcher.strip():
             actions.append("Run Kitter")
         if status.spreadsheet_match.chosen_path is not None and self.settings.inventor_to_radan_entry.strip():
@@ -802,6 +846,10 @@ class MainWindow(QMainWindow):
             if status.spreadsheet_match.chosen_path is None and status.spreadsheet_match.issue != "multiple_spreadsheets"
         )
         nest_ready = sum(1 for status in self._all_statuses if status.preview_pdf_match.chosen_path is not None)
+        print_packet_ready = sum(1 for status in self._all_statuses if detect_print_packet_pdf(status.paths).chosen_path is not None)
+        assembly_packet_ready = sum(
+            1 for status in self._all_statuses if detect_assembly_packet_pdf(status.paths).chosen_path is not None
+        )
         hidden_filtered = max(0, total_kits - visible_kits)
         lines = [
             f"Kits in truck: {total_kits}",
@@ -810,6 +858,7 @@ class MainWindow(QMainWindow):
             f"Project files ready: {rpd_ready}/{total_kits}",
             f"Spreadsheets ready: {spreadsheet_ready} | Ambiguous: {spreadsheet_ambiguous} | Missing: {spreadsheet_missing}",
             f"Nest summaries ready: {nest_ready}/{total_kits}",
+            f"Print packets ready: {print_packet_ready}/{total_kits} | Assembly packets ready: {assembly_packet_ready}/{total_kits}",
         ]
         if hidden_filtered:
             lines.append(f"Filtered out by hidden toggle: {hidden_filtered}")
@@ -842,6 +891,7 @@ class MainWindow(QMainWindow):
     def _kit_details_lines(self, status: KitStatus) -> list[str]:
         flow_insight = self._flow_insight_for_status(status)
         packet_match = detect_print_packet_pdf(status.paths)
+        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
         lines = [
             f"Kit: {status.paths.display_name}",
             f"RADAN name: {status.kit_name}",
@@ -858,6 +908,9 @@ class MainWindow(QMainWindow):
             ),
             (
                 f"Print packet: {self._match_summary_text(chosen_path=packet_match.chosen_path, candidates=packet_match.candidates, missing_label='Missing')}"
+            ),
+            (
+                f"Assembly packet: {self._match_summary_text(chosen_path=assembly_packet_match.chosen_path, candidates=assembly_packet_match.candidates, missing_label='Missing')}"
             ),
             f"Punch code: {self._punch_code_text_for_status(status) or '(blank)'}",
             f"Notes: {self._note_text_for_status(status) or '(blank)'}",
@@ -1364,6 +1417,10 @@ class MainWindow(QMainWindow):
         if item.column() == self.PRINT_PACKET_COLUMN:
             if detect_print_packet_pdf(status.paths).chosen_path is not None:
                 self._open_print_packet_for_status(status)
+            return
+        if item.column() == self.ASSEMBLY_PACKET_COLUMN:
+            if detect_assembly_packet_pdf(status.paths).chosen_path is not None:
+                self._open_assembly_packet_for_status(status)
 
     def _on_kit_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         row = item.row()
@@ -1381,6 +1438,10 @@ class MainWindow(QMainWindow):
         if item.column() == self.PRINT_PACKET_COLUMN:
             if detect_print_packet_pdf(status.paths).chosen_path is not None:
                 self._open_print_packet_for_status(status)
+            return
+        if item.column() == self.ASSEMBLY_PACKET_COLUMN:
+            if detect_assembly_packet_pdf(status.paths).chosen_path is not None:
+                self._open_assembly_packet_for_status(status)
 
     def _populate_status_row(self, row: int, status: KitStatus) -> None:
         green = QColor("#D8F3DC")
@@ -1405,11 +1466,17 @@ class MainWindow(QMainWindow):
         elif status.preview_pdf_match.candidates:
             nest_summary_color = yellow
         packet_match = detect_print_packet_pdf(status.paths)
+        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
         print_packet_color = red
         if packet_match.chosen_path is not None:
             print_packet_color = green if len(packet_match.candidates) == 1 else yellow
         elif packet_match.candidates:
             print_packet_color = yellow
+        assembly_packet_color = red
+        if assembly_packet_match.chosen_path is not None:
+            assembly_packet_color = green if len(assembly_packet_match.candidates) == 1 else yellow
+        elif assembly_packet_match.candidates:
+            assembly_packet_color = yellow
 
         punch_code_item = self._make_item(
             self._punch_code_text_for_status(status),
@@ -1456,6 +1523,16 @@ class MainWindow(QMainWindow):
             background=print_packet_color,
             hidden_foreground=hidden_foreground,
         )
+        assembly_packet_item = self._make_open_link_item(
+            exists=assembly_packet_match.chosen_path is not None,
+            tooltip=(
+                f"Click to open Assembly Packet:\n{assembly_packet_match.chosen_path}"
+                if assembly_packet_match.chosen_path is not None
+                else "No Assembly Packet PDF found on L for this kit."
+            ),
+            background=assembly_packet_color,
+            hidden_foreground=hidden_foreground,
+        )
 
         flow_insight = self._flow_insight_for_status(status)
         flow_background = neutral
@@ -1483,6 +1560,7 @@ class MainWindow(QMainWindow):
             project_file_item,
             nest_summary_item,
             print_packet_item,
+            assembly_packet_item,
             self._make_item(release_text, background=release_color, foreground=hidden_foreground),
             flow_item,
             punch_code_item,
@@ -1999,6 +2077,18 @@ class MainWindow(QMainWindow):
             return
         self._open_path_with_message(packet_path)
 
+    def _open_assembly_packet_for_status(self, status: KitStatus) -> None:
+        packet_match = detect_assembly_packet_pdf(status.paths)
+        packet_path = packet_match.chosen_path
+        if packet_path is None:
+            QMessageBox.warning(
+                self,
+                "Open Assembly Packet",
+                "Could not find an Assembly Packet PDF on the L side for this kit.",
+            )
+            return
+        self._open_path_with_message(packet_path)
+
     def open_selected_nest_summary(self) -> None:
         status = self._current_status()
         if status is None:
@@ -2012,6 +2102,223 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Open Print Packet", "Select a kit first.")
             return
         self._open_print_packet_for_status(status)
+
+    def open_selected_assembly_packet(self) -> None:
+        status = self._current_status()
+        if status is None:
+            QMessageBox.information(self, "Open Assembly Packet", "Select a kit first.")
+            return
+        self._open_assembly_packet_for_status(status)
+
+    def _prepare_packet_build_context(self, title: str):
+        if bool(getattr(self, "_packet_build_running", False)):
+            QMessageBox.information(
+                self,
+                title,
+                "A packet build is already running. Let it finish before starting another one.",
+            )
+            return None, None
+
+        status = self._current_status()
+        if status is None:
+            QMessageBox.information(self, title, "Select a kit first.")
+            return None, None
+        if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
+            QMessageBox.warning(
+                self,
+                title,
+                "The L-side project file is missing for this kit.",
+            )
+            return None, None
+        if status.paths.fabrication_kit_dir is None or not status.paths.fabrication_kit_dir.exists():
+            QMessageBox.warning(
+                self,
+                title,
+                "The W-side kit folder is missing for this kit.",
+            )
+            return None, None
+
+        try:
+            context = prepare_packet_build_context(
+                rpd_path=status.paths.rpd_path,
+                fabrication_dir=status.paths.fabrication_kit_dir,
+                settings=self.settings,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, title, str(exc))
+            return None, None
+
+        return status, context
+
+    def _refresh_packet_statuses(self, status: KitStatus) -> None:
+        if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
+            self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
+
+    def build_selected_print_packet(self) -> None:
+        status, context = self._prepare_packet_build_context("Build Print Packet")
+        if status is None or context is None:
+            return
+        if not context.parts:
+            QMessageBox.information(
+                self,
+                "Build Print Packet",
+                "No parts were found in the selected RPD.",
+            )
+            return
+
+        total_steps = max(1, len(context.parts))
+        progress = QProgressDialog("Building print packet...", "Cancel", 0, total_steps, self)
+        progress.setWindowTitle("Build Print Packet")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = create_main_packet_worker(
+            context=context,
+            rpd_path=status.paths.rpd_path,
+        )
+        setattr(self, "_packet_build_running", True)
+        setattr(self, "_packet_build_worker", worker)
+
+        def _set_progress(done: int, status_text: str) -> None:
+            progress.setMaximum(total_steps)
+            progress.setValue(max(0, min(total_steps, int(done))))
+            progress.setLabelText(f"Building print packet...\n{status_text}")
+            QApplication.processEvents()
+
+        def _cleanup() -> None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            setattr(self, "_packet_build_worker", None)
+            setattr(self, "_packet_build_running", False)
+
+        def _on_progress(done: int, total: int, status_text: str) -> None:
+            _set_progress(int(done), status_text)
+
+        def _on_done(packet_path: str, pages: int, missing: int) -> None:
+            self._refresh_packet_statuses(status)
+            _cleanup()
+            try:
+                open_path(Path(packet_path))
+            except Exception:
+                pass
+            QMessageBox.information(
+                self,
+                "Build Print Packet",
+                (
+                    f"Print packet pages: {int(pages)}\n"
+                    f"Missing part PDFs: {int(missing)}\n"
+                    f"Print packet: {packet_path}"
+                ),
+            )
+            self.log(f"Built print packet for {status.paths.display_name}.")
+
+        def _on_canceled(pages: int, missing: int) -> None:
+            _cleanup()
+            self.log("Print packet build canceled.")
+
+        def _on_empty(message: str, pages: int, missing: int) -> None:
+            _cleanup()
+            QMessageBox.information(
+                self,
+                "Build Print Packet",
+                f"{message}\n\nMissing part PDFs: {int(missing)}",
+            )
+
+        def _on_error(tb: str) -> None:
+            _cleanup()
+            QMessageBox.critical(
+                self,
+                "Build Print Packet",
+                str(tb or "").strip() or "Packet build failed.",
+            )
+
+        worker.signals.progress.connect(_on_progress)
+        worker.signals.done.connect(_on_done)
+        worker.signals.canceled.connect(_on_canceled)
+        worker.signals.empty.connect(_on_empty)
+        worker.signals.error.connect(_on_error)
+        progress.canceled.connect(worker.request_stop)
+        _set_progress(0, "Starting")
+        QThreadPool.globalInstance().start(worker)
+
+    def build_selected_assembly_packet(self) -> None:
+        status, context = self._prepare_packet_build_context("Build Assembly Packet")
+        if status is None or context is None:
+            return
+        if not context.assembly_source_pdfs:
+            QMessageBox.information(
+                self,
+                "Build Assembly Packet",
+                "No unused tabloid assembly PDFs were found in the selected W-side kit folder.",
+            )
+            return
+
+        total_steps = max(1, len(context.assembly_source_pdfs))
+        progress = QProgressDialog("Building assembly packet...", "Cancel", 0, total_steps, self)
+        progress.setWindowTitle("Build Assembly Packet")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        setattr(self, "_packet_build_running", True)
+        try:
+            result = build_assembly_packet(
+                rpd_path=status.paths.rpd_path,
+                source_pdfs=context.assembly_source_pdfs,
+                progress_cb=lambda done, total, status_text: (
+                    progress.setMaximum(total_steps),
+                    progress.setValue(max(0, min(total_steps, int(done)))),
+                    progress.setLabelText(f"Building assembly packet...\n{status_text}"),
+                    QApplication.processEvents(),
+                ),
+                should_cancel_cb=progress.wasCanceled,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Build Assembly Packet", str(exc))
+            result = None
+        finally:
+            setattr(self, "_packet_build_running", False)
+            try:
+                progress.close()
+            except Exception:
+                pass
+
+        if result is None:
+            return
+
+        self._refresh_packet_statuses(status)
+
+        if result.packet_path:
+            try:
+                open_path(Path(result.packet_path))
+            except Exception:
+                pass
+            QMessageBox.information(
+                self,
+                "Build Assembly Packet",
+                (
+                    f"Assembly packet documents: {int(result.source_documents)}\n"
+                    f"Assembly packet pages: {int(result.output_pages)}\n"
+                    f"Assembly packet: {result.packet_path}"
+                ),
+            )
+            self.log(f"Built assembly packet for {status.paths.display_name}.")
+            return
+
+        if result.skipped:
+            self.log("Assembly packet build canceled.")
+            return
+
+        QMessageBox.information(
+            self,
+            "Build Assembly Packet",
+            "No unused tabloid assembly PDFs were found in the selected W-side kit folder.",
+        )
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()

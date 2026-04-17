@@ -562,19 +562,26 @@ def _is_print_packet_pdf(path: Path) -> bool:
         or " printpacket " in f" {stem_words} "
     )
 
-def detect_preview_pdf(paths: KitPaths) -> PdfMatch:
-    if paths.project_dir is None:
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
-    if not paths.project_dir.exists():
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
 
-    candidates = _collect_preview_pdf_candidates(paths)
-    if not candidates:
-        return PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
-    return PdfMatch(chosen_path=candidates[0], candidates=candidates)
+def _is_assembly_packet_pdf(path: Path) -> bool:
+    stem_words = _normalize_pdf_name_words(path.stem)
+    return (
+        stem_words.startswith("assembly packet")
+        or stem_words.startswith("assemblypacket")
+        or stem_words.startswith("assembly drawings")
+        or stem_words.startswith("assemblydrawings")
+        or " assembly packet " in f" {stem_words} "
+        or " assemblypacket " in f" {stem_words} "
+        or " assembly drawings " in f" {stem_words} "
+        or " assemblydrawings " in f" {stem_words} "
+    )
 
 
-def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
+def _detect_named_packet_pdf(
+    paths: KitPaths,
+    *,
+    matches_fn,
+) -> PdfMatch:
     if paths.project_dir is None:
         return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
     if not paths.project_dir.exists():
@@ -588,7 +595,7 @@ def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
     for child, depth in _shallow_descendant_files(search_root, max_depth=MAX_NEST_SUMMARY_DEPTH):
         if child.suffix.casefold() not in SUPPORTED_PREVIEW_SUFFIXES:
             continue
-        if not _is_print_packet_pdf(child):
+        if not matches_fn(child):
             continue
         candidates.append((depth, child))
 
@@ -596,7 +603,27 @@ def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
     paths_only = tuple(path for _depth, path in candidates)
     if not paths_only:
         return PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
-    return PdfMatch(chosen_path=paths_only[0], candidates=paths_only)
+    return PdfMatch(chosen_path=paths_only[-1], candidates=paths_only)
+
+
+def detect_preview_pdf(paths: KitPaths) -> PdfMatch:
+    if paths.project_dir is None:
+        return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
+    if not paths.project_dir.exists():
+        return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
+
+    candidates = _collect_preview_pdf_candidates(paths)
+    if not candidates:
+        return PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
+    return PdfMatch(chosen_path=candidates[0], candidates=candidates)
+
+
+def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
+    return _detect_named_packet_pdf(paths, matches_fn=_is_print_packet_pdf)
+
+
+def detect_assembly_packet_pdf(paths: KitPaths) -> PdfMatch:
+    return _detect_named_packet_pdf(paths, matches_fn=_is_assembly_packet_pdf)
 
 
 def fabrication_folder_has_files(folder: Path | None) -> bool:

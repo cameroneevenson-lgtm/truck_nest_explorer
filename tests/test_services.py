@@ -10,6 +10,8 @@ import shutil
 import uuid
 from unittest.mock import patch
 
+import fitz
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
@@ -36,6 +38,7 @@ from models import (
     materialize_legacy_punch_codes_for_kit,
     resolve_punch_code_text,
 )
+from packet_build_service import build_assembly_packet, prepare_packet_build_context
 from settings_store import load_settings, save_settings
 from services import (
     build_kit_paths,
@@ -43,6 +46,7 @@ from services import (
     build_kit_status,
     collect_kit_statuses,
     create_kit_scaffold,
+    detect_assembly_packet_pdf,
     detect_print_packet_pdf,
     detect_preview_pdf,
     detect_spreadsheet,
@@ -69,6 +73,35 @@ def workspace_tempdir() -> Path:
         yield temp_dir
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def write_pdf(path: Path, *, text: str, width: float, height: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=width, height=height)
+        page.insert_text((72, 72), text, fontsize=18)
+        doc.save(str(path))
+    finally:
+        doc.close()
+
+
+def write_simple_rpd(path: Path, *, sym_path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"""<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://www.radan.com/ns/project">
+  <Parts>
+    <Part>
+      <ID>1</ID>
+      <Symbol>{sym_path}</Symbol>
+      <Qty>2</Qty>
+    </Part>
+  </Parts>
+</Project>
+""",
+        encoding="utf-8",
+    )
 
 
 class TruckNestExplorerServicesTests(unittest.TestCase):
@@ -573,6 +606,81 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(match.chosen_path, packet_pdf)
             self.assertEqual(tuple(path.name for path in match.candidates), (packet_pdf.name,))
+
+    def test_detect_assembly_packet_pdf_finds_generated_assembly_packet(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            assembly_pdf = paths.project_dir / "AssemblyPacket_TABLOID_20260417_101500.pdf"
+            packet_pdf = paths.project_dir / "PrintPacket_QTY_20260417_101500.pdf"
+            assembly_pdf.write_text("pdf", encoding="utf-8")
+            packet_pdf.write_text("pdf", encoding="utf-8")
+
+            match = detect_assembly_packet_pdf(paths)
+
+            self.assertEqual(match.chosen_path, assembly_pdf)
+            self.assertEqual(tuple(path.name for path in match.candidates), (assembly_pdf.name,))
+
+    def test_prepare_packet_build_context_collects_unused_tabloid_assembly_pdfs(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            sym_path = paths.fabrication_kit_dir / "PART-1.sym"
+            part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_pdf = paths.fabrication_kit_dir / "Assembly-Overview.pdf"
+            note_pdf = paths.fabrication_kit_dir / "Traveler.pdf"
+            sym_path.write_text("sym", encoding="utf-8")
+            write_pdf(part_pdf, text="PART", width=612, height=792)
+            write_pdf(assembly_pdf, text="ASSEMBLY", width=792, height=1224)
+            write_pdf(note_pdf, text="LETTER", width=612, height=792)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(len(context.parts), 1)
+            self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
+
+    def test_build_assembly_packet_combines_unused_tabloid_pdfs_as_is(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
+            rpd_path.parent.mkdir(parents=True, exist_ok=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+            assembly_pdf_a = temp_root / "fab" / "Assembly-A.pdf"
+            assembly_pdf_b = temp_root / "fab" / "Assembly-B.pdf"
+            write_pdf(assembly_pdf_a, text="ASSEMBLY A", width=792, height=1224)
+            write_pdf(assembly_pdf_b, text="ASSEMBLY B", width=1224, height=792)
+
+            result = build_assembly_packet(
+                rpd_path=rpd_path,
+                source_pdfs=(assembly_pdf_a, assembly_pdf_b),
+            )
+
+            self.assertTrue(result.packet_path.endswith(".pdf"))
+            self.assertEqual(result.source_documents, 2)
+            self.assertEqual(result.output_pages, 2)
+            with fitz.open(result.packet_path) as doc:
+                self.assertEqual(doc.page_count, 2)
+                page_texts = [doc[index].get_text("text") for index in range(doc.page_count)]
+            self.assertIn("ASSEMBLY A", page_texts[0])
+            self.assertIn("ASSEMBLY B", page_texts[1])
 
     def test_move_inventor_outputs_to_project_places_files_in_l_project_folder(self) -> None:
         with workspace_tempdir() as temp_root:

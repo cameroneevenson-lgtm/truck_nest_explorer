@@ -6,6 +6,7 @@ It also includes:
 
 - a direct `Flow App` action that launches `fabrication_flow_dashboard`
 - on-demand opening of the best matching Nest Summary PDF found in the L-side project area
+- direct packet generation from Explorer for the saved `.rpd`, including the QTY print packet and a separate assembly packet built from unused tabloid PDFs on W
 - editable per-kit punch-code notes directly in the kit table
 - saved client numbers per truck
 - persistent hide/unhide controls for completed trucks and kits that should stay on L
@@ -19,8 +20,9 @@ The release root, fabrication root, template project, and launcher paths are now
 3. Generate the RADAN output in the W-side kit folder, then move the `*_Radan.csv` and report into the appropriate L-side project folder.
 4. Switch to RADAN and load that CSV from L.
 5. Save in RADAN.
-6. Run `radan_kitter` on the saved `.rpd`.
-7. Return to RADAN for completion.
+6. Build the print packet or assembly packet in Truck Nest Explorer from the saved `.rpd`.
+7. Run `radan_kitter` if you still need its kit-prep workflow.
+8. Return to RADAN for completion.
 
 ## Folder convention
 
@@ -104,7 +106,9 @@ The actual nest summary PDF is opened on demand instead of previewed in a small 
 - It only searches a shallow folder hierarchy under the L-side kit folder.
 - A print packet PDF is ignored even if it is nearby.
 - Use `Open Nest Summary` or double-click the Nest Summary cell to open it.
-- Use `Open Print Packet` when you want the kitter packet PDF instead.
+- Use `Build Print Packet` to generate the QTY packet directly from Explorer.
+- Use `Build Assembly Packet` to generate the unused tabloid assembly drawings packet directly from Explorer.
+- Double-click the `Print Packet` or `Assembly Packet` cell to open those generated PDFs from L.
 
 Example target filename:
 
