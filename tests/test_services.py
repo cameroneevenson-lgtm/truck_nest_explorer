@@ -86,6 +86,18 @@ def write_pdf(path: Path, *, text: str, width: float, height: float) -> None:
         doc.close()
 
 
+def write_pdf_pages(path: Path, *, pages: list[tuple[str, float, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    try:
+        for text, width, height in pages:
+            page = doc.new_page(width=width, height=height)
+            page.insert_text((72, 72), text, fontsize=18)
+        doc.save(str(path))
+    finally:
+        doc.close()
+
+
 def write_simple_rpd(path: Path, *, sym_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -658,6 +670,35 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(len(context.parts), 1)
             self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
 
+    def test_prepare_packet_build_context_collects_unused_tabloid_assembly_pdfs_from_project_dir(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            sym_path = paths.fabrication_kit_dir / "PART-1.sym"
+            part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_pdf = paths.project_dir / "Assembly-Overview.pdf"
+            sym_path.write_text("sym", encoding="utf-8")
+            write_pdf(part_pdf, text="PART", width=612, height=792)
+            write_pdf(assembly_pdf, text="ASSEMBLY", width=792, height=1224)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
+
     def test_prepare_packet_build_context_ignores_generated_packet_artifacts(self) -> None:
         with workspace_tempdir() as temp_root:
             settings = ExplorerSettings(
@@ -713,9 +754,37 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(result.output_pages, 2)
             with fitz.open(result.packet_path) as doc:
                 self.assertEqual(doc.page_count, 2)
-                page_texts = [doc[index].get_text("text") for index in range(doc.page_count)]
-            self.assertIn("ASSEMBLY A", page_texts[0])
-            self.assertIn("ASSEMBLY B", page_texts[1])
+                image_counts = [len(doc[index].get_images(full=True)) for index in range(doc.page_count)]
+                darkest_pixels = [min(doc[index].get_pixmap().samples) for index in range(doc.page_count)]
+            self.assertEqual(image_counts, [1, 1])
+            self.assertLess(darkest_pixels[0], 250)
+            self.assertLess(darkest_pixels[1], 250)
+
+    def test_build_assembly_packet_includes_only_tabloid_pages_from_mixed_source_pdf(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
+            rpd_path.parent.mkdir(parents=True, exist_ok=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+            mixed_pdf = temp_root / "fab" / "Assembly-Mixed.pdf"
+            write_pdf_pages(
+                mixed_pdf,
+                pages=[
+                    ("LETTER COVER", 612, 792),
+                    ("TABLOID DRAWING", 792, 1224),
+                ],
+            )
+
+            result = build_assembly_packet(
+                rpd_path=rpd_path,
+                source_pdfs=(mixed_pdf,),
+            )
+
+            self.assertEqual(result.source_documents, 1)
+            self.assertEqual(result.output_pages, 1)
+            with fitz.open(result.packet_path) as doc:
+                self.assertEqual(doc.page_count, 1)
+                self.assertEqual(len(doc[0].get_images(full=True)), 1)
+                self.assertLess(min(doc[0].get_pixmap().samples), 250)
 
     def test_move_inventor_outputs_to_project_places_files_in_l_project_folder(self) -> None:
         with workspace_tempdir() as temp_root:

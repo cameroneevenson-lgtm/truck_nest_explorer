@@ -14,6 +14,7 @@ ASSEMBLY_PACKET_PREFIX = "AssemblyPacket_TABLOID"
 TABLOID_WIDTH_POINTS = 11.0 * 72.0
 TABLOID_HEIGHT_POINTS = 17.0 * 72.0
 TABLOID_TOLERANCE_POINTS = 18.0
+ASSEMBLY_PACKET_RENDER_DPI = 300
 
 
 @dataclass(frozen=True)
@@ -21,15 +22,7 @@ class PacketBuildContext:
     parts: tuple[object, ...]
     resolve_asset_fn: Callable[[str, str], Optional[str]]
     assembly_source_pdfs: tuple[Path, ...]
-
-
-@dataclass(frozen=True)
-class AssemblyPacketBuildResult:
-    packet_path: str
-    source_documents: int
-    output_pages: int
-    skipped: bool = False
-    source_pdfs: tuple[str, ...] = ()
+    assembly_search_roots: tuple[Path, ...]
 
 
 def _ensure_radan_kitter_on_path() -> None:
@@ -56,12 +49,13 @@ def _fitz_module():
     return fitz
 
 
-def _pypdf_module():
-    try:
-        import pypdf  # type: ignore[import-not-found]
-    except Exception as exc:
-        raise RuntimeError("pypdf is required to build assembly packets.") from exc
-    return pypdf
+@dataclass(frozen=True)
+class AssemblyPacketBuildResult:
+    packet_path: str
+    source_documents: int
+    output_pages: int
+    skipped: bool = False
+    source_pdfs: tuple[str, ...] = ()
 
 
 def _make_stamp() -> str:
@@ -116,15 +110,21 @@ def _is_tabloid_size(width_points: float, height_points: float) -> bool:
 
 
 def _is_tabloid_pdf(path: Path) -> bool:
+    return bool(_tabloid_page_indices(path))
+
+
+def _tabloid_page_indices(path: Path) -> tuple[int, ...]:
     try:
         fitz = _fitz_module()
         with fitz.open(str(path)) as doc:
-            if doc.page_count < 1:
-                return False
-            rect = doc[0].rect
-            return _is_tabloid_size(float(rect.width), float(rect.height))
+            indices: list[int] = []
+            for index in range(doc.page_count):
+                rect = doc[index].rect
+                if _is_tabloid_size(float(rect.width), float(rect.height)):
+                    indices.append(index)
+            return tuple(indices)
     except Exception:
-        return False
+        return ()
 
 
 def _iter_pdf_paths(root: Path) -> list[Path]:
@@ -142,6 +142,21 @@ def _iter_pdf_paths(root: Path) -> list[Path]:
                 continue
             discovered.append(path)
     return discovered
+
+
+def _assembly_search_roots(*roots: Path | None) -> tuple[Path, ...]:
+    collected: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if root is None:
+            continue
+        path = Path(root)
+        key = _normalize_path_key(path)
+        if key in seen or not path.exists():
+            continue
+        seen.add(key)
+        collected.append(path)
+    return tuple(collected)
 
 
 def _matched_part_pdf_keys(
@@ -185,28 +200,29 @@ def _configure_asset_lookup(rk_assets, settings: ExplorerSettings) -> None:
 def collect_unused_tabloid_pdfs(
     parts: Sequence[object],
     *,
-    fabrication_dir: Path | None,
+    search_roots: Sequence[Path],
     resolve_asset_fn: Callable[[str, str], Optional[str]],
 ) -> tuple[Path, ...]:
-    if fabrication_dir is None or not fabrication_dir.exists():
+    if not search_roots:
         return ()
 
     matched_pdf_keys = _matched_part_pdf_keys(parts, resolve_asset_fn=resolve_asset_fn)
-    candidates: list[Path] = []
+    candidates: list[tuple[int, tuple[int, list[object]], Path]] = []
     seen: set[str] = set()
-    for pdf_path in _iter_pdf_paths(fabrication_dir):
-        key = _normalize_path_key(pdf_path)
-        if key in seen or key in matched_pdf_keys:
-            continue
-        seen.add(key)
-        if _looks_generated_pdf_artifact(pdf_path):
-            continue
-        if not _is_tabloid_pdf(pdf_path):
-            continue
-        candidates.append(pdf_path)
+    for root_index, root in enumerate(search_roots):
+        for pdf_path in _iter_pdf_paths(root):
+            key = _normalize_path_key(pdf_path)
+            if key in seen or key in matched_pdf_keys:
+                continue
+            seen.add(key)
+            if _looks_generated_pdf_artifact(pdf_path):
+                continue
+            if not _is_tabloid_pdf(pdf_path):
+                continue
+            candidates.append((root_index, _sorted_relative_key(pdf_path, root), pdf_path))
 
-    candidates.sort(key=lambda path: _sorted_relative_key(path, fabrication_dir))
-    return tuple(candidates)
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return tuple(path for _root_index, _relative_key, path in candidates)
 
 
 def prepare_packet_build_context(
@@ -223,15 +239,17 @@ def prepare_packet_build_context(
 
     _tree, parts, _debug = rk_rpd_io.load_rpd(str(rpd_path))
     resolve_asset_fn = rk_assets.resolve_asset_fast
+    assembly_search_roots = _assembly_search_roots(fabrication_dir, rpd_path.parent)
     assembly_source_pdfs = collect_unused_tabloid_pdfs(
         parts,
-        fabrication_dir=fabrication_dir,
+        search_roots=assembly_search_roots,
         resolve_asset_fn=resolve_asset_fn,
     )
     return PacketBuildContext(
         parts=tuple(parts),
         resolve_asset_fn=resolve_asset_fn,
         assembly_source_pdfs=assembly_source_pdfs,
+        assembly_search_roots=assembly_search_roots,
     )
 
 
@@ -293,21 +311,38 @@ def build_assembly_packet(
             source_pdfs=source_pdf_text,
         )
 
-    pypdf = _pypdf_module()
+    fitz = _fitz_module()
     out_dir = rpd_path.parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{ASSEMBLY_PACKET_PREFIX}_{_make_stamp()}.pdf"
 
     output_pages = 0
-    writer = pypdf.PdfWriter()
+    dst = fitz.open()
     try:
         for index, pdf_path in enumerate(valid_sources, start=1):
+            if _should_cancel():
+                if progress_cb is not None:
+                    progress_cb(index - 1, total, "Assembly packet | Skipped after cancel request")
+                return AssemblyPacketBuildResult(
+                    packet_path="",
+                    source_documents=total,
+                    output_pages=output_pages,
+                    skipped=True,
+                    source_pdfs=source_pdf_text,
+                )
             if progress_cb is not None:
-                progress_cb(index - 1, total, f"Assembly packet | Adding {pdf_path.name}")
-            with pdf_path.open("rb") as handle:
-                reader = pypdf.PdfReader(handle)
-                writer.append(reader, import_outline=False)
-                output_pages += len(reader.pages)
+                progress_cb(index - 1, total, f"Assembly packet | Flattening {pdf_path.name}")
+            page_indices = _tabloid_page_indices(pdf_path)
+            if not page_indices:
+                continue
+            with fitz.open(str(pdf_path)) as src:
+                for page_index in page_indices:
+                    page = src[page_index]
+                    rect = page.rect
+                    pix = page.get_pixmap(dpi=ASSEMBLY_PACKET_RENDER_DPI, alpha=False)
+                    dst_page = dst.new_page(width=float(rect.width), height=float(rect.height))
+                    dst_page.insert_image(dst_page.rect, stream=pix.tobytes("png"))
+                    output_pages += 1
 
         if output_pages <= 0:
             return AssemblyPacketBuildResult(
@@ -318,11 +353,10 @@ def build_assembly_packet(
                 source_pdfs=source_pdf_text,
             )
 
-        with out_path.open("wb") as handle:
-            writer.write(handle)
+        dst.save(str(out_path), deflate=True, garbage=3)
     finally:
         try:
-            writer.close()
+            dst.close()
         except Exception:
             pass
 

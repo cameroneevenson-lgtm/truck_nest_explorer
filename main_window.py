@@ -635,7 +635,7 @@ class MainWindow(QMainWindow):
         self.build_print_packet_button.clicked.connect(self.build_selected_print_packet)
         self.build_assembly_packet_button = QPushButton("Build Assembly Packet")
         self.build_assembly_packet_button.setToolTip(
-            "Build the as-is assembly packet from the unused tabloid PDFs in the selected W-side kit folder."
+            "Build the as-is assembly packet from the unused tabloid PDFs in the selected kit's W-side and project folders."
         )
         self.build_assembly_packet_button.clicked.connect(self.build_selected_assembly_packet)
         self.launch_kitter_button = QPushButton("Run Kitter")
@@ -2250,10 +2250,11 @@ class MainWindow(QMainWindow):
         if status is None or context is None:
             return
         if not context.assembly_source_pdfs:
+            searched = "\n".join(str(path) for path in context.assembly_search_roots) or "(none)"
             QMessageBox.information(
                 self,
                 "Build Assembly Packet",
-                "No unused tabloid assembly PDFs were found in the selected W-side kit folder.",
+                "No unused tabloid assembly PDFs were found.\n\nSearched:\n" + searched,
             )
             return
 
@@ -2317,7 +2318,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Build Assembly Packet",
-            "No unused tabloid assembly PDFs were found in the selected W-side kit folder.",
+            "No unused tabloid assembly PDFs were found.",
         )
 
     def launch_selected_kitter(self) -> None:
