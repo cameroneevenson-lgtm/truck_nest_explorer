@@ -56,6 +56,14 @@ def _fitz_module():
     return fitz
 
 
+def _pypdf_module():
+    try:
+        import pypdf  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError("pypdf is required to build assembly packets.") from exc
+    return pypdf
+
+
 def _make_stamp() -> str:
     from datetime import datetime
 
@@ -125,6 +133,9 @@ def _iter_pdf_paths(root: Path) -> list[Path]:
 
     discovered: list[Path] = []
     for dirpath, _dirnames, filenames in os.walk(root):
+        current_dir = Path(dirpath)
+        if any(part.casefold() == DEFAULT_PACKET_OUT_DIR.casefold() for part in current_dir.parts):
+            continue
         for name in filenames:
             path = Path(dirpath) / name
             if path.suffix.casefold() != ".pdf":
@@ -282,20 +293,21 @@ def build_assembly_packet(
             source_pdfs=source_pdf_text,
         )
 
-    fitz = _fitz_module()
+    pypdf = _pypdf_module()
     out_dir = rpd_path.parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{ASSEMBLY_PACKET_PREFIX}_{_make_stamp()}.pdf"
 
     output_pages = 0
-    dst = fitz.open()
+    writer = pypdf.PdfWriter()
     try:
         for index, pdf_path in enumerate(valid_sources, start=1):
             if progress_cb is not None:
                 progress_cb(index - 1, total, f"Assembly packet | Adding {pdf_path.name}")
-            with fitz.open(str(pdf_path)) as src:
-                dst.insert_pdf(src)
-                output_pages += int(src.page_count)
+            with pdf_path.open("rb") as handle:
+                reader = pypdf.PdfReader(handle)
+                writer.append(reader, import_outline=False)
+                output_pages += len(reader.pages)
 
         if output_pages <= 0:
             return AssemblyPacketBuildResult(
@@ -306,14 +318,13 @@ def build_assembly_packet(
                 source_pdfs=source_pdf_text,
             )
 
-        dst.save(
-            str(out_path),
-            deflate=False,
-            deflate_images=False,
-            garbage=0,
-        )
+        with out_path.open("wb") as handle:
+            writer.write(handle)
     finally:
-        dst.close()
+        try:
+            writer.close()
+        except Exception:
+            pass
 
     if progress_cb is not None:
         progress_cb(total, total, "Assembly packet | Complete")

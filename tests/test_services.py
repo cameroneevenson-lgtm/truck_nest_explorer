@@ -658,6 +658,41 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(len(context.parts), 1)
             self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
 
+    def test_prepare_packet_build_context_ignores_generated_packet_artifacts(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            sym_path = paths.fabrication_kit_dir / "PART-1.sym"
+            part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_pdf = paths.fabrication_kit_dir / "Assembly-Overview.pdf"
+            generated_out_dir = paths.fabrication_kit_dir / "_out"
+            generated_out_dir.mkdir(parents=True)
+            generated_print_packet = generated_out_dir / "PrintPacket_QTY_20260417_101500.pdf"
+            generated_assembly_packet = generated_out_dir / "AssemblyPacket_TABLOID_20260417_101500.pdf"
+            sym_path.write_text("sym", encoding="utf-8")
+            write_pdf(part_pdf, text="PART", width=612, height=792)
+            write_pdf(assembly_pdf, text="ASSEMBLY", width=792, height=1224)
+            write_pdf(generated_print_packet, text="GENERATED PRINT", width=792, height=1224)
+            write_pdf(generated_assembly_packet, text="GENERATED ASSEMBLY", width=792, height=1224)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
+
     def test_build_assembly_packet_combines_unused_tabloid_pdfs_as_is(self) -> None:
         with workspace_tempdir() as temp_root:
             rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
