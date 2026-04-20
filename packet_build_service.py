@@ -238,7 +238,10 @@ def prepare_packet_build_context(
     _configure_asset_lookup(rk_assets, settings)
 
     _tree, parts, _debug = rk_rpd_io.load_rpd(str(rpd_path))
-    resolve_asset_fn = rk_assets.resolve_asset_fast
+    # Packet builds are explicit user actions, so prefer the subtree-capable
+    # resolver over the preview-optimized fast path. This covers cases where
+    # W-side PDFs live under kit-specific subfolders such as PUMP PACK\PUMP HOUSE.
+    resolve_asset_fn = rk_assets.resolve_asset
     assembly_search_roots = _assembly_search_roots(fabrication_dir, rpd_path.parent)
     assembly_source_pdfs = collect_unused_tabloid_pdfs(
         parts,

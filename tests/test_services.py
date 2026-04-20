@@ -670,6 +670,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(len(context.parts), 1)
             self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
 
+    def test_prepare_packet_build_context_uses_subtree_lookup_for_pump_house_print_packet_pdfs(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+                kit_templates=["PUMP HOUSE => PUMP PACK\\PUMP HOUSE"],
+            )
+            paths = build_kit_paths("F55334", "PUMP HOUSE", settings)
+            assert paths.release_kit_dir is not None
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.release_kit_dir.mkdir(parents=True, exist_ok=True)
+            paths.project_dir.mkdir(parents=True, exist_ok=True)
+            paths.fabrication_kit_dir.mkdir(parents=True, exist_ok=True)
+
+            sym_path = paths.release_kit_dir / "F55334-PH-1.sym"
+            nested_pdf_dir = paths.fabrication_kit_dir / "Parts" / "Nested"
+            part_pdf = nested_pdf_dir / "F55334-PH-1.pdf"
+            sym_path.write_text("sym", encoding="utf-8")
+            write_pdf(part_pdf, text="PUMP HOUSE PART", width=612, height=792)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.resolve_asset_fn(str(sym_path), ".pdf"), str(part_pdf))
+            self.assertEqual(context.assembly_source_pdfs, ())
+
     def test_prepare_packet_build_context_collects_unused_tabloid_assembly_pdfs_from_project_dir(self) -> None:
         with workspace_tempdir() as temp_root:
             settings = ExplorerSettings(
