@@ -14,6 +14,15 @@ APP_DIR = Path(__file__).resolve().parent
 FLOW_APP_DIR = APP_DIR.parent / "fabrication_flow_dashboard"
 FLOW_PROBE_PATH = APP_DIR / "flow_schedule_probe.py"
 FLOW_DB_PATH = FLOW_APP_DIR / "fabrication_flow.db"
+FLOW_CACHE_DEPENDENCY_PATHS = (
+    FLOW_PROBE_PATH,
+    FLOW_DB_PATH,
+    FLOW_APP_DIR / "database.py",
+    FLOW_APP_DIR / "gantt_overlay.py",
+    FLOW_APP_DIR / "models.py",
+    FLOW_APP_DIR / "schedule.py",
+    FLOW_APP_DIR / "stages.py",
+)
 
 EXPLORER_TO_FLOW_KIT_NAME = {
     "PAINT PACK": "Body",
@@ -91,12 +100,7 @@ def _file_cache_token(path: Path) -> str:
 
 
 def flow_probe_cache_token() -> str:
-    return "|".join(
-        (
-            _file_cache_token(FLOW_PROBE_PATH),
-            _file_cache_token(FLOW_DB_PATH),
-        )
-    )
+    return "|".join(_file_cache_token(path) for path in FLOW_CACHE_DEPENDENCY_PATHS)
 
 
 def _normalize_status_key(value: object) -> str:

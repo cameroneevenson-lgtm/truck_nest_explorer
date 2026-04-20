@@ -58,6 +58,7 @@ from services import (
     is_hidden_truck,
     launch_tool,
     move_inventor_outputs_to_project,
+    release_text_for_status,
     sort_truck_numbers_by_fabrication_order,
 )
 
@@ -558,6 +559,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertTrue(released_status.fabrication_has_files)
             self.assertIn("Released", released_status.status_summary)
             self.assertIn("Spreadsheet ready", released_status.status_summary)
+
+    def test_release_text_for_status_prefers_flow_complete(self) -> None:
+        self.assertEqual(
+            release_text_for_status(
+                fabrication_folder_exists=True,
+                fabrication_has_files=True,
+                flow_display_text="Complete",
+            ),
+            "Complete",
+        )
+        self.assertEqual(
+            release_text_for_status(
+                fabrication_folder_exists=True,
+                fabrication_has_files=True,
+                flow_display_text="Weld | Late",
+            ),
+            "Released",
+        )
+        self.assertEqual(
+            release_text_for_status(
+                fabrication_folder_exists=True,
+                fabrication_has_files=False,
+            ),
+            "Not released",
+        )
+        self.assertEqual(
+            release_text_for_status(
+                fabrication_folder_exists=False,
+                fabrication_has_files=False,
+            ),
+            "W missing",
+        )
 
     def test_detect_preview_pdf_finds_matching_nest_summary_on_l(self) -> None:
         with workspace_tempdir() as temp_root:

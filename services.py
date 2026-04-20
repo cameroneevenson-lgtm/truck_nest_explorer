@@ -647,6 +647,22 @@ def fabrication_folder_has_files(folder: Path | None) -> bool:
     return False
 
 
+def release_text_for_status(
+    *,
+    fabrication_folder_exists: bool,
+    fabrication_has_files: bool,
+    flow_display_text: str = "",
+) -> str:
+    display_key = clean_text(flow_display_text).casefold()
+    if display_key == "complete":
+        return "Complete"
+    if fabrication_has_files:
+        return "Released"
+    if fabrication_folder_exists:
+        return "Not released"
+    return "W missing"
+
+
 def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSettings) -> KitStatus:
     paths = build_kit_paths(truck_number, kit_name, settings)
     release_folder_exists = bool(paths.release_kit_dir and paths.release_kit_dir.exists())
@@ -663,9 +679,13 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
 
     summary_parts: list[str] = []
     summary_parts.append("RPD ready" if rpd_exists else "RPD missing")
-    if fabrication_has_files:
+    release_text = release_text_for_status(
+        fabrication_folder_exists=fabrication_folder_exists,
+        fabrication_has_files=fabrication_has_files,
+    )
+    if release_text == "Released":
         summary_parts.append("Released")
-    elif fabrication_folder_exists:
+    elif release_text == "Not released":
         summary_parts.append("Not released")
     else:
         summary_parts.append("W folder missing")

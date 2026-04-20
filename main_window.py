@@ -84,6 +84,7 @@ from services import (
     move_inventor_outputs_to_project,
     open_external_target,
     open_path,
+    release_text_for_status,
     sort_truck_numbers_by_fabrication_order,
 )
 from settings_store import load_settings, save_settings
@@ -203,10 +204,14 @@ class MainWindow(QMainWindow):
         self._flow_watch_timer = QTimer(self)
         self._flow_watch_timer.setInterval(120)
         self._flow_watch_timer.timeout.connect(self._poll_pending_flow_future)
+        self._flow_cache_refresh_timer = QTimer(self)
+        self._flow_cache_refresh_timer.setInterval(1500)
+        self._flow_cache_refresh_timer.timeout.connect(self._check_current_flow_cache)
 
         self._build_ui()
         self._apply_dashboard_style()
         self._load_settings_into_form()
+        self._flow_cache_refresh_timer.start()
         QTimer.singleShot(0, self.refresh_trucks)
 
     def _build_ui(self) -> None:
@@ -737,11 +742,18 @@ class MainWindow(QMainWindow):
         return group
 
     def _release_text_for_status(self, status: KitStatus) -> str:
-        if status.fabrication_has_files:
-            return "Released"
-        if status.fabrication_folder_exists:
-            return "Not released"
-        return "W missing"
+        flow_insight = self._flow_insight_for_status(status)
+        return release_text_for_status(
+            fabrication_folder_exists=status.fabrication_folder_exists,
+            fabrication_has_files=status.fabrication_has_files,
+            flow_display_text=flow_insight.display_text,
+        )
+
+    def _status_summary_for_display(self, status: KitStatus) -> str:
+        release_text = self._release_text_for_status(status)
+        if release_text == "Complete":
+            return f"Complete in flow | {status.status_summary}"
+        return status.status_summary
 
     def _flow_insight_for_status(self, status: KitStatus):
         flow_insight = flow_kit_insight_for_explorer_kit(status.kit_name, self._current_flow_truck_insight)
@@ -832,6 +844,7 @@ class MainWindow(QMainWindow):
     def _truck_rollup_lines(self) -> list[str]:
         total_kits = len(self._all_statuses)
         visible_kits = len(self._current_statuses)
+        complete = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Complete")
         released = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Released")
         not_released = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Not released")
         w_missing = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "W missing")
@@ -854,7 +867,7 @@ class MainWindow(QMainWindow):
         lines = [
             f"Kits in truck: {total_kits}",
             f"Kits visible in table: {visible_kits}",
-            f"Released: {released} | Not released: {not_released} | W missing: {w_missing}",
+            f"Complete: {complete} | Released: {released} | Not released: {not_released} | W missing: {w_missing}",
             f"Project files ready: {rpd_ready}/{total_kits}",
             f"Spreadsheets ready: {spreadsheet_ready} | Ambiguous: {spreadsheet_ambiguous} | Missing: {spreadsheet_missing}",
             f"Nest summaries ready: {nest_ready}/{total_kits}",
@@ -866,7 +879,12 @@ class MainWindow(QMainWindow):
 
     def _selection_rollup_lines(self, statuses: list[KitStatus]) -> list[str]:
         missing_projects = sum(1 for status in statuses if not status.project_folder_exists or not status.rpd_exists)
-        unreleased = sum(1 for status in statuses if self._release_text_for_status(status) != "Released")
+        complete = sum(1 for status in statuses if self._release_text_for_status(status) == "Complete")
+        unreleased = sum(
+            1
+            for status in statuses
+            if self._release_text_for_status(status) in {"Not released", "W missing"}
+        )
         spreadsheet_ready = sum(1 for status in statuses if status.spreadsheet_match.is_unique)
         spreadsheet_ambiguous = sum(
             1 for status in statuses if status.spreadsheet_match.issue == "multiple_spreadsheets"
@@ -880,6 +898,7 @@ class MainWindow(QMainWindow):
         lines = [
             f"Selection size: {len(statuses)}",
             f"Need repair: {missing_projects}",
+            f"Complete in flow: {complete}",
             f"Not fully released yet: {unreleased}",
             f"Spreadsheets ready: {spreadsheet_ready} | Ambiguous: {spreadsheet_ambiguous}",
             f"Nest summaries missing: {nest_missing}",
@@ -896,7 +915,7 @@ class MainWindow(QMainWindow):
             f"Kit: {status.paths.display_name}",
             f"RADAN name: {status.kit_name}",
             f"Kit hidden: {'Yes' if is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings) else 'No'}",
-            f"Status summary: {status.status_summary}",
+            f"Status summary: {self._status_summary_for_display(status)}",
             f"Release state: {self._release_text_for_status(status)}",
             f"Flow status: {flow_insight.display_text or 'Not mapped'}",
             f"Project file: {'Ready' if status.rpd_exists else 'Missing'}",
@@ -965,7 +984,7 @@ class MainWindow(QMainWindow):
         if len(selected_statuses) == 1:
             status = selected_statuses[0]
             self.details_summary_label.setText(f"{status.paths.display_name} on {truck_number}")
-            self.details_helper_label.setText(status.status_summary)
+            self.details_helper_label.setText(self._status_summary_for_display(status))
             detail_lines.extend(["", *self._kit_details_lines(status)])
             self.details_text.setPlainText("\n".join(detail_lines))
             return
@@ -1284,6 +1303,19 @@ class MainWindow(QMainWindow):
             self._refresh_current_truck_heading()
             self._render_current_statuses()
 
+    def _check_current_flow_cache(self) -> None:
+        truck_number = self.current_truck_number().strip()
+        if not truck_number:
+            return
+        truck_key = truck_number.casefold()
+        if truck_key in self._pending_flow_by_truck:
+            return
+        current_token = flow_probe_cache_token()
+        cached_flow = self._flow_cache_by_truck.get(truck_key)
+        if cached_flow is not None and cached_flow[0] == current_token:
+            return
+        self._load_selected_truck()
+
     def _render_current_statuses(self) -> None:
         previous_kit_name = self._current_status().kit_name if self._current_status() is not None else ""
         visible_statuses = filter_kit_statuses(
@@ -1455,7 +1487,7 @@ class MainWindow(QMainWindow):
 
         release_text = self._release_text_for_status(status)
         release_color = red
-        if release_text == "Released":
+        if release_text in {"Complete", "Released"}:
             release_color = green
         elif release_text == "Not released":
             release_color = yellow
