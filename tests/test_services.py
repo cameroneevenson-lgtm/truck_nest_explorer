@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -43,6 +45,7 @@ from packet_build_service import build_assembly_packet, prepare_packet_build_con
 from settings_store import load_settings, save_settings
 from services import (
     DEFAULT_RADAN_CSV_IMPORT_ENTRY,
+    InventorToRadanInlineNeedsUi,
     build_kit_paths,
     build_launch_command,
     build_kit_status,
@@ -61,6 +64,9 @@ from services import (
     launch_tool,
     launch_radan_csv_import,
     move_inventor_outputs_to_project,
+    radan_csv_missing_symbols,
+    radan_csv_import_lock_status,
+    run_inventor_to_radan_inline,
     release_text_for_status,
     resolve_existing_inventor_csv,
     sort_truck_numbers_by_fabrication_order,
@@ -934,18 +940,95 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(resolve_existing_inventor_csv(spreadsheet, l_project), source_csv)
 
+    def test_run_inventor_to_radan_inline_loads_sibling_module_for_batch_entry(self) -> None:
+        with workspace_tempdir() as temp_root:
+            tool_dir = temp_root / "inventor_to_radan"
+            tool_dir.mkdir()
+            spreadsheet = temp_root / "bom.csv"
+            spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
+            batch = tool_dir / "inventor_to_radan.bat"
+            batch.write_text("@echo off\n", encoding="utf-8")
+            (tool_dir / "inventor_to_radan.py").write_text(
+                "from types import SimpleNamespace\n"
+                "def convert_bom_to_radan_csv(path, *, allow_prompts, show_summary):\n"
+                "    if allow_prompts or show_summary:\n"
+                "        raise AssertionError('inline mode should not prompt')\n"
+                "    return SimpleNamespace(added_count=3, bom_path=path)\n",
+                encoding="utf-8",
+            )
+
+            result = run_inventor_to_radan_inline(batch, spreadsheet)
+
+            self.assertEqual(result.added_count, 3)
+            self.assertEqual(result.bom_path, str(spreadsheet))
+
+    def test_run_inventor_to_radan_inline_wraps_prompt_required_signal(self) -> None:
+        with workspace_tempdir() as temp_root:
+            tool_dir = temp_root / "inventor_to_radan"
+            tool_dir.mkdir()
+            spreadsheet = temp_root / "bom.csv"
+            spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
+            entry = tool_dir / "inventor_to_radan.py"
+            entry.write_text(
+                "class InventorToRadanNeedsUi(RuntimeError):\n"
+                "    def __init__(self):\n"
+                "        self.missing_dxf_items = [{'desc': 'X'}]\n"
+                "        self.missing_rules = ['Y']\n"
+                "        super().__init__('needs ui')\n"
+                "def convert_bom_to_radan_csv(path, *, allow_prompts, show_summary):\n"
+                "    raise InventorToRadanNeedsUi()\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(InventorToRadanInlineNeedsUi) as raised:
+                run_inventor_to_radan_inline(entry, spreadsheet)
+
+            self.assertEqual(raised.exception.missing_dxf_count, 1)
+            self.assertEqual(raised.exception.missing_rule_count, 1)
+
+    def test_radan_csv_missing_symbols_reports_missing_sym_files(self) -> None:
+        with workspace_tempdir() as temp_root:
+            output_folder = temp_root / "symbols"
+            output_folder.mkdir()
+            (output_folder / "Part A.sym").write_text("sym", encoding="utf-8")
+            csv_path = temp_root / "parts_Radan.csv"
+            csv_path.write_text(
+                f"{temp_root / 'Part A.dxf'},1,Aluminum,0.125,in,AIR\n"
+                f"{temp_root / 'Part B.dxf'},1,Aluminum,0.125,in,AIR\n",
+                encoding="utf-8",
+            )
+
+            missing = radan_csv_missing_symbols(csv_path, output_folder)
+
+            self.assertEqual(missing, (output_folder / "Part B.sym",))
+
+    def test_radan_csv_import_lock_status_reports_live_pid(self) -> None:
+        with workspace_tempdir() as temp_root:
+            project_path = temp_root / "job.rpd"
+            project_path.write_text("<Project />", encoding="utf-8")
+            digest = hashlib.sha1(str(project_path.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+            lock_path = Path(os.environ.get("TEMP", str(project_path.parent))) / f"radan_csv_import_{digest}.lock"
+            lock_path.write_text("1234", encoding="ascii")
+            try:
+                with patch("services._process_exists", return_value=True):
+                    running, found_lock_path, process_id = radan_csv_import_lock_status(project_path)
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+            self.assertTrue(running)
+            self.assertEqual(found_lock_path, lock_path)
+            self.assertEqual(process_id, 1234)
+
     def test_launch_radan_csv_import_starts_helper_console(self) -> None:
         with workspace_tempdir() as temp_root:
             entry_path = temp_root / "import_parts_csv_live.py"
             csv_path = temp_root / "TruckBom_Radan.csv"
             project_path = temp_root / "TruckBom.rpd"
             log_path = temp_root / "import.log"
-            kitter_launcher = temp_root / "radan_kitter.bat"
             output_folder = temp_root / "out"
             entry_path.write_text("print('helper')", encoding="utf-8")
             csv_path.write_text("csv", encoding="utf-8")
             project_path.write_text("<Project />", encoding="utf-8")
-            kitter_launcher.write_text("@echo off\r\n", encoding="utf-8")
             output_folder.mkdir()
 
             with patch("services.subprocess.Popen") as popen_mock:
@@ -953,9 +1036,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     csv_path,
                     output_folder,
                     project_path=project_path,
-                    kitter_launcher=kitter_launcher,
                     log_path=log_path,
                     entry_path=entry_path,
+                    allow_visible_radan=True,
                 )
 
             command = popen_mock.call_args.args[0]
@@ -963,8 +1046,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn(str(csv_path), command)
             self.assertIn(str(output_folder), command)
             self.assertIn(str(project_path), command)
-            self.assertIn(str(kitter_launcher), command)
             self.assertIn(str(log_path), command)
+            self.assertNotIn("--kitter-launcher", command)
+            self.assertIn("--allow-visible-radan", command)
             self.assertEqual(popen_mock.call_args.kwargs["cwd"], str(temp_root))
             self.assertIs(popen_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
             self.assertIs(popen_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)

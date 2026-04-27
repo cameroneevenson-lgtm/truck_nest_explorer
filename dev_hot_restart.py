@@ -24,6 +24,7 @@ IGNORE_DIR_PREFIXES = (
 )
 WATCH_EXTENSIONS = {".py"}
 _LOCK_HANDLE = None
+SHARED_VENV_PYTHON = r"C:\Tools\.venv\Scripts\python.exe"
 
 
 def _is_ignored_dir(name: str) -> bool:
@@ -78,6 +79,12 @@ def _spawn_app(py_exe: str, app_py: str, app_args: List[str], cwd: str) -> subpr
     env = os.environ.copy()
     env["TNE_HOT_RELOAD_ACTIVE"] = "1"
     return subprocess.Popen(command, cwd=cwd, env=env)
+
+
+def _shared_python_executable() -> str:
+    if os.path.exists(SHARED_VENV_PYTHON):
+        return SHARED_VENV_PYTHON
+    raise FileNotFoundError(f"Shared venv Python was not found: {SHARED_VENV_PYTHON}")
 
 
 def _terminate_process(proc: subprocess.Popen, timeout_sec: float = 6.0) -> None:
@@ -201,7 +208,7 @@ def main() -> int:
         return 0
 
     app_py = os.path.join(root, "app.py")
-    py_exe = sys.executable
+    py_exe = _shared_python_executable()
     app_args = list(ns.app_args or [])
     if app_args and app_args[0] == "--":
         app_args = app_args[1:]

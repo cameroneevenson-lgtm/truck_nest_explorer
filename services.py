@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import csv
+import ctypes
+import hashlib
+import importlib.util
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from models import (
@@ -38,6 +44,13 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
+
+
+class InventorToRadanInlineNeedsUi(RuntimeError):
+    def __init__(self, message: str, *, missing_dxf_count: int = 0, missing_rule_count: int = 0) -> None:
+        self.missing_dxf_count = missing_dxf_count
+        self.missing_rule_count = missing_rule_count
+        super().__init__(message)
 
 
 def clean_text(value: object) -> str:
@@ -797,6 +810,153 @@ def _python_executable() -> str:
     raise FileNotFoundError(f"Shared venv Python was not found: {DEFAULT_VENV_PYTHON}")
 
 
+def _inventor_to_radan_module_path(entry_path: Path) -> Path:
+    if entry_path.suffix.casefold() == ".py":
+        return entry_path
+    return entry_path.parent / "inventor_to_radan.py"
+
+
+def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path | str) -> object:
+    entry = Path(str(entry_path))
+    spreadsheet = Path(str(spreadsheet_path))
+    if not entry.exists():
+        raise FileNotFoundError(str(entry))
+    if not spreadsheet.exists():
+        raise FileNotFoundError(str(spreadsheet))
+
+    module_path = _inventor_to_radan_module_path(entry)
+    if not module_path.exists():
+        raise FileNotFoundError(f"Could not find inline Inventor-to-RADAN module: {module_path}")
+
+    module_name = "_truck_nest_inventor_to_radan_inline"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load inline Inventor-to-RADAN module: {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous_module is not None:
+            sys.modules[module_name] = previous_module
+        else:
+            sys.modules.pop(module_name, None)
+
+    converter = getattr(module, "convert_bom_to_radan_csv", None)
+    if not callable(converter):
+        raise RuntimeError(
+            f"{module_path} does not expose convert_bom_to_radan_csv(). "
+            "Use the external launcher for this version."
+        )
+
+    try:
+        return converter(str(spreadsheet), allow_prompts=False, show_summary=False)
+    except Exception as exc:
+        if exc.__class__.__name__ != "InventorToRadanNeedsUi":
+            raise
+        missing_dxf_items = getattr(exc, "missing_dxf_items", ()) or ()
+        missing_rules = getattr(exc, "missing_rules", ()) or ()
+        parts: list[str] = []
+        if missing_dxf_items:
+            parts.append(f"{len(missing_dxf_items)} missing-DXF classification(s)")
+        if missing_rules:
+            parts.append(f"{len(missing_rules)} RADAN rule(s)")
+        detail = " and ".join(parts) if parts else "user input"
+        raise InventorToRadanInlineNeedsUi(
+            f"Inline conversion needs {detail}.",
+            missing_dxf_count=len(missing_dxf_items),
+            missing_rule_count=len(missing_rules),
+        ) from exc
+
+
+def radan_csv_missing_symbols(csv_path: Path | str, output_folder: Path | str) -> tuple[Path, ...]:
+    csv_file = Path(str(csv_path))
+    symbol_folder = Path(str(output_folder))
+    missing: list[Path] = []
+    with csv_file.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.reader(handle)
+        for row in reader:
+            if not row or all(not cell.strip() for cell in row):
+                continue
+            dxf_text = row[0].strip()
+            if not dxf_text:
+                continue
+            symbol_path = symbol_folder / f"{Path(dxf_text).stem}.sym"
+            if not symbol_path.exists():
+                missing.append(symbol_path)
+    return tuple(missing)
+
+
+def visible_radan_sessions() -> tuple[tuple[int, str], ...]:
+    command = (
+        "$sessions = Get-Process -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.ProcessName -like 'radraft*' -and $_.MainWindowHandle -ne 0 -and "
+        "-not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) } | "
+        "Select-Object @{Name='ProcessId';Expression={$_.Id}}, @{Name='WindowTitle';Expression={$_.MainWindowTitle}}; "
+        "$sessions | ConvertTo-Json -Compress"
+    )
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return ()
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return ()
+    if isinstance(payload, dict):
+        items = [payload]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return ()
+    sessions: list[tuple[int, str]] = []
+    for item in items:
+        try:
+            process_id = int(item.get("ProcessId"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        title = str(item.get("WindowTitle") or "").strip()
+        if title:
+            sessions.append((process_id, title))
+    return tuple(sessions)
+
+
+def _process_exists(process_id: int) -> bool:
+    if process_id <= 0:
+        return False
+    if os.name == "nt":
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(process_id))
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(int(process_id), 0)
+    except OSError:
+        return False
+    return True
+
+
+def radan_csv_import_lock_status(project_path: Path | str) -> tuple[bool, Path, int | None]:
+    project = Path(str(project_path)).expanduser().resolve()
+    digest = hashlib.sha1(str(project).casefold().encode("utf-8")).hexdigest()[:16]
+    lock_path = Path(os.environ.get("TEMP", str(project.parent))) / f"radan_csv_import_{digest}.lock"
+    if not lock_path.exists():
+        return False, lock_path, None
+    try:
+        process_id = int(lock_path.read_text(encoding="ascii", errors="ignore").strip())
+    except (OSError, ValueError):
+        return False, lock_path, None
+    return _process_exists(process_id), lock_path, process_id
+
+
 def launch_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.Popen[object]:
     entry = Path(str(entry_path))
     spreadsheet = Path(str(spreadsheet_path))
@@ -829,9 +989,9 @@ def launch_radan_csv_import(
     output_folder: Path | str,
     *,
     project_path: Path | str | None = None,
-    kitter_launcher: Path | str | None = None,
     log_path: Path | str | None = None,
     entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
+    allow_visible_radan: bool = False,
 ) -> subprocess.Popen[object]:
     entry = Path(str(entry_path))
     csv = Path(str(csv_path))
@@ -845,9 +1005,6 @@ def launch_radan_csv_import(
     project = Path(str(project_path)) if project_path is not None else None
     if project is not None and not project.exists():
         raise FileNotFoundError(str(project))
-    kitter = Path(str(kitter_launcher)) if kitter_launcher is not None and str(kitter_launcher).strip() else None
-    if kitter is not None and not kitter.exists():
-        raise FileNotFoundError(str(kitter))
     log = Path(str(log_path)) if log_path is not None else None
 
     command = [
@@ -860,8 +1017,8 @@ def launch_radan_csv_import(
     ]
     if project is not None:
         command.extend(["--project", str(project)])
-    if kitter is not None:
-        command.extend(["--kitter-launcher", str(kitter)])
+    if allow_visible_radan:
+        command.append("--allow-visible-radan")
     if log is not None:
         command.extend(["--log-file", str(log)])
     return subprocess.Popen(

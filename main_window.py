@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import html
 import json
 import subprocess
 import time
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -76,6 +78,7 @@ from services import (
     filter_truck_numbers,
     find_fabrication_truck_dir,
     inventor_output_paths,
+    InventorToRadanInlineNeedsUi,
     is_hidden_kit,
     is_hidden_truck,
     launch_inventor_to_radan,
@@ -85,9 +88,13 @@ from services import (
     move_inventor_outputs_to_project,
     open_external_target,
     open_path,
+    radan_csv_missing_symbols,
+    radan_csv_import_lock_status,
     release_text_for_status,
     resolve_existing_inventor_csv,
+    run_inventor_to_radan_inline,
     sort_truck_numbers_by_fabrication_order,
+    visible_radan_sessions,
 )
 from settings_store import load_settings, save_settings
 
@@ -176,6 +183,227 @@ class ImportLogDialog(QDialog):
         self.viewer.setPlainText(text)
         if was_at_bottom:
             scrollbar.setValue(scrollbar.maximum())
+
+
+class InventorReportReviewDialog(QDialog):
+    REVIEW_SECTION_LEVELS = {
+        "Expected laser but missing DXF": "red",
+        "Orphan DXFs": "yellow",
+        "DXFs missing PDFs": "yellow",
+        "Non-laser parts": "yellow",
+    }
+
+    def __init__(self, report_path: Path, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.report_path = report_path
+        self._acknowledged = False
+        self.rejected_without_ack = False
+        self.setWindowTitle("Review Inventor-to-RADAN Report")
+        self.resize(920, 680)
+
+        title = QLabel("Review required before production use")
+        title.setStyleSheet("font-weight: 700;")
+        title.setWordWrap(True)
+
+        report_text = self._read_report_text()
+        critical_count, review_count = self._warning_counts(report_text)
+        if critical_count:
+            detail_text = (
+                f"This report contains {critical_count} critical line(s) and "
+                f"{review_count} review line(s). "
+                "Read the report below before acknowledging completion."
+            )
+            detail_style = "color: #B91C1C; font-weight: 700;"
+        elif review_count:
+            detail_text = (
+                f"This report contains {review_count} line(s) to check. "
+                "Read the yellow sections below before acknowledging completion."
+            )
+            detail_style = "color: #A16207; font-weight: 700;"
+        else:
+            detail_text = "No report warnings were found. Review the green confirmation sections before continuing."
+            detail_style = "color: #15803D; font-weight: 700;"
+        detail = QLabel(detail_text)
+        detail.setWordWrap(True)
+        detail.setStyleSheet(detail_style)
+
+        path_label = QLabel(str(report_path))
+        path_label.setWordWrap(True)
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.viewer = QTextEdit()
+        self.viewer.setReadOnly(True)
+        self.viewer.setLineWrapMode(QTextEdit.NoWrap)
+        self.viewer.setHtml(self._report_html(report_text))
+
+        self.ack_checkbox = QCheckBox(
+            "I have reviewed this report and understand any warnings before production."
+        )
+        self.ack_checkbox.stateChanged.connect(self._update_ack_button)
+
+        self.open_button = QPushButton("Open Report File")
+        self.open_button.clicked.connect(self.open_report)
+        self.ack_button = QPushButton("Acknowledge Report")
+        self.ack_button.setEnabled(False)
+        self.ack_button.clicked.connect(self.accept)
+        self.discard_button = QPushButton("Discard CSV/Report")
+        self.discard_button.clicked.connect(self.reject)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.open_button)
+        button_row.addWidget(self.discard_button)
+        button_row.addWidget(self.ack_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addWidget(detail)
+        layout.addWidget(path_label)
+        layout.addWidget(self.viewer, 1)
+        layout.addWidget(self.ack_checkbox)
+        layout.addLayout(button_row)
+
+    def _read_report_text(self) -> str:
+        try:
+            return self.report_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"Could not read report file:\n{exc}"
+
+    @classmethod
+    def _warning_counts(cls, report_text: str) -> tuple[int, int]:
+        critical_count = 0
+        review_count = 0
+        active_section = ""
+        active_level = ""
+        for line in report_text.splitlines():
+            stripped = line.strip()
+            if stripped.endswith(":"):
+                active_section = stripped
+                active_level = ""
+                for section, level in cls.REVIEW_SECTION_LEVELS.items():
+                    if active_section.startswith(section):
+                        active_level = level
+                        break
+                continue
+            if not stripped or stripped == "(none)":
+                continue
+            if active_level == "red":
+                critical_count += 1
+            elif active_level == "yellow":
+                review_count += 1
+        return critical_count, review_count
+
+    @classmethod
+    def _report_html(cls, report_text: str) -> str:
+        colors = {
+            "base": "#111827",
+            "muted": "#475569",
+            "green": "#15803D",
+            "yellow": "#A16207",
+            "red": "#B91C1C",
+        }
+        active_level = ""
+        rows: list[str] = []
+        for line in report_text.splitlines():
+            stripped = line.strip()
+            if stripped.endswith(":"):
+                active_level = ""
+                for section, level in cls.REVIEW_SECTION_LEVELS.items():
+                    if stripped.startswith(section):
+                        active_level = level
+                        break
+                color = colors.get(active_level, colors["base"])
+                weight = "700" if active_level else "600"
+            elif stripped == "(none)" and active_level:
+                color = colors["green"]
+                weight = "700"
+            elif stripped and active_level:
+                color = colors[active_level]
+                weight = "700"
+            elif stripped:
+                color = colors["base"]
+                weight = "400"
+            else:
+                color = colors["muted"]
+                weight = "400"
+            rows.append(
+                "<div style='white-space: pre-wrap; "
+                f"color: {color}; font-weight: {weight};'>"
+                f"{html.escape(line) or '&nbsp;'}</div>"
+            )
+        body = "\n".join(rows)
+        return (
+            "<html><body style='font-family: Consolas, monospace; "
+            "font-size: 10pt; background: #FFFFFF;'>"
+            f"{body}</body></html>"
+        )
+
+    def _update_ack_button(self) -> None:
+        self.ack_button.setEnabled(self.ack_checkbox.isChecked())
+
+    def open_report(self) -> None:
+        try:
+            open_path(self.report_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Report", str(exc))
+
+    def accept(self) -> None:
+        if not self.ack_checkbox.isChecked():
+            QMessageBox.warning(
+                self,
+                "Review Required",
+                "Review the report and check the acknowledgement before continuing.",
+            )
+            return
+        self._acknowledged = True
+        super().accept()
+
+    def reject(self) -> None:
+        if not self._acknowledged:
+            choice = QMessageBox.question(
+                self,
+                "Discard Inventor Output?",
+                "Close without acknowledging this report?\n\n"
+                "The generated RADAN CSV and report will be deleted.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+            self.rejected_without_ack = True
+            super().reject()
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._acknowledged:
+            event.accept()
+            return
+        choice = QMessageBox.question(
+            self,
+            "Discard Inventor Output?",
+            "Close without acknowledging this report?\n\n"
+            "The generated RADAN CSV and report will be deleted.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice == QMessageBox.Yes:
+            self.rejected_without_ack = True
+            event.accept()
+            return
+        event.ignore()
+
+
+def delete_paths(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    deleted: list[Path] = []
+    failed: list[str] = []
+    for path in paths:
+        try:
+            if path.exists():
+                path.unlink()
+                deleted.append(path)
+        except OSError as exc:
+            failed.append(f"{path}: {exc}")
+    return tuple(deleted), tuple(failed)
 
 
 class MainWindow(QMainWindow):
@@ -2481,6 +2709,89 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Run Inventor Tool", "Inventor launcher is not configured.")
             return
         entry_path = Path(entry_text)
+
+        self.launch_inventor_button.setEnabled(False)
+        self.launch_inventor_button.setText("Running Inventor...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            result = run_inventor_to_radan_inline(entry_path, spreadsheet_path)
+            outputs, moved_paths = move_inventor_outputs_to_project(
+                spreadsheet_path,
+                status.paths.project_dir,
+            )
+        except InventorToRadanInlineNeedsUi as exc:
+            QApplication.restoreOverrideCursor()
+            self.launch_inventor_button.setEnabled(True)
+            self.launch_inventor_button.setText("Run Inventor Tool")
+            result = None
+            moved_paths = ()
+            fallback_reason = str(exc)
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            self.launch_inventor_button.setEnabled(True)
+            self.launch_inventor_button.setText("Run Inventor Tool")
+            QMessageBox.critical(self, "Run Inventor Tool", str(exc))
+            return
+        else:
+            QApplication.restoreOverrideCursor()
+            self.launch_inventor_button.setEnabled(True)
+            self.launch_inventor_button.setText("Run Inventor Tool")
+            if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
+                self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
+            added_count = getattr(result, "added_count", None)
+            row_text = f" ({added_count} RADAN row{'s' if added_count != 1 else ''})" if added_count is not None else ""
+            self.log("Ran Inventor-to-RADAN inline and moved outputs to L: " + ", ".join(str(path) for path in moved_paths))
+            report_path = outputs.target_report_path
+            if report_path is None or not report_path.exists():
+                report_path = next((path for path in moved_paths if path.suffix.casefold() == ".txt"), None)
+            if report_path is not None and report_path.exists():
+                try:
+                    review_dialog = InventorReportReviewDialog(report_path, self)
+                    review_result = review_dialog.exec()
+                except Exception as exc:
+                    QMessageBox.critical(self, "Run Inventor Tool", f"Could not show report review:\n\n{exc}")
+                    return
+                if review_result != QDialog.Accepted:
+                    discard_paths = tuple(
+                        path
+                        for path in moved_paths
+                        if path.suffix.casefold() in {".csv", ".txt"}
+                    )
+                    deleted_paths, failed_deletes = delete_paths(discard_paths)
+                    if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
+                        self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
+                    self.log("Discarded unacknowledged Inventor-to-RADAN outputs: " + ", ".join(str(path) for path in deleted_paths))
+                    if failed_deletes:
+                        QMessageBox.warning(
+                            self,
+                            "Run Inventor Tool",
+                            "The Inventor-to-RADAN report was not acknowledged, but some generated files could not be deleted.\n\n"
+                            + "\n".join(failed_deletes),
+                        )
+                    else:
+                        QMessageBox.information(
+                            self,
+                            "Run Inventor Tool",
+                            "The Inventor-to-RADAN report was not acknowledged, so the generated CSV/report were deleted.\n\n"
+                            + "\n".join(str(path) for path in deleted_paths),
+                        )
+                    return
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Run Inventor Tool",
+                    "Inventor-to-RADAN completed, but the generated report could not be found for review.",
+                )
+                return
+            QMessageBox.information(
+                self,
+                "Run Inventor Tool",
+                f"Inventor-to-RADAN ran inline{row_text} and the output was moved to L.\n\n"
+                + "\n".join(str(path) for path in moved_paths),
+            )
+            return
+
         try:
             process = launch_inventor_to_radan(entry_path, spreadsheet_path)
         except Exception as exc:
@@ -2500,13 +2811,13 @@ class MainWindow(QMainWindow):
         self.launch_inventor_button.setText("Watching Inventor...")
         self._inventor_watch_timer.start()
         self.log(
-            f"Launched Inventor tool for {spreadsheet_path.name}. "
+            f"Launched Inventor tool for {spreadsheet_path.name} because {fallback_reason.lower()} "
             "Finish the external prompts; output will be moved to L automatically when ready."
         )
         QMessageBox.information(
             self,
             "Run Inventor Tool",
-            "Inventor has been launched in its own window.\n\n"
+            f"{fallback_reason}\n\nInventor has been launched in its own window.\n\n"
             "Complete its prompts there. This explorer will keep watching and move the generated output to L once the files exist and stop changing.",
         )
 
@@ -2551,14 +2862,52 @@ class MainWindow(QMainWindow):
                 f"The expected RADAN symbol output folder is missing:\n{output_folder}",
             )
             return
-        kitter_launcher = self.settings.radan_kitter_launcher.strip()
-        if not kitter_launcher:
-            QMessageBox.warning(
+        running_import, lock_path, lock_pid = radan_csv_import_lock_status(status.paths.rpd_path)
+        if running_import:
+            QMessageBox.information(
                 self,
                 "Import CSV to RADAN",
-                "RADAN Kitter launcher is not configured.",
+                "A RADAN CSV import is already running for this project.\n\n"
+                f"PID: {lock_pid}\nLock: {lock_path}",
             )
+            self.log(f"RADAN CSV import already running for {status.paths.rpd_path} (PID {lock_pid}).")
             return
+        allow_visible_radan = False
+        try:
+            missing_symbols = radan_csv_missing_symbols(csv_path, output_folder)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import CSV to RADAN", f"Could not inspect CSV symbols:\n{exc}")
+            return
+        if missing_symbols:
+            try:
+                visible_sessions = visible_radan_sessions()
+            except Exception:
+                visible_sessions = ()
+            if visible_sessions:
+                sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:12])
+                if len(missing_symbols) > 12:
+                    sample_symbols += f"\n... (+{len(missing_symbols) - 12} more)"
+                session_text = "\n".join(f"{pid}: {title}" for pid, title in visible_sessions[:8])
+                if len(visible_sessions) > 8:
+                    session_text += f"\n... (+{len(visible_sessions) - 8} more)"
+                choice = QMessageBox.warning(
+                    self,
+                    "Visible RADAN Sessions Are Open",
+                    "This import still needs RADAN to convert DXF files into symbols.\n\n"
+                    "During conversion, RADAN COM automation can redraw or disturb already-open RADAN windows, "
+                    "and those sessions may not be safe to keep saving afterward.\n\n"
+                    f"Open RADAN sessions:\n{session_text}\n\n"
+                    f"Missing symbols to create:\n{sample_symbols}\n\n"
+                    "Continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if choice != QMessageBox.Yes:
+                    self.log(
+                        "RADAN CSV import cancelled before conversion because visible RADAN sessions were open."
+                    )
+                    return
+                allow_visible_radan = True
         log_dir = self._runtime_dir / "_runtime"
         log_dir.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(
@@ -2572,8 +2921,8 @@ class MainWindow(QMainWindow):
                 csv_path,
                 output_folder,
                 project_path=status.paths.rpd_path,
-                kitter_launcher=Path(kitter_launcher),
                 log_path=log_path,
+                allow_visible_radan=allow_visible_radan,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Import CSV to RADAN", str(exc))
