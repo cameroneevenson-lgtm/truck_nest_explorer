@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
@@ -57,8 +58,10 @@ from services import (
     is_hidden_kit,
     is_hidden_truck,
     launch_tool,
+    launch_radan_csv_import,
     move_inventor_outputs_to_project,
     release_text_for_status,
+    resolve_existing_inventor_csv,
     sort_truck_numbers_by_fabrication_order,
 )
 
@@ -125,6 +128,27 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
     def test_build_launch_command_uses_cmd_for_batch_files(self) -> None:
         command = build_launch_command(r"C:\Tools\fabrication_flow_dashboard\run_app.bat")
         self.assertEqual(command, ["cmd.exe", "/c", r"C:\Tools\fabrication_flow_dashboard\run_app.bat"])
+
+    def test_build_launch_command_uses_shared_venv_for_python_files(self) -> None:
+        with workspace_tempdir() as temp_dir:
+            fake_python = temp_dir / "Scripts" / "python.exe"
+            fake_python.parent.mkdir()
+            fake_python.write_text("", encoding="utf-8")
+            script_path = temp_dir / "tool.py"
+
+            with patch("services.DEFAULT_VENV_PYTHON", fake_python):
+                command = build_launch_command(script_path)
+
+            self.assertEqual(command, [str(fake_python), str(script_path)])
+
+    def test_build_launch_command_requires_shared_venv_for_python_files(self) -> None:
+        with workspace_tempdir() as temp_dir:
+            missing_python = temp_dir / "Scripts" / "python.exe"
+            script_path = temp_dir / "tool.py"
+
+            with patch("services.DEFAULT_VENV_PYTHON", missing_python):
+                with self.assertRaisesRegex(FileNotFoundError, "Shared venv Python was not found"):
+                    build_launch_command(script_path)
 
     def test_launch_tool_starts_dashboard_launcher_in_its_own_folder(self) -> None:
         with workspace_tempdir() as temp_dir:
@@ -875,6 +899,72 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertTrue(outputs.target_report_path.exists())
             self.assertFalse(source_csv.exists())
             self.assertFalse(source_report.exists())
+
+    def test_resolve_existing_inventor_csv_prefers_l_project_output(self) -> None:
+        with workspace_tempdir() as temp_root:
+            w_folder = temp_root / "W" / "F55334" / "PAINT PACK"
+            l_project = temp_root / "L" / "F55334" / "PAINT PACK" / "F55334 PAINT PACK"
+            w_folder.mkdir(parents=True)
+            l_project.mkdir(parents=True)
+
+            spreadsheet = w_folder / "TruckBom.xlsx"
+            spreadsheet.write_text("bom", encoding="utf-8")
+            source_csv = w_folder / "TruckBom_Radan.csv"
+            target_csv = l_project / "TruckBom_Radan.csv"
+            source_csv.write_text("w csv", encoding="utf-8")
+            target_csv.write_text("l csv", encoding="utf-8")
+
+            self.assertEqual(resolve_existing_inventor_csv(spreadsheet, l_project), target_csv)
+
+    def test_resolve_existing_inventor_csv_falls_back_to_w_output(self) -> None:
+        with workspace_tempdir() as temp_root:
+            w_folder = temp_root / "W" / "F55334" / "PAINT PACK"
+            l_project = temp_root / "L" / "F55334" / "PAINT PACK" / "F55334 PAINT PACK"
+            w_folder.mkdir(parents=True)
+            l_project.mkdir(parents=True)
+
+            spreadsheet = w_folder / "TruckBom.xlsx"
+            spreadsheet.write_text("bom", encoding="utf-8")
+            source_csv = w_folder / "TruckBom_Radan.csv"
+            source_csv.write_text("w csv", encoding="utf-8")
+
+            self.assertEqual(resolve_existing_inventor_csv(spreadsheet, l_project), source_csv)
+
+    def test_launch_radan_csv_import_starts_helper_console(self) -> None:
+        with workspace_tempdir() as temp_root:
+            entry_path = temp_root / "import_parts_csv_live.py"
+            csv_path = temp_root / "TruckBom_Radan.csv"
+            project_path = temp_root / "TruckBom.rpd"
+            log_path = temp_root / "import.log"
+            kitter_launcher = temp_root / "radan_kitter.bat"
+            output_folder = temp_root / "out"
+            entry_path.write_text("print('helper')", encoding="utf-8")
+            csv_path.write_text("csv", encoding="utf-8")
+            project_path.write_text("<Project />", encoding="utf-8")
+            kitter_launcher.write_text("@echo off\r\n", encoding="utf-8")
+            output_folder.mkdir()
+
+            with patch("services.subprocess.Popen") as popen_mock:
+                launch_radan_csv_import(
+                    csv_path,
+                    output_folder,
+                    project_path=project_path,
+                    kitter_launcher=kitter_launcher,
+                    log_path=log_path,
+                    entry_path=entry_path,
+                )
+
+            command = popen_mock.call_args.args[0]
+            self.assertIn(str(entry_path), command)
+            self.assertIn(str(csv_path), command)
+            self.assertIn(str(output_folder), command)
+            self.assertIn(str(project_path), command)
+            self.assertIn(str(kitter_launcher), command)
+            self.assertIn(str(log_path), command)
+            self.assertEqual(popen_mock.call_args.kwargs["cwd"], str(temp_root))
+            self.assertIs(popen_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIs(popen_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertIs(popen_mock.call_args.kwargs["stderr"], subprocess.DEVNULL)
 
     def test_discover_trucks_uses_release_root_only(self) -> None:
         with workspace_tempdir() as temp_root:

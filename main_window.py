@@ -80,11 +80,13 @@ from services import (
     is_hidden_truck,
     launch_inventor_to_radan,
     launch_launcher,
+    launch_radan_csv_import,
     launch_tool,
     move_inventor_outputs_to_project,
     open_external_target,
     open_path,
     release_text_for_status,
+    resolve_existing_inventor_csv,
     sort_truck_numbers_by_fabrication_order,
 )
 from settings_store import load_settings, save_settings
@@ -128,6 +130,52 @@ class MultilineEditorDialog(QDialog):
 
     def value(self) -> str:
         return self.editor.toPlainText()
+
+
+class ImportLogDialog(QDialog):
+    def __init__(self, log_path: Path, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.log_path = log_path
+        self.setWindowTitle("RADAN CSV Import Log")
+        self.resize(900, 520)
+
+        self.label = QLabel(str(log_path))
+        self.label.setWordWrap(True)
+        self.helper_label = QLabel("You can close this log window; the RADAN import helper will keep running.")
+        self.helper_label.setWordWrap(True)
+        self.helper_label.setStyleSheet("color: #64748B;")
+
+        self.viewer = QPlainTextEdit()
+        self.viewer.setReadOnly(True)
+        self.viewer.setPlaceholderText("Waiting for the RADAN import helper to write progress...")
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.label)
+        layout.addWidget(self.helper_label)
+        layout.addWidget(self.viewer, 1)
+        layout.addWidget(close_button)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self.refresh_log)
+        self._timer.start()
+        self.refresh_log()
+
+    def refresh_log(self) -> None:
+        try:
+            text = self.log_path.read_text(encoding="utf-8")
+        except OSError:
+            text = "Starting RADAN import helper..."
+        if self.viewer.toPlainText() == text:
+            return
+        scrollbar = self.viewer.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        self.viewer.setPlainText(text)
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
 
 class MainWindow(QMainWindow):
@@ -180,6 +228,7 @@ class MainWindow(QMainWindow):
         self._updating_kit_table = False
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
         self._pending_inventor_job: PendingInventorJob | None = None
+        self._radan_import_log_dialog: ImportLogDialog | None = None
         self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
         self._flow_cache_by_truck: dict[str, tuple[str, FlowTruckInsight]] = {}
         self._flow_gantt_source_bytes: bytes | None = None
@@ -651,6 +700,11 @@ class MainWindow(QMainWindow):
             "Run the Inventor-to-RADAN launcher on the selected spreadsheet, then move the generated output into the matching L project folder."
         )
         self.launch_inventor_button.clicked.connect(self.run_selected_inventor_flow)
+        self.import_csv_button = QPushButton("Import CSV to RADAN")
+        self.import_csv_button.setToolTip(
+            "Import the selected kit's generated _Radan.csv into the live RADAN Nest session using the L-side kit folder as the symbol output folder."
+        )
+        self.import_csv_button.clicked.connect(self.import_selected_csv_to_radan)
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
         self.toggle_selected_kits_hidden_button.setToolTip(
             "Hide or unhide the selected kits in the explorer without deleting anything."
@@ -665,6 +719,7 @@ class MainWindow(QMainWindow):
             self.build_assembly_packet_button,
             self.launch_kitter_button,
             self.launch_inventor_button,
+            self.import_csv_button,
             self.toggle_selected_kits_hidden_button,
         ):
             kit_row.addWidget(button)
@@ -837,6 +892,13 @@ class MainWindow(QMainWindow):
             actions.append("Run Kitter")
         if status.spreadsheet_match.chosen_path is not None and self.settings.inventor_to_radan_entry.strip():
             actions.append("Run Inventor Tool")
+        if status.spreadsheet_match.chosen_path is not None and status.paths.project_dir is not None:
+            outputs = inventor_output_paths(status.spreadsheet_match.chosen_path, status.paths.project_dir)
+            if (
+                (outputs.target_csv_path is not None and outputs.target_csv_path.exists())
+                or outputs.source_csv_path.exists()
+            ):
+                actions.append("Import CSV to RADAN")
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
         actions.append("Show Kit" if hidden else "Hide Kit")
         return ", ".join(actions) if actions else "(none)"
@@ -2447,6 +2509,90 @@ class MainWindow(QMainWindow):
             "Inventor has been launched in its own window.\n\n"
             "Complete its prompts there. This explorer will keep watching and move the generated output to L once the files exist and stop changing.",
         )
+
+    def import_selected_csv_to_radan(self) -> None:
+        status = self._current_status()
+        if status is None:
+            QMessageBox.information(self, "Import CSV to RADAN", "Select a kit first.")
+            return
+        spreadsheet_path = status.spreadsheet_match.chosen_path
+        if spreadsheet_path is None:
+            QMessageBox.warning(
+                self,
+                "Import CSV to RADAN",
+                "This kit does not have exactly one spreadsheet candidate, so the expected _Radan.csv path is ambiguous.",
+            )
+            return
+        if status.paths.project_dir is None or not status.paths.project_dir.exists():
+            QMessageBox.warning(
+                self,
+                "Import CSV to RADAN",
+                "The L-side project folder is not available for this kit.",
+            )
+            return
+        if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
+            QMessageBox.warning(
+                self,
+                "Import CSV to RADAN",
+                "The L-side project file is missing for this kit.",
+            )
+            return
+        try:
+            csv_path = resolve_existing_inventor_csv(spreadsheet_path, status.paths.project_dir)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import CSV to RADAN", str(exc))
+            return
+
+        output_folder = status.paths.release_kit_dir
+        if output_folder is None or not output_folder.exists():
+            QMessageBox.warning(
+                self,
+                "Import CSV to RADAN",
+                f"The expected RADAN symbol output folder is missing:\n{output_folder}",
+            )
+            return
+        kitter_launcher = self.settings.radan_kitter_launcher.strip()
+        if not kitter_launcher:
+            QMessageBox.warning(
+                self,
+                "Import CSV to RADAN",
+                "RADAN Kitter launcher is not configured.",
+            )
+            return
+        log_dir = self._runtime_dir / "_runtime"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(
+            character if character.isalnum() else "_"
+            for character in f"{status.paths.truck_number}_{status.paths.project_name}"
+        ).strip("_")
+        log_path = log_dir / f"radan_csv_import_{safe_name}_{int(time.time())}.log"
+        self._show_radan_import_log(log_path)
+        try:
+            launch_radan_csv_import(
+                csv_path,
+                output_folder,
+                project_path=status.paths.rpd_path,
+                kitter_launcher=Path(kitter_launcher),
+                log_path=log_path,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Import CSV to RADAN", str(exc))
+            return
+
+        self.log(f"Launched RADAN CSV import for {csv_path.name}; output folder is {output_folder}.")
+
+    def _show_radan_import_log(self, log_path: Path) -> None:
+        dialog = self._radan_import_log_dialog
+        if dialog is not None:
+            try:
+                dialog.close()
+            except Exception:
+                pass
+        dialog = ImportLogDialog(log_path, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._radan_import_log_dialog = dialog
 
     @staticmethod
     def _inventor_output_signature(outputs: InventorOutputPaths) -> tuple[tuple[str, int, int], ...] | None:

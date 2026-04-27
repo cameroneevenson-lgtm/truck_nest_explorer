@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 from models import (
@@ -37,6 +36,7 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 </Project>
 """
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
+DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_live.py")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 
 
@@ -504,6 +504,20 @@ def inventor_output_paths(spreadsheet_path: Path, project_dir: Path | None) -> I
     )
 
 
+def resolve_existing_inventor_csv(spreadsheet_path: Path, project_dir: Path | None) -> Path:
+    outputs = inventor_output_paths(spreadsheet_path, project_dir)
+    candidates = [
+        path
+        for path in (outputs.target_csv_path, outputs.source_csv_path)
+        if path is not None
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    expected = "\n".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Inventor-to-RADAN CSV was not found. Expected one of:\n{expected}")
+
+
 def _normalize_pdf_name_words(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
 
@@ -780,7 +794,7 @@ def launch_launcher(launcher_path: Path | str, argument_path: Path | str) -> Non
 def _python_executable() -> str:
     if DEFAULT_VENV_PYTHON.exists():
         return str(DEFAULT_VENV_PYTHON)
-    return sys.executable
+    raise FileNotFoundError(f"Shared venv Python was not found: {DEFAULT_VENV_PYTHON}")
 
 
 def launch_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.Popen[object]:
@@ -808,6 +822,56 @@ def launch_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | st
     if suffix in {".bat", ".cmd"}:
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     return subprocess.Popen(command, **popen_kwargs)
+
+
+def launch_radan_csv_import(
+    csv_path: Path | str,
+    output_folder: Path | str,
+    *,
+    project_path: Path | str | None = None,
+    kitter_launcher: Path | str | None = None,
+    log_path: Path | str | None = None,
+    entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
+) -> subprocess.Popen[object]:
+    entry = Path(str(entry_path))
+    csv = Path(str(csv_path))
+    output = Path(str(output_folder))
+    if not entry.exists():
+        raise FileNotFoundError(str(entry))
+    if not csv.exists():
+        raise FileNotFoundError(str(csv))
+    if not output.exists():
+        raise FileNotFoundError(str(output))
+    project = Path(str(project_path)) if project_path is not None else None
+    if project is not None and not project.exists():
+        raise FileNotFoundError(str(project))
+    kitter = Path(str(kitter_launcher)) if kitter_launcher is not None and str(kitter_launcher).strip() else None
+    if kitter is not None and not kitter.exists():
+        raise FileNotFoundError(str(kitter))
+    log = Path(str(log_path)) if log_path is not None else None
+
+    command = [
+        _python_executable(),
+        str(entry),
+        "--csv",
+        str(csv),
+        "--output-folder",
+        str(output),
+    ]
+    if project is not None:
+        command.extend(["--project", str(project)])
+    if kitter is not None:
+        command.extend(["--kitter-launcher", str(kitter)])
+    if log is not None:
+        command.extend(["--log-file", str(log)])
+    return subprocess.Popen(
+        command,
+        cwd=str(entry.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
 
 def run_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.CompletedProcess[str]:
