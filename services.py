@@ -36,7 +36,7 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 </Project>
 """
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
-DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_live.py")
+DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 
 

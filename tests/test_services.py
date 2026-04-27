@@ -42,6 +42,7 @@ from models import (
 from packet_build_service import build_assembly_packet, prepare_packet_build_context
 from settings_store import load_settings, save_settings
 from services import (
+    DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     build_kit_paths,
     build_launch_command,
     build_kit_status,
@@ -124,6 +125,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
     def test_default_dashboard_launcher_targets_fabrication_flow_dashboard(self) -> None:
         settings = ExplorerSettings()
         self.assertEqual(settings.dashboard_launcher, r"C:\Tools\fabrication_flow_dashboard\run_app.bat")
+
+    def test_default_radan_csv_import_entry_is_headless_helper(self) -> None:
+        self.assertEqual(DEFAULT_RADAN_CSV_IMPORT_ENTRY.name, "import_parts_csv_headless.py")
 
     def test_build_launch_command_uses_cmd_for_batch_files(self) -> None:
         command = build_launch_command(r"C:\Tools\fabrication_flow_dashboard\run_app.bat")
