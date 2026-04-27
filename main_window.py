@@ -932,7 +932,14 @@ class MainWindow(QMainWindow):
         self.import_csv_button.setToolTip(
             "Import the selected kit's generated _Radan.csv into the live RADAN Nest session using the L-side kit folder as the symbol output folder."
         )
-        self.import_csv_button.clicked.connect(self.import_selected_csv_to_radan)
+        self.import_csv_button.clicked.connect(lambda _checked=False: self.import_selected_csv_to_radan())
+        self.import_csv_native_button = QPushButton("Import CSV Native SYM")
+        self.import_csv_native_button.setToolTip(
+            "Experimental: rebuild existing .sym files directly from DXF without RADAN COM, then update the selected RPD."
+        )
+        self.import_csv_native_button.clicked.connect(
+            lambda _checked=False: self.import_selected_csv_to_radan(native_sym_experimental=True)
+        )
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
         self.toggle_selected_kits_hidden_button.setToolTip(
             "Hide or unhide the selected kits in the explorer without deleting anything."
@@ -948,6 +955,7 @@ class MainWindow(QMainWindow):
             self.launch_kitter_button,
             self.launch_inventor_button,
             self.import_csv_button,
+            self.import_csv_native_button,
             self.toggle_selected_kits_hidden_button,
         ):
             kit_row.addWidget(button)
@@ -1127,6 +1135,7 @@ class MainWindow(QMainWindow):
                 or outputs.source_csv_path.exists()
             ):
                 actions.append("Import CSV to RADAN")
+                actions.append("Import CSV Native SYM")
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
         actions.append("Show Kit" if hidden else "Hide Kit")
         return ", ".join(actions) if actions else "(none)"
@@ -2821,44 +2830,45 @@ class MainWindow(QMainWindow):
             "Complete its prompts there. This explorer will keep watching and move the generated output to L once the files exist and stop changing.",
         )
 
-    def import_selected_csv_to_radan(self) -> None:
+    def import_selected_csv_to_radan(self, *, native_sym_experimental: bool = False) -> None:
+        title = "Import CSV Native SYM" if native_sym_experimental else "Import CSV to RADAN"
         status = self._current_status()
         if status is None:
-            QMessageBox.information(self, "Import CSV to RADAN", "Select a kit first.")
+            QMessageBox.information(self, title, "Select a kit first.")
             return
         spreadsheet_path = status.spreadsheet_match.chosen_path
         if spreadsheet_path is None:
             QMessageBox.warning(
                 self,
-                "Import CSV to RADAN",
+                title,
                 "This kit does not have exactly one spreadsheet candidate, so the expected _Radan.csv path is ambiguous.",
             )
             return
         if status.paths.project_dir is None or not status.paths.project_dir.exists():
             QMessageBox.warning(
                 self,
-                "Import CSV to RADAN",
+                title,
                 "The L-side project folder is not available for this kit.",
             )
             return
         if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
             QMessageBox.warning(
                 self,
-                "Import CSV to RADAN",
+                title,
                 "The L-side project file is missing for this kit.",
             )
             return
         try:
             csv_path = resolve_existing_inventor_csv(spreadsheet_path, status.paths.project_dir)
         except Exception as exc:
-            QMessageBox.warning(self, "Import CSV to RADAN", str(exc))
+            QMessageBox.warning(self, title, str(exc))
             return
 
         output_folder = status.paths.release_kit_dir
         if output_folder is None or not output_folder.exists():
             QMessageBox.warning(
                 self,
-                "Import CSV to RADAN",
+                title,
                 f"The expected RADAN symbol output folder is missing:\n{output_folder}",
             )
             return
@@ -2866,7 +2876,7 @@ class MainWindow(QMainWindow):
         if running_import:
             QMessageBox.information(
                 self,
-                "Import CSV to RADAN",
+                title,
                 "A RADAN CSV import is already running for this project.\n\n"
                 f"PID: {lock_pid}\nLock: {lock_path}",
             )
@@ -2876,9 +2886,48 @@ class MainWindow(QMainWindow):
         try:
             missing_symbols = radan_csv_missing_symbols(csv_path, output_folder)
         except Exception as exc:
-            QMessageBox.warning(self, "Import CSV to RADAN", f"Could not inspect CSV symbols:\n{exc}")
+            QMessageBox.warning(self, title, f"Could not inspect CSV symbols:\n{exc}")
             return
-        if missing_symbols:
+        if native_sym_experimental:
+            if missing_symbols:
+                sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:20])
+                if len(missing_symbols) > 20:
+                    sample_symbols += f"\n... (+{len(missing_symbols) - 20} more)"
+                QMessageBox.warning(
+                    self,
+                    title,
+                    "The native SYM test path currently needs an existing .sym file for every CSV row, "
+                    "because each existing symbol is used as the template before it is rebuilt from DXF.\n\n"
+                    f"Missing templates:\n{sample_symbols}",
+                )
+                return
+            try:
+                visible_sessions = visible_radan_sessions()
+            except Exception:
+                visible_sessions = ()
+            session_text = ""
+            if visible_sessions:
+                session_text = "\n\nOpen RADAN sessions:\n" + "\n".join(
+                    f"{pid}: {window_title}" for pid, window_title in visible_sessions[:8]
+                )
+                if len(visible_sessions) > 8:
+                    session_text += f"\n... (+{len(visible_sessions) - 8} more)"
+            choice = QMessageBox.warning(
+                self,
+                title,
+                "This is the experimental native DXF-to-SYM path.\n\n"
+                "It will back up and overwrite the existing .sym files for every CSV row, validate each generated symbol, "
+                "and append the CSV rows to the selected RPD. It does not use RADAN COM for symbol conversion.\n\n"
+                "If this same project is open in RADAN, do not save that open session after this import unless you have reloaded it."
+                f"{session_text}\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                self.log("Native SYM CSV import cancelled before launch.")
+                return
+        elif missing_symbols:
             try:
                 visible_sessions = visible_radan_sessions()
             except Exception:
@@ -2914,7 +2963,8 @@ class MainWindow(QMainWindow):
             character if character.isalnum() else "_"
             for character in f"{status.paths.truck_number}_{status.paths.project_name}"
         ).strip("_")
-        log_path = log_dir / f"radan_csv_import_{safe_name}_{int(time.time())}.log"
+        log_prefix = "radan_csv_native_import" if native_sym_experimental else "radan_csv_import"
+        log_path = log_dir / f"{log_prefix}_{safe_name}_{int(time.time())}.log"
         self._show_radan_import_log(log_path)
         try:
             launch_radan_csv_import(
@@ -2923,12 +2973,16 @@ class MainWindow(QMainWindow):
                 project_path=status.paths.rpd_path,
                 log_path=log_path,
                 allow_visible_radan=allow_visible_radan,
+                native_sym_experimental=native_sym_experimental,
             )
         except Exception as exc:
-            QMessageBox.critical(self, "Import CSV to RADAN", str(exc))
+            QMessageBox.critical(self, title, str(exc))
             return
 
-        self.log(f"Launched RADAN CSV import for {csv_path.name}; output folder is {output_folder}.")
+        if native_sym_experimental:
+            self.log(f"Launched native SYM CSV import for {csv_path.name}; output folder is {output_folder}.")
+        else:
+            self.log(f"Launched RADAN CSV import for {csv_path.name}; output folder is {output_folder}.")
 
     def _show_radan_import_log(self, log_path: Path) -> None:
         dialog = self._radan_import_log_dialog

@@ -1039,6 +1039,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     log_path=log_path,
                     entry_path=entry_path,
                     allow_visible_radan=True,
+                    native_sym_experimental=True,
                 )
 
             command = popen_mock.call_args.args[0]
@@ -1049,6 +1050,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn(str(log_path), command)
             self.assertNotIn("--kitter-launcher", command)
             self.assertIn("--allow-visible-radan", command)
+            self.assertIn("--native-sym-experimental", command)
             self.assertEqual(popen_mock.call_args.kwargs["cwd"], str(temp_root))
             self.assertIs(popen_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
             self.assertIs(popen_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)

@@ -992,6 +992,7 @@ def launch_radan_csv_import(
     log_path: Path | str | None = None,
     entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     allow_visible_radan: bool = False,
+    native_sym_experimental: bool = False,
 ) -> subprocess.Popen[object]:
     entry = Path(str(entry_path))
     csv = Path(str(csv_path))
@@ -1019,6 +1020,8 @@ def launch_radan_csv_import(
         command.extend(["--project", str(project)])
     if allow_visible_radan:
         command.append("--allow-visible-radan")
+    if native_sym_experimental:
+        command.append("--native-sym-experimental")
     if log is not None:
         command.extend(["--log-file", str(log)])
     return subprocess.Popen(
