@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from models import (
     DEFAULT_SUPPORT_FOLDERS,
@@ -44,6 +44,7 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
+OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
 
 
 class InventorToRadanInlineNeedsUi(RuntimeError):
@@ -51,6 +52,46 @@ class InventorToRadanInlineNeedsUi(RuntimeError):
         self.missing_dxf_count = missing_dxf_count
         self.missing_rule_count = missing_rule_count
         super().__init__(message)
+
+
+def is_w_drive_path(path: Path | str) -> bool:
+    text = str(path or "").strip()
+    if not text:
+        return False
+    normalized = text.replace("/", "\\")
+    if normalized.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return PureWindowsPath(normalized).drive.casefold() == "w:"
+
+
+def is_owned_inventor_output(path: Path | str, *, spreadsheet_path: Path | str | None = None) -> bool:
+    candidate = Path(str(path))
+    if spreadsheet_path is not None:
+        spreadsheet = Path(str(spreadsheet_path))
+        allowed_names = {
+            f"{spreadsheet.stem}_Radan.csv".casefold(),
+            f"{spreadsheet.stem}_report.txt".casefold(),
+        }
+        return candidate.name.casefold() in allowed_names
+    name = candidate.name.casefold()
+    return name.endswith(tuple(suffix.casefold() for suffix in OWNED_INVENTOR_OUTPUT_SUFFIXES))
+
+
+def assert_w_drive_write_allowed(
+    path: Path | str | None,
+    *,
+    operation: str,
+    allow_owned_inventor_output: bool = False,
+    spreadsheet_path: Path | str | None = None,
+) -> None:
+    if path is None or not is_w_drive_path(path):
+        return
+    if allow_owned_inventor_output and is_owned_inventor_output(path, spreadsheet_path=spreadsheet_path):
+        return
+    raise RuntimeError(
+        f"Refusing to {operation} on W: path: {path}. "
+        "W: is read-only except for moving/deleting Inventor-generated *_Radan.csv and *_report.txt handoff files."
+    )
 
 
 def clean_text(value: object) -> str:
@@ -871,10 +912,18 @@ def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path 
         ) from exc
 
 
-def radan_csv_missing_symbols(csv_path: Path | str, output_folder: Path | str) -> tuple[Path, ...]:
+def radan_csv_missing_symbols(
+    csv_path: Path | str,
+    output_folder: Path | str,
+    *,
+    max_parts: int | None = None,
+) -> tuple[Path, ...]:
+    if max_parts is not None and max_parts <= 0:
+        raise ValueError("max_parts must be greater than zero when supplied.")
     csv_file = Path(str(csv_path))
     symbol_folder = Path(str(output_folder))
     missing: list[Path] = []
+    importable_count = 0
     with csv_file.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.reader(handle)
         for row in reader:
@@ -883,9 +932,12 @@ def radan_csv_missing_symbols(csv_path: Path | str, output_folder: Path | str) -
             dxf_text = row[0].strip()
             if not dxf_text:
                 continue
+            importable_count += 1
             symbol_path = symbol_folder / f"{Path(dxf_text).stem}.sym"
             if not symbol_path.exists():
                 missing.append(symbol_path)
+            if max_parts is not None and importable_count >= max_parts:
+                break
     return tuple(missing)
 
 
@@ -992,7 +1044,13 @@ def launch_radan_csv_import(
     log_path: Path | str | None = None,
     entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     allow_visible_radan: bool = False,
+    rebuild_symbols: bool = False,
     native_sym_experimental: bool = False,
+    preprocess_dxf_outer_profile: bool = False,
+    preprocess_dxf_tolerance: float | None = None,
+    assign_project_colors: bool = False,
+    project_update_method: str = "direct-xml",
+    max_parts: int | None = None,
 ) -> subprocess.Popen[object]:
     entry = Path(str(entry_path))
     csv = Path(str(csv_path))
@@ -1020,10 +1078,37 @@ def launch_radan_csv_import(
         command.extend(["--project", str(project)])
     if allow_visible_radan:
         command.append("--allow-visible-radan")
+    if rebuild_symbols:
+        command.append("--rebuild-symbols")
     if native_sym_experimental:
         command.append("--native-sym-experimental")
+    if preprocess_dxf_outer_profile:
+        command.append("--preprocess-dxf-outer-profile")
+    if preprocess_dxf_tolerance is not None:
+        command.extend(["--preprocess-dxf-tolerance", str(preprocess_dxf_tolerance)])
+    if assign_project_colors:
+        command.append("--assign-project-colors")
+    if project_update_method:
+        command.extend(["--project-update-method", str(project_update_method)])
+    if max_parts is not None:
+        if max_parts <= 0:
+            raise ValueError("max_parts must be greater than zero when supplied.")
+        command.extend(["--max-parts", str(max_parts)])
     if log is not None:
         command.extend(["--log-file", str(log)])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log_stream = log.open("a", encoding="utf-8", buffering=1)
+        try:
+            return subprocess.Popen(
+                command,
+                cwd=str(entry.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=log_stream,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        finally:
+            log_stream.close()
     return subprocess.Popen(
         command,
         cwd=str(entry.parent),
@@ -1064,7 +1149,20 @@ def run_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) 
     )
 
 
-def _move_or_replace(source_path: Path, target_path: Path) -> Path:
+def _move_or_replace(
+    source_path: Path,
+    target_path: Path,
+    *,
+    spreadsheet_path: Path | str | None = None,
+    source_is_owned_inventor_output: bool = False,
+) -> Path:
+    assert_w_drive_write_allowed(
+        source_path,
+        operation="move/delete source file",
+        allow_owned_inventor_output=source_is_owned_inventor_output,
+        spreadsheet_path=spreadsheet_path,
+    )
+    assert_w_drive_write_allowed(target_path, operation="overwrite target file")
     if target_path.exists():
         target_path.unlink()
     shutil.move(str(source_path), str(target_path))
@@ -1086,11 +1184,21 @@ def move_inventor_outputs_to_project(
         raise FileNotFoundError(str(outputs.source_csv_path))
 
     moved: list[Path] = []
-    _move_or_replace(outputs.source_csv_path, outputs.target_csv_path)
+    _move_or_replace(
+        outputs.source_csv_path,
+        outputs.target_csv_path,
+        spreadsheet_path=spreadsheet_path,
+        source_is_owned_inventor_output=True,
+    )
     moved.append(outputs.target_csv_path)
 
     if outputs.source_report_path.exists():
-        _move_or_replace(outputs.source_report_path, outputs.target_report_path)
+        _move_or_replace(
+            outputs.source_report_path,
+            outputs.target_report_path,
+            spreadsheet_path=spreadsheet_path,
+            source_is_owned_inventor_output=True,
+        )
         moved.append(outputs.target_report_path)
 
     return outputs, tuple(moved)

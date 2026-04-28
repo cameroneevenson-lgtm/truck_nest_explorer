@@ -11,6 +11,7 @@ import time
 from typing import Dict, Iterable, List, Tuple
 
 RUNTIME_DIRNAME = "_runtime"
+RADAN_IMPORT_MARKER = "radan_import_active.json"
 IGNORE_DIR_NAMES = {
     ".git",
     "__pycache__",
@@ -25,6 +26,27 @@ IGNORE_DIR_PREFIXES = (
 WATCH_EXTENSIONS = {".py"}
 _LOCK_HANDLE = None
 SHARED_VENV_PYTHON = r"C:\Tools\.venv\Scripts\python.exe"
+_REEXEC_ENV = "TNE_HOT_RESTART_REEXEC_SHARED_VENV"
+
+
+def _same_path(left: str, right: str) -> bool:
+    try:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+    except Exception:
+        return str(left).casefold() == str(right).casefold()
+
+
+def _ensure_shared_launcher_venv() -> None:
+    if _same_path(sys.executable, SHARED_VENV_PYTHON):
+        return
+    if os.environ.get(_REEXEC_ENV) == "1":
+        raise SystemExit(f"Hot restart launcher must run from shared venv: {SHARED_VENV_PYTHON}")
+    if not os.path.exists(SHARED_VENV_PYTHON):
+        raise SystemExit(f"Shared venv Python was not found: {SHARED_VENV_PYTHON}")
+    env = os.environ.copy()
+    env[_REEXEC_ENV] = "1"
+    subprocess.Popen([SHARED_VENV_PYTHON, os.path.abspath(__file__), *sys.argv[1:]], cwd=os.path.dirname(os.path.abspath(__file__)), env=env)
+    raise SystemExit(0)
 
 
 def _is_ignored_dir(name: str) -> bool:
@@ -102,6 +124,60 @@ def _terminate_process(proc: subprocess.Popen, timeout_sec: float = 6.0) -> None
             proc.kill()
         except Exception:
             pass
+
+
+def _process_exists(process_id: int) -> bool:
+    if process_id <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(process_id))
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(int(process_id), 0)
+    except OSError:
+        return False
+    return True
+
+
+def _active_radan_import(root: str) -> Dict[str, str]:
+    marker_path = os.path.join(root, RUNTIME_DIRNAME, RADAN_IMPORT_MARKER)
+    if not os.path.exists(marker_path):
+        return {}
+    try:
+        with open(marker_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        _safe_remove(marker_path)
+        return {}
+    try:
+        process_id = int(payload.get("pid", 0))
+    except (AttributeError, TypeError, ValueError):
+        process_id = 0
+    if not _process_exists(process_id):
+        _safe_remove(marker_path)
+        return {}
+    return {
+        "pid": str(process_id),
+        "log_path": str(payload.get("log_path") or ""),
+        "marker_path": marker_path,
+    }
+
+
+def _defer_reload_if_radan_import_active(root: str, *, reason: str) -> bool:
+    active_import = _active_radan_import(root)
+    if not active_import:
+        return False
+    print(
+        f"Hot reload {reason} deferred while RADAN CSV import helper PID {active_import['pid']} is running. "
+        f"Log: {active_import.get('log_path', '')}"
+    )
+    return True
 
 
 def _resolve_handshake_paths(root: str) -> Tuple[str, str]:
@@ -182,6 +258,8 @@ def _acquire_single_instance_lock(root: str):
 
 
 def main() -> int:
+    _ensure_shared_launcher_venv()
+
     parser = argparse.ArgumentParser(description="Dev hot-restart launcher for Truck Nest Explorer.")
     parser.add_argument("app_args", nargs=argparse.REMAINDER, help="Arguments forwarded to app.py.")
     parser.add_argument("--interval", type=float, default=0.6, help="Polling interval in seconds.")
@@ -297,6 +375,9 @@ def main() -> int:
 
                 waited_for = max(0.0, now - request_posted_at)
                 if awaiting_user_decision and request_posted_at > 0.0 and waited_for >= decision_timeout:
+                    if _defer_reload_if_radan_import_active(root, reason="auto-reload"):
+                        request_posted_at = now
+                        continue
                     batch_count = len(pending_changes)
                     print(f"No in-app cancel after {decision_timeout:.0f}s ({batch_count} file(s)); forcing reload.")
                     _terminate_process(proc)
@@ -317,6 +398,10 @@ def main() -> int:
 
                 action = resp.get("action", "")
                 if action == "accept":
+                    if _defer_reload_if_radan_import_active(root, reason="accept"):
+                        request_posted_at = now
+                        _safe_remove(resp_path)
+                        continue
                     batch_count = len(pending_changes)
                     print(f"Reload accepted ({batch_count} file(s)); restarting app...")
                     _terminate_process(proc)

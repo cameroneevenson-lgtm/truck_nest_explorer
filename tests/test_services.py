@@ -46,6 +46,7 @@ from settings_store import load_settings, save_settings
 from services import (
     DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     InventorToRadanInlineNeedsUi,
+    assert_w_drive_write_allowed,
     build_kit_paths,
     build_launch_command,
     build_kit_status,
@@ -61,6 +62,8 @@ from services import (
     find_fabrication_truck_dir,
     is_hidden_kit,
     is_hidden_truck,
+    is_owned_inventor_output,
+    is_w_drive_path,
     launch_tool,
     launch_radan_csv_import,
     move_inventor_outputs_to_project,
@@ -910,6 +913,30 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertFalse(source_csv.exists())
             self.assertFalse(source_report.exists())
 
+    def test_w_drive_guard_allows_only_owned_inventor_outputs(self) -> None:
+        spreadsheet = Path(r"W:\LASER\TruckBom.xlsx")
+
+        self.assertTrue(is_w_drive_path(r"W:\LASER\TruckBom.xlsx"))
+        self.assertFalse(is_w_drive_path(r"L:\BATTLESHIELD\TruckBom_Radan.csv"))
+        self.assertTrue(is_owned_inventor_output(r"W:\LASER\TruckBom_Radan.csv", spreadsheet_path=spreadsheet))
+        self.assertTrue(is_owned_inventor_output(r"W:\LASER\TruckBom_report.txt", spreadsheet_path=spreadsheet))
+
+        assert_w_drive_write_allowed(
+            r"W:\LASER\TruckBom_Radan.csv",
+            operation="move Inventor output",
+            allow_owned_inventor_output=True,
+            spreadsheet_path=spreadsheet,
+        )
+        with self.assertRaisesRegex(RuntimeError, "Refusing to write cleaned DXF on W:"):
+            assert_w_drive_write_allowed(r"W:\LASER\cleaned.dxf", operation="write cleaned DXF")
+        with self.assertRaises(RuntimeError):
+            assert_w_drive_write_allowed(
+                r"W:\LASER\Other_Radan.csv",
+                operation="move Inventor output",
+                allow_owned_inventor_output=True,
+                spreadsheet_path=spreadsheet,
+            )
+
     def test_resolve_existing_inventor_csv_prefers_l_project_output(self) -> None:
         with workspace_tempdir() as temp_root:
             w_folder = temp_root / "W" / "F55334" / "PAINT PACK"
@@ -1002,6 +1029,23 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(missing, (output_folder / "Part B.sym",))
 
+    def test_radan_csv_missing_symbols_can_limit_importable_rows(self) -> None:
+        with workspace_tempdir() as temp_root:
+            output_folder = temp_root / "symbols"
+            output_folder.mkdir()
+            (output_folder / "Part A.sym").write_text("sym", encoding="utf-8")
+            csv_path = temp_root / "parts_Radan.csv"
+            csv_path.write_text(
+                "\n"
+                f"{temp_root / 'Part A.dxf'},1,Aluminum,0.125,in,AIR\n"
+                f"{temp_root / 'Part B.dxf'},1,Aluminum,0.125,in,AIR\n",
+                encoding="utf-8",
+            )
+
+            missing = radan_csv_missing_symbols(csv_path, output_folder, max_parts=1)
+
+            self.assertEqual(missing, ())
+
     def test_radan_csv_import_lock_status_reports_live_pid(self) -> None:
         with workspace_tempdir() as temp_root:
             project_path = temp_root / "job.rpd"
@@ -1039,7 +1083,13 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     log_path=log_path,
                     entry_path=entry_path,
                     allow_visible_radan=True,
+                    rebuild_symbols=True,
                     native_sym_experimental=True,
+                    preprocess_dxf_outer_profile=True,
+                    preprocess_dxf_tolerance=0.002,
+                    assign_project_colors=True,
+                    project_update_method="radan-nst",
+                    max_parts=10,
                 )
 
             command = popen_mock.call_args.args[0]
@@ -1050,11 +1100,51 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn(str(log_path), command)
             self.assertNotIn("--kitter-launcher", command)
             self.assertIn("--allow-visible-radan", command)
+            self.assertIn("--rebuild-symbols", command)
             self.assertIn("--native-sym-experimental", command)
+            self.assertIn("--preprocess-dxf-outer-profile", command)
+            self.assertIn("--preprocess-dxf-tolerance", command)
+            self.assertIn("0.002", command)
+            self.assertIn("--assign-project-colors", command)
+            self.assertIn("--project-update-method", command)
+            self.assertIn("radan-nst", command)
+            self.assertIn("--max-parts", command)
+            self.assertIn("10", command)
             self.assertEqual(popen_mock.call_args.kwargs["cwd"], str(temp_root))
             self.assertIs(popen_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
-            self.assertIs(popen_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)
-            self.assertIs(popen_mock.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            stdout_arg = popen_mock.call_args.kwargs["stdout"]
+            self.assertEqual(Path(stdout_arg.name), log_path)
+            self.assertIs(popen_mock.call_args.kwargs["stderr"], stdout_arg)
+
+    def test_launch_radan_csv_import_allows_cleaned_dxf_preprocess_without_synthetic_mode(self) -> None:
+        with workspace_tempdir() as temp_root:
+            entry_path = temp_root / "import_parts_csv_headless.py"
+            csv_path = temp_root / "TruckBom_Radan.csv"
+            project_path = temp_root / "TruckBom.rpd"
+            output_folder = temp_root / "out"
+            entry_path.write_text("print('helper')", encoding="utf-8")
+            csv_path.write_text("csv", encoding="utf-8")
+            project_path.write_text("<Project />", encoding="utf-8")
+            output_folder.mkdir()
+
+            with patch("services.subprocess.Popen") as popen_mock:
+                launch_radan_csv_import(
+                    csv_path,
+                    output_folder,
+                    project_path=project_path,
+                    entry_path=entry_path,
+                    rebuild_symbols=True,
+                    preprocess_dxf_outer_profile=True,
+                    preprocess_dxf_tolerance=0.002,
+                )
+
+            command = popen_mock.call_args.args[0]
+            self.assertIn("--preprocess-dxf-outer-profile", command)
+            self.assertIn("--preprocess-dxf-tolerance", command)
+            self.assertIn("0.002", command)
+            self.assertIn("--rebuild-symbols", command)
+            self.assertNotIn("--native-sym-experimental", command)
+            self.assertNotIn("--assign-project-colors", command)
 
     def test_discover_trucks_uses_release_root_only(self) -> None:
         with workspace_tempdir() as temp_root:

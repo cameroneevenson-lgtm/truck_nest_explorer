@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 set "APPDIR=%~dp0"
 if "%APPDIR:~-1%"=="\" set "APPDIR=%APPDIR:~0,-1%"
 
@@ -36,9 +36,9 @@ echo PythonW: %PYW% >> "%LOG%"
 echo Python: %PYC% >> "%LOG%"
 echo Args: %* >> "%LOG%"
 
-set "APPDIR_PS=%APPDIR:\=\\%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$procs = Get-CimInstance Win32_Process | Where-Object { ($_.Name -match '^pythonw?\.exe$') -and (($_.CommandLine -like '*%APPDIR_PS%\\app.py*') -or ($_.CommandLine -like '*%APPDIR_PS%\\dev_hot_restart.py*')) }; " ^
+  "$appdir = '%APPDIR%'; $appPy = Join-Path $appdir 'app.py'; $hotPy = Join-Path $appdir 'dev_hot_restart.py'; " ^
+  "$procs = Get-CimInstance Win32_Process | Where-Object { ($_.Name -match '^pythonw?\.exe$') -and (($_.CommandLine -like ('*' + $appPy + '*')) -or ($_.CommandLine -like ('*' + $hotPy + '*'))) }; " ^
   "foreach ($p in $procs) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} }"
 
 if "%DEV_HOT_RELOAD%"=="1" (
@@ -48,13 +48,13 @@ if "%DEV_HOT_RELOAD%"=="1" (
   echo HOT_RELOAD_MIN_UPTIME=%HOT_RELOAD_MIN_UPTIME% >> "%LOG%"
   echo HOT_RELOAD_DECISION_TIMEOUT=%HOT_RELOAD_DECISION_TIMEOUT% >> "%LOG%"
   "%PYC%" "%APPDIR%\dev_hot_restart.py" --interval %HOT_RELOAD_INTERVAL% --debounce %HOT_RELOAD_DEBOUNCE% --min-uptime %HOT_RELOAD_MIN_UPTIME% --decision-timeout %HOT_RELOAD_DECISION_TIMEOUT% %*
-  set EXITCODE=%ERRORLEVEL%
-  if not "%EXITCODE%"=="0" (
+  set "EXITCODE=!ERRORLEVEL!"
+  if not "!EXITCODE!"=="0" (
     echo.
-    echo Hot reload launcher exited with code %EXITCODE%.
+    echo Hot reload launcher exited with code !EXITCODE!.
     echo See %LOG% for startup details.
   )
-  endlocal & exit /b %EXITCODE%
+  endlocal & exit /b !EXITCODE!
 )
 
 echo MODE=stable >> "%LOG%"

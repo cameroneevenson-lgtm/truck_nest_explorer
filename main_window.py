@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -140,15 +141,20 @@ class MultilineEditorDialog(QDialog):
 
 
 class ImportLogDialog(QDialog):
-    def __init__(self, log_path: Path, parent: QWidget | None = None):
+    def __init__(self, log_path: Path, parent: QWidget | None = None, completion_callback=None):
         super().__init__(parent)
         self.log_path = log_path
+        self._process: subprocess.Popen[object] | None = None
+        self._process_assigned = False
+        self._completed = False
+        self._completion_callback = completion_callback
+        self._completion_notified = False
         self.setWindowTitle("RADAN CSV Import Log")
         self.resize(900, 520)
 
         self.label = QLabel(str(log_path))
         self.label.setWordWrap(True)
-        self.helper_label = QLabel("You can close this log window; the RADAN import helper will keep running.")
+        self.helper_label = QLabel("Import is running. This window will stay open until the helper finishes.")
         self.helper_label.setWordWrap(True)
         self.helper_label.setStyleSheet("color: #64748B;")
 
@@ -156,20 +162,70 @@ class ImportLogDialog(QDialog):
         self.viewer.setReadOnly(True)
         self.viewer.setPlaceholderText("Waiting for the RADAN import helper to write progress...")
 
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
+        self.close_button = QPushButton("Running...")
+        self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.close)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.label)
         layout.addWidget(self.helper_label)
         layout.addWidget(self.viewer, 1)
-        layout.addWidget(close_button)
+        layout.addWidget(self.close_button)
 
         self._timer = QTimer(self)
         self._timer.setInterval(500)
-        self._timer.timeout.connect(self.refresh_log)
+        self._timer.timeout.connect(self._tick)
         self._timer.start()
         self.refresh_log()
+
+    @property
+    def is_complete(self) -> bool:
+        return self._completed
+
+    @property
+    def process_id(self) -> int | None:
+        if self._process is None:
+            return None
+        return int(self._process.pid)
+
+    def set_process(self, process: subprocess.Popen[object]) -> None:
+        self._process = process
+        self._process_assigned = True
+        self._completed = False
+        self.helper_label.setText("Import is running. This window will stay open until the helper finishes.")
+        self.helper_label.setStyleSheet("color: #64748B;")
+        self.close_button.setText("Running...")
+        self.close_button.setEnabled(False)
+        self._refresh_process_state()
+
+    def mark_launch_failed(self, message: str) -> None:
+        detail = message.strip() or "The import helper could not be launched."
+        self._process = None
+        self._process_assigned = True
+        self._mark_complete(f"Import did not launch: {detail}", success=False)
+
+    def force_close(self) -> None:
+        self._completed = True
+        self.close()
+
+    def reject(self) -> None:
+        if not self._completed:
+            self.raise_()
+            self.activateWindow()
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        if not self._completed:
+            event.ignore()
+            self.raise_()
+            self.activateWindow()
+            return
+        super().closeEvent(event)
+
+    def _tick(self) -> None:
+        self.refresh_log()
+        self._refresh_process_state()
 
     def refresh_log(self) -> None:
         try:
@@ -183,6 +239,32 @@ class ImportLogDialog(QDialog):
         self.viewer.setPlainText(text)
         if was_at_bottom:
             scrollbar.setValue(scrollbar.maximum())
+
+    def _refresh_process_state(self) -> None:
+        if self._completed or not self._process_assigned or self._process is None:
+            return
+        return_code = self._process.poll()
+        if return_code is None:
+            return
+        if return_code == 0:
+            self._mark_complete("Import helper finished successfully. Review the log, then dismiss this window.", success=True)
+        else:
+            self._mark_complete(
+                f"Import helper finished with exit code {return_code}. Review the log, then dismiss this window.",
+                success=False,
+            )
+
+    def _mark_complete(self, message: str, *, success: bool) -> None:
+        self.refresh_log()
+        self._completed = True
+        self.helper_label.setText(message)
+        self.helper_label.setStyleSheet("color: #15803D;" if success else "color: #B91C1C; font-weight: 700;")
+        self.close_button.setText("Dismiss")
+        self.close_button.setEnabled(True)
+        self._timer.stop()
+        if not self._completion_notified and callable(self._completion_callback):
+            self._completion_notified = True
+            self._completion_callback(self)
 
 
 class InventorReportReviewDialog(QDialog):
@@ -457,6 +539,7 @@ class MainWindow(QMainWindow):
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
         self._pending_inventor_job: PendingInventorJob | None = None
         self._radan_import_log_dialog: ImportLogDialog | None = None
+        self._radan_import_log_dialogs: list[ImportLogDialog] = []
         self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
         self._flow_cache_by_truck: dict[str, tuple[str, FlowTruckInsight]] = {}
         self._flow_gantt_source_bytes: bytes | None = None
@@ -928,17 +1011,46 @@ class MainWindow(QMainWindow):
             "Run the Inventor-to-RADAN launcher on the selected spreadsheet, then move the generated output into the matching L project folder."
         )
         self.launch_inventor_button.clicked.connect(self.run_selected_inventor_flow)
-        self.import_csv_button = QPushButton("Import CSV to RADAN")
+        self.import_csv_button = QPushButton("Import CSV")
         self.import_csv_button.setToolTip(
-            "Import the selected kit's generated _Radan.csv into the live RADAN Nest session using the L-side kit folder as the symbol output folder."
+            "Import the selected kit's generated _Radan.csv into RADAN using the selected DXF source."
         )
         self.import_csv_button.clicked.connect(lambda _checked=False: self.import_selected_csv_to_radan())
-        self.import_csv_native_button = QPushButton("Import CSV Native SYM")
-        self.import_csv_native_button.setToolTip(
-            "Experimental: rebuild existing .sym files directly from DXF without RADAN COM, then update the selected RPD."
+        self.radan_dxf_source_label = QLabel("DXF:")
+        self.radan_dxf_source_left_label = QLabel("Src")
+        self.radan_dxf_source_right_label = QLabel("Clean")
+        self.radan_dxf_source_slider = QSlider(Qt.Horizontal)
+        self.radan_dxf_source_slider.setRange(0, 1)
+        self.radan_dxf_source_slider.setSingleStep(1)
+        self.radan_dxf_source_slider.setPageStep(1)
+        self.radan_dxf_source_slider.setFixedWidth(52)
+        self.radan_dxf_source_slider.setValue(1)
+        self.radan_dxf_source_slider.setToolTip(
+            "Copy/preprocess source DXFs into the L-side _preprocessed_dxfs folder, then let RADAN create symbols from those cleaned copies."
         )
-        self.import_csv_native_button.clicked.connect(
-            lambda _checked=False: self.import_selected_csv_to_radan(native_sym_experimental=True)
+        self.radan_project_update_label = QLabel("Project:")
+        self.radan_project_update_left_label = QLabel("RPD")
+        self.radan_project_update_right_label = QLabel("Proj")
+        self.radan_project_update_slider = QSlider(Qt.Horizontal)
+        self.radan_project_update_slider.setRange(0, 1)
+        self.radan_project_update_slider.setSingleStep(1)
+        self.radan_project_update_slider.setPageStep(1)
+        self.radan_project_update_slider.setFixedWidth(52)
+        self.radan_project_update_slider.setToolTip(
+            "Disabled for now: RADAN's NST schedule API did not persist imported parts into the RPD."
+        )
+        self.radan_project_update_slider.setEnabled(False)
+        self.radan_project_update_right_label.setEnabled(False)
+        self.radan_part_limit_label = QLabel("Rows:")
+        self.radan_part_limit_left_label = QLabel("All")
+        self.radan_part_limit_right_label = QLabel("10")
+        self.radan_part_limit_slider = QSlider(Qt.Horizontal)
+        self.radan_part_limit_slider.setRange(0, 1)
+        self.radan_part_limit_slider.setSingleStep(1)
+        self.radan_part_limit_slider.setPageStep(1)
+        self.radan_part_limit_slider.setFixedWidth(52)
+        self.radan_part_limit_slider.setToolTip(
+            "Temporary test limiter: import only the first 10 importable CSV part rows."
         )
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
         self.toggle_selected_kits_hidden_button.setToolTip(
@@ -954,12 +1066,27 @@ class MainWindow(QMainWindow):
             self.build_assembly_packet_button,
             self.launch_kitter_button,
             self.launch_inventor_button,
-            self.import_csv_button,
-            self.import_csv_native_button,
             self.toggle_selected_kits_hidden_button,
         ):
             kit_row.addWidget(button)
         kit_row.addStretch(1)
+
+        radan_row = QHBoxLayout()
+        radan_row.addWidget(QLabel("RADAN CSV:"))
+        radan_row.addWidget(self.radan_dxf_source_label)
+        radan_row.addWidget(self.radan_dxf_source_left_label)
+        radan_row.addWidget(self.radan_dxf_source_slider)
+        radan_row.addWidget(self.radan_dxf_source_right_label)
+        radan_row.addWidget(self.radan_project_update_label)
+        radan_row.addWidget(self.radan_project_update_left_label)
+        radan_row.addWidget(self.radan_project_update_slider)
+        radan_row.addWidget(self.radan_project_update_right_label)
+        radan_row.addWidget(self.radan_part_limit_label)
+        radan_row.addWidget(self.radan_part_limit_left_label)
+        radan_row.addWidget(self.radan_part_limit_slider)
+        radan_row.addWidget(self.radan_part_limit_right_label)
+        radan_row.addWidget(self.import_csv_button)
+        radan_row.addStretch(1)
 
         layout.addWidget(self.current_truck_label)
         layout.addWidget(self.current_flow_label)
@@ -967,6 +1094,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(actions_helper_label)
         layout.addLayout(truck_row)
         layout.addLayout(kit_row)
+        layout.addLayout(radan_row)
         return group
 
     def _build_table_group(self) -> QWidget:
@@ -1135,7 +1263,6 @@ class MainWindow(QMainWindow):
                 or outputs.source_csv_path.exists()
             ):
                 actions.append("Import CSV to RADAN")
-                actions.append("Import CSV Native SYM")
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
         actions.append("Show Kit" if hidden else "Hide Kit")
         return ", ".join(actions) if actions else "(none)"
@@ -2830,8 +2957,25 @@ class MainWindow(QMainWindow):
             "Complete its prompts there. This explorer will keep watching and move the generated output to L once the files exist and stop changing.",
         )
 
-    def import_selected_csv_to_radan(self, *, native_sym_experimental: bool = False) -> None:
-        title = "Import CSV Native SYM" if native_sym_experimental else "Import CSV to RADAN"
+    def import_selected_csv_to_radan(self) -> None:
+        title = "Import CSV to RADAN"
+        use_cleaned_dxf = (
+            getattr(self, "radan_dxf_source_slider", None) is not None
+            and self.radan_dxf_source_slider.value() == 1
+        )
+        project_update_method = "direct-xml"
+        if (
+            getattr(self, "radan_project_update_slider", None) is not None
+            and self.radan_project_update_slider.isEnabled()
+            and self.radan_project_update_slider.value() == 1
+        ):
+            project_update_method = "radan-nst"
+        max_parts = None
+        if (
+            getattr(self, "radan_part_limit_slider", None) is not None
+            and self.radan_part_limit_slider.value() == 1
+        ):
+            max_parts = 10
         status = self._current_status()
         if status is None:
             QMessageBox.information(self, title, "Select a kit first.")
@@ -2884,69 +3028,35 @@ class MainWindow(QMainWindow):
             return
         allow_visible_radan = False
         try:
-            missing_symbols = radan_csv_missing_symbols(csv_path, output_folder)
+            missing_symbols = radan_csv_missing_symbols(csv_path, output_folder, max_parts=max_parts)
         except Exception as exc:
             QMessageBox.warning(self, title, f"Could not inspect CSV symbols:\n{exc}")
             return
-        if native_sym_experimental:
-            if missing_symbols:
-                sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:20])
-                if len(missing_symbols) > 20:
-                    sample_symbols += f"\n... (+{len(missing_symbols) - 20} more)"
-                QMessageBox.warning(
-                    self,
-                    title,
-                    "The native SYM test path currently needs an existing .sym file for every CSV row, "
-                    "because each existing symbol is used as the template before it is rebuilt from DXF.\n\n"
-                    f"Missing templates:\n{sample_symbols}",
-                )
-                return
-            try:
-                visible_sessions = visible_radan_sessions()
-            except Exception:
-                visible_sessions = ()
-            session_text = ""
-            if visible_sessions:
-                session_text = "\n\nOpen RADAN sessions:\n" + "\n".join(
-                    f"{pid}: {window_title}" for pid, window_title in visible_sessions[:8]
-                )
-                if len(visible_sessions) > 8:
-                    session_text += f"\n... (+{len(visible_sessions) - 8} more)"
-            choice = QMessageBox.warning(
-                self,
-                title,
-                "This is the experimental native DXF-to-SYM path.\n\n"
-                "It will back up and overwrite the existing .sym files for every CSV row, validate each generated symbol, "
-                "and append the CSV rows to the selected RPD. It does not use RADAN COM for symbol conversion.\n\n"
-                "If this same project is open in RADAN, do not save that open session after this import unless you have reloaded it."
-                f"{session_text}\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if choice != QMessageBox.Yes:
-                self.log("Native SYM CSV import cancelled before launch.")
-                return
-        elif missing_symbols:
+        if missing_symbols or use_cleaned_dxf or project_update_method == "radan-nst":
             try:
                 visible_sessions = visible_radan_sessions()
             except Exception:
                 visible_sessions = ()
             if visible_sessions:
-                sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:12])
-                if len(missing_symbols) > 12:
-                    sample_symbols += f"\n... (+{len(missing_symbols) - 12} more)"
+                if use_cleaned_dxf:
+                    sample_symbols = "All CSV symbols will be rebuilt from cleaned L-side DXF working copies."
+                else:
+                    sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:12])
+                    if len(missing_symbols) > 12:
+                        sample_symbols += f"\n... (+{len(missing_symbols) - 12} more)"
+                    if not sample_symbols:
+                        sample_symbols = "No symbol conversion; project update will use RADAN NST."
                 session_text = "\n".join(f"{pid}: {title}" for pid, title in visible_sessions[:8])
                 if len(visible_sessions) > 8:
                     session_text += f"\n... (+{len(visible_sessions) - 8} more)"
                 choice = QMessageBox.warning(
                     self,
                     "Visible RADAN Sessions Are Open",
-                    "This import still needs RADAN to convert DXF files into symbols.\n\n"
-                    "During conversion, RADAN COM automation can redraw or disturb already-open RADAN windows, "
+                    "This import still needs RADAN automation.\n\n"
+                    "During conversion or RADAN NST project update, RADAN COM automation can redraw or disturb already-open RADAN windows, "
                     "and those sessions may not be safe to keep saving afterward.\n\n"
                     f"Open RADAN sessions:\n{session_text}\n\n"
-                    f"Missing symbols to create:\n{sample_symbols}\n\n"
+                    f"Work requiring RADAN:\n{sample_symbols}\n\n"
                     "Continue anyway?",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
@@ -2963,39 +3073,131 @@ class MainWindow(QMainWindow):
             character if character.isalnum() else "_"
             for character in f"{status.paths.truck_number}_{status.paths.project_name}"
         ).strip("_")
-        log_prefix = "radan_csv_native_import" if native_sym_experimental else "radan_csv_import"
+        if use_cleaned_dxf:
+            log_prefix = "radan_csv_cleaned_import"
+        else:
+            log_prefix = "radan_csv_import"
         log_path = log_dir / f"{log_prefix}_{safe_name}_{int(time.time())}.log"
-        self._show_radan_import_log(log_path)
+        log_dialog = self._show_radan_import_log(log_path)
         try:
-            launch_radan_csv_import(
+            process = launch_radan_csv_import(
                 csv_path,
                 output_folder,
                 project_path=status.paths.rpd_path,
                 log_path=log_path,
                 allow_visible_radan=allow_visible_radan,
-                native_sym_experimental=native_sym_experimental,
+                rebuild_symbols=use_cleaned_dxf,
+                preprocess_dxf_outer_profile=use_cleaned_dxf,
+                preprocess_dxf_tolerance=0.002 if use_cleaned_dxf else None,
+                project_update_method=project_update_method,
+                max_parts=max_parts,
             )
         except Exception as exc:
+            log_dialog.mark_launch_failed(str(exc))
             QMessageBox.critical(self, title, str(exc))
             return
+        self._write_radan_import_marker(
+            process=process,
+            log_path=log_path,
+            project_path=status.paths.rpd_path,
+        )
+        log_dialog.set_process(process)
 
-        if native_sym_experimental:
-            self.log(f"Launched native SYM CSV import for {csv_path.name}; output folder is {output_folder}.")
+        part_limit_text = " (first 10 rows)" if max_parts == 10 else ""
+        if use_cleaned_dxf:
+            self.log(
+                f"Launched RADAN CSV import for {csv_path.name}{part_limit_text} using cleaned L-side DXF working copies; "
+                f"output folder is {output_folder}; project_update={project_update_method}."
+            )
         else:
-            self.log(f"Launched RADAN CSV import for {csv_path.name}; output folder is {output_folder}.")
+            self.log(
+                f"Launched RADAN CSV import for {csv_path.name}{part_limit_text}; "
+                f"output folder is {output_folder}; "
+                f"project_update={project_update_method}."
+            )
 
-    def _show_radan_import_log(self, log_path: Path) -> None:
+    def _show_radan_import_log(self, log_path: Path) -> ImportLogDialog:
+        self._radan_import_log_dialogs = [
+            dialog
+            for dialog in self._radan_import_log_dialogs
+            if not dialog.is_complete or dialog.isVisible()
+        ]
         dialog = self._radan_import_log_dialog
-        if dialog is not None:
+        if dialog is not None and dialog.is_complete:
             try:
-                dialog.close()
+                dialog.force_close()
             except Exception:
                 pass
-        dialog = ImportLogDialog(log_path, self)
+        dialog = ImportLogDialog(log_path, self, completion_callback=self._on_radan_import_log_complete)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
         self._radan_import_log_dialog = dialog
+        self._radan_import_log_dialogs.append(dialog)
+        return dialog
+
+    def _radan_import_marker_path(self) -> Path:
+        return self._runtime_dir / "_runtime" / "radan_import_active.json"
+
+    def _write_radan_import_marker(
+        self,
+        *,
+        process: subprocess.Popen[object],
+        log_path: Path,
+        project_path: Path,
+    ) -> None:
+        marker_path = self._radan_import_marker_path()
+        payload = {
+            "pid": int(process.pid),
+            "log_path": str(log_path),
+            "project_path": str(project_path),
+            "started_at_epoch": time.time(),
+        }
+        try:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            self.log(f"Could not write RADAN import active marker: {exc}")
+
+    def _clear_radan_import_marker(self, *, process_id: int | None = None) -> None:
+        marker_path = self._radan_import_marker_path()
+        if process_id is not None:
+            try:
+                payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            try:
+                marker_pid = int(payload.get("pid", 0))
+            except (AttributeError, TypeError, ValueError):
+                marker_pid = 0
+            if marker_pid and marker_pid != int(process_id):
+                return
+        try:
+            marker_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log(f"Could not clear RADAN import active marker: {exc}")
+
+    def _on_radan_import_log_complete(self, dialog: ImportLogDialog) -> None:
+        self._clear_radan_import_marker(process_id=dialog.process_id)
+
+    def closeEvent(self, event) -> None:
+        running_import_logs = [
+            dialog
+            for dialog in self._radan_import_log_dialogs
+            if not dialog.is_complete
+        ]
+        if running_import_logs:
+            dialog = running_import_logs[-1]
+            QMessageBox.warning(
+                self,
+                "RADAN Import Running",
+                "A RADAN CSV import helper is still running. The Explorer window will stay open until it finishes.",
+            )
+            dialog.raise_()
+            dialog.activateWindow()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     @staticmethod
     def _inventor_output_signature(outputs: InventorOutputPaths) -> tuple[tuple[str, int, int], ...] | None:

@@ -23,9 +23,6 @@ def _same_path(left: Path, right: Path) -> bool:
 def _running_from_shared_venv() -> bool:
     if _same_path(Path(sys.prefix), SHARED_VENV_ROOT):
         return True
-    virtual_env = os.environ.get("VIRTUAL_ENV")
-    if virtual_env and _same_path(Path(virtual_env), SHARED_VENV_ROOT):
-        return True
     current = Path(sys.executable)
     allowed = [SHARED_VENV_PYTHON]
     if SHARED_VENV_PYTHONW.exists():
