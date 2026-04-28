@@ -1089,6 +1089,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     preprocess_dxf_tolerance=0.002,
                     assign_project_colors=True,
                     project_update_method="radan-nst",
+                    refresh_project_sheets=True,
                     max_parts=10,
                 )
 
@@ -1108,6 +1109,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn("--assign-project-colors", command)
             self.assertIn("--project-update-method", command)
             self.assertIn("radan-nst", command)
+            self.assertIn("--refresh-project-sheets", command)
             self.assertIn("--max-parts", command)
             self.assertIn("10", command)
             self.assertEqual(popen_mock.call_args.kwargs["cwd"], str(temp_root))

@@ -1050,6 +1050,7 @@ def launch_radan_csv_import(
     preprocess_dxf_tolerance: float | None = None,
     assign_project_colors: bool = False,
     project_update_method: str = "direct-xml",
+    refresh_project_sheets: bool = False,
     max_parts: int | None = None,
 ) -> subprocess.Popen[object]:
     entry = Path(str(entry_path))
@@ -1090,6 +1091,8 @@ def launch_radan_csv_import(
         command.append("--assign-project-colors")
     if project_update_method:
         command.extend(["--project-update-method", str(project_update_method)])
+    if refresh_project_sheets:
+        command.append("--refresh-project-sheets")
     if max_parts is not None:
         if max_parts <= 0:
             raise ValueError("max_parts must be greater than zero when supplied.")

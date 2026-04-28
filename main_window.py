@@ -1013,7 +1013,7 @@ class MainWindow(QMainWindow):
         self.launch_inventor_button.clicked.connect(self.run_selected_inventor_flow)
         self.import_csv_button = QPushButton("Import CSV")
         self.import_csv_button.setToolTip(
-            "Import the selected kit's generated _Radan.csv into RADAN using the selected DXF source."
+            "Import the selected kit's generated _Radan.csv, then refresh the project sheet list through hidden RADAN automation."
         )
         self.import_csv_button.clicked.connect(lambda _checked=False: self.import_selected_csv_to_radan())
         self.radan_dxf_source_label = QLabel("DXF:")
@@ -3090,6 +3090,7 @@ class MainWindow(QMainWindow):
                 preprocess_dxf_outer_profile=use_cleaned_dxf,
                 preprocess_dxf_tolerance=0.002 if use_cleaned_dxf else None,
                 project_update_method=project_update_method,
+                refresh_project_sheets=True,
                 max_parts=max_parts,
             )
         except Exception as exc:
@@ -3107,13 +3108,13 @@ class MainWindow(QMainWindow):
         if use_cleaned_dxf:
             self.log(
                 f"Launched RADAN CSV import for {csv_path.name}{part_limit_text} using cleaned L-side DXF working copies; "
-                f"output folder is {output_folder}; project_update={project_update_method}."
+                f"output folder is {output_folder}; project_update={project_update_method}; sheet_refresh=on."
             )
         else:
             self.log(
                 f"Launched RADAN CSV import for {csv_path.name}{part_limit_text}; "
                 f"output folder is {output_folder}; "
-                f"project_update={project_update_method}."
+                f"project_update={project_update_method}; sheet_refresh=on."
             )
 
     def _show_radan_import_log(self, log_path: Path) -> ImportLogDialog:
