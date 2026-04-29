@@ -41,7 +41,13 @@ from models import (
     materialize_legacy_punch_codes_for_kit,
     resolve_punch_code_text,
 )
-from packet_build_service import build_assembly_packet, prepare_packet_build_context
+from packet_build_service import (
+    PacketBuildReadinessError,
+    build_assembly_packet,
+    build_cut_list_packet,
+    prepare_packet_build_context,
+    validate_print_packet_readiness,
+)
 from settings_store import load_settings, save_settings
 from services import (
     DEFAULT_RADAN_CSV_IMPORT_ENTRY,
@@ -53,6 +59,7 @@ from services import (
     collect_kit_statuses,
     create_kit_scaffold,
     detect_assembly_packet_pdf,
+    detect_cut_list_packet_pdf,
     detect_print_packet_pdf,
     detect_preview_pdf,
     detect_spreadsheet,
@@ -126,6 +133,28 @@ def write_simple_rpd(path: Path, *, sym_path: Path) -> None:
   </Parts>
 </Project>
 """,
+        encoding="utf-8",
+    )
+
+
+def write_rpd_parts(path: Path, rows: list[tuple[str, int | None]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parts = []
+    for index, (sym_path, qty) in enumerate(rows, start=1):
+        qty_xml = "" if qty is None else f"\n      <Number>{qty}</Number>"
+        parts.append(
+            f"""    <Part>
+      <ID>{index}</ID>
+      <Symbol>{sym_path}</Symbol>{qty_xml}
+    </Part>"""
+        )
+    path.write_text(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        "<Project xmlns=\"http://www.radan.com/ns/project\">\n"
+        "  <Parts>\n"
+        + "\n".join(parts)
+        + "\n  </Parts>\n"
+        "</Project>\n",
         encoding="utf-8",
     )
 
@@ -708,6 +737,25 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(match.chosen_path, assembly_pdf)
             self.assertEqual(tuple(path.name for path in match.candidates), (assembly_pdf.name,))
 
+    def test_detect_cut_list_packet_pdf_finds_generated_cut_list(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            cut_list_pdf = paths.project_dir / "CutList_20260428_101500.pdf"
+            assembly_pdf = paths.project_dir / "AssemblyPacket_TABLOID_20260417_101500.pdf"
+            cut_list_pdf.write_text("pdf", encoding="utf-8")
+            assembly_pdf.write_text("pdf", encoding="utf-8")
+
+            match = detect_cut_list_packet_pdf(paths)
+
+            self.assertEqual(match.chosen_path, cut_list_pdf)
+            self.assertEqual(tuple(path.name for path in match.candidates), (cut_list_pdf.name,))
+
     def test_prepare_packet_build_context_collects_unused_tabloid_assembly_pdfs(self) -> None:
         with workspace_tempdir() as temp_root:
             settings = ExplorerSettings(
@@ -723,9 +771,11 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             sym_path = paths.fabrication_kit_dir / "PART-1.sym"
             part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_iam = paths.fabrication_kit_dir / "Assembly-Overview.iam"
             assembly_pdf = paths.fabrication_kit_dir / "Assembly-Overview.pdf"
             note_pdf = paths.fabrication_kit_dir / "Traveler.pdf"
             sym_path.write_text("sym", encoding="utf-8")
+            assembly_iam.write_text("iam", encoding="utf-8")
             write_pdf(part_pdf, text="PART", width=612, height=792)
             write_pdf(assembly_pdf, text="ASSEMBLY", width=792, height=1224)
             write_pdf(note_pdf, text="LETTER", width=612, height=792)
@@ -739,6 +789,156 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(len(context.parts), 1)
             self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
+
+    def test_validate_print_packet_readiness_rejects_empty_rpd(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "empty.rpd"
+            rpd_path.write_text(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                "<Project xmlns=\"http://www.radan.com/ns/project\"><Parts /></Project>\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(PacketBuildReadinessError, "no part rows"):
+                validate_print_packet_readiness(rpd_path=rpd_path, parts=())
+
+    def test_validate_print_packet_readiness_rejects_missing_explicit_qty(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "missing_qty.rpd"
+            sym_path = temp_root / "Part A.sym"
+            sym_path.write_text("sym", encoding="utf-8")
+            write_rpd_parts(rpd_path, [(str(sym_path), None)])
+            _tree, parts, _debug = rpd_io.load_rpd(str(rpd_path))
+
+            with self.assertRaisesRegex(PacketBuildReadinessError, "without explicit quantities"):
+                validate_print_packet_readiness(rpd_path=rpd_path, parts=parts)
+
+    def test_validate_print_packet_readiness_compares_radan_csv_quantities(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "ready.rpd"
+            csv_path = temp_root / "TruckBom_Radan.csv"
+            sym_a = temp_root / "Part A.sym"
+            sym_b = temp_root / "Part B.sym"
+            sym_a.write_text("sym", encoding="utf-8")
+            sym_b.write_text("sym", encoding="utf-8")
+            write_rpd_parts(rpd_path, [(str(sym_a), 2), (str(sym_b), 3)])
+            csv_path.write_text(
+                f"{temp_root / 'Part A.dxf'},2,Aluminum,0.125,in,AIR\n"
+                f"{temp_root / 'Part B.dxf'},3,Aluminum,0.125,in,AIR\n",
+                encoding="utf-8",
+            )
+            _tree, parts, _debug = rpd_io.load_rpd(str(rpd_path))
+
+            validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path)
+
+            csv_path.write_text(
+                f"{temp_root / 'Part A.dxf'},2,Aluminum,0.125,in,AIR\n"
+                f"{temp_root / 'Part B.dxf'},4,Aluminum,0.125,in,AIR\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PacketBuildReadinessError, "quantity mismatch"):
+                validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path)
+
+    def test_prepare_packet_build_context_collects_iam_backed_assembly_drawings(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            sym_path = paths.fabrication_kit_dir / "PART-1.sym"
+            part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_iam = paths.fabrication_kit_dir / "F55334-B-100.iam"
+            assembly_pdf = paths.fabrication_kit_dir / "F55334-B-100.pdf"
+            revised_assembly_iam = paths.fabrication_kit_dir / "F55334-BODY.iam"
+            revised_assembly_pdf = paths.fabrication_kit_dir / "F55334-BODY R1.pdf"
+            cut_part_ipt = paths.fabrication_kit_dir / "B-1001.ipt"
+            cut_part_pdf = paths.fabrication_kit_dir / "B-1001.pdf"
+            loose_assembly_pdf = paths.fabrication_kit_dir / "Assembly-Loose.pdf"
+            sample_template_pdf = paths.fabrication_kit_dir / "Templates" / "Sample Assembly Template.pdf"
+            sym_path.write_text("sym", encoding="utf-8")
+            assembly_iam.write_text("iam", encoding="utf-8")
+            revised_assembly_iam.write_text("iam", encoding="utf-8")
+            cut_part_ipt.write_text("ipt", encoding="utf-8")
+            write_pdf(part_pdf, text="PART", width=612, height=792)
+            write_pdf(assembly_pdf, text="ASSEMBLY", width=2448, height=1584)
+            write_pdf(revised_assembly_pdf, text="REVISED ASSEMBLY", width=2448, height=1584)
+            write_pdf(cut_part_pdf, text="CUT PART", width=2448, height=1584)
+            write_pdf(loose_assembly_pdf, text="LOOSE ASSEMBLY", width=2448, height=1584)
+            write_pdf(sample_template_pdf, text="SAMPLE", width=792, height=1224)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(
+                context.assembly_source_pdfs,
+                (assembly_pdf, revised_assembly_pdf),
+            )
+
+    def test_prepare_packet_build_context_collects_nonlaser_token_cut_list_pdfs(self) -> None:
+        with workspace_tempdir() as temp_root:
+            inventor_tool_dir = temp_root / "inventor_to_radan"
+            inventor_tool_dir.mkdir(parents=True)
+            (inventor_tool_dir / "nonlaser_tokens.csv").write_text("Token\nACH\nAST\n", encoding="utf-8")
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+                inventor_to_radan_entry=str(inventor_tool_dir / "inventor_to_radan.bat"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            sym_path = paths.fabrication_kit_dir / "PART-1.sym"
+            part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            ach_ipt = paths.fabrication_kit_dir / "ACH 3X2X.25-32-1.ipt"
+            ach_pdf = paths.fabrication_kit_dir / "ACH 3X2X.25-32-1.pdf"
+            revised_ast_ipt = paths.fabrication_kit_dir / "AST SC 2X.25-49.75-1.ipt"
+            revised_ast_pdf = paths.fabrication_kit_dir / "AST SC 2X.25-49.75-1 R1.pdf"
+            laser_ipt = paths.fabrication_kit_dir / "B-100.ipt"
+            laser_pdf = paths.fabrication_kit_dir / "B-100.pdf"
+            assembly_iam = paths.fabrication_kit_dir / "ACH Assembly.iam"
+            assembly_pdf = paths.fabrication_kit_dir / "ACH Assembly.pdf"
+            template_ipt = paths.fabrication_kit_dir / "Templates" / "ACH Template.ipt"
+            template_pdf = paths.fabrication_kit_dir / "Templates" / "ACH Template.pdf"
+            generated_pdf = paths.fabrication_kit_dir / "_out" / "CutList_20260428_101500.pdf"
+            sym_path.write_text("sym", encoding="utf-8")
+            ach_ipt.write_text("ipt", encoding="utf-8")
+            revised_ast_ipt.write_text("ipt", encoding="utf-8")
+            laser_ipt.write_text("ipt", encoding="utf-8")
+            assembly_iam.write_text("iam", encoding="utf-8")
+            template_ipt.parent.mkdir(parents=True)
+            template_ipt.write_text("ipt", encoding="utf-8")
+            generated_pdf.parent.mkdir(parents=True)
+            write_pdf(part_pdf, text="PART", width=612, height=792)
+            write_pdf(ach_pdf, text="ACH CUT", width=1584, height=1224)
+            write_pdf(revised_ast_pdf, text="AST CUT", width=1584, height=1224)
+            write_pdf(laser_pdf, text="LASER", width=1584, height=1224)
+            write_pdf(assembly_pdf, text="ASSEMBLY", width=1584, height=1224)
+            write_pdf(template_pdf, text="TEMPLATE", width=1584, height=1224)
+            write_pdf(generated_pdf, text="GENERATED", width=1584, height=1224)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.cut_list_source_pdfs, (ach_pdf, revised_ast_pdf))
 
     def test_prepare_packet_build_context_uses_subtree_lookup_for_pump_house_print_packet_pdfs(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -787,8 +987,10 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             sym_path = paths.fabrication_kit_dir / "PART-1.sym"
             part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_iam = paths.project_dir / "Assembly-Overview.iam"
             assembly_pdf = paths.project_dir / "Assembly-Overview.pdf"
             sym_path.write_text("sym", encoding="utf-8")
+            assembly_iam.write_text("iam", encoding="utf-8")
             write_pdf(part_pdf, text="PART", width=612, height=792)
             write_pdf(assembly_pdf, text="ASSEMBLY", width=792, height=1224)
             write_simple_rpd(paths.rpd_path, sym_path=sym_path)
@@ -816,12 +1018,14 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             sym_path = paths.fabrication_kit_dir / "PART-1.sym"
             part_pdf = paths.fabrication_kit_dir / "PART-1.pdf"
+            assembly_iam = paths.fabrication_kit_dir / "Assembly-Overview.iam"
             assembly_pdf = paths.fabrication_kit_dir / "Assembly-Overview.pdf"
             generated_out_dir = paths.fabrication_kit_dir / "_out"
             generated_out_dir.mkdir(parents=True)
             generated_print_packet = generated_out_dir / "PrintPacket_QTY_20260417_101500.pdf"
             generated_assembly_packet = generated_out_dir / "AssemblyPacket_TABLOID_20260417_101500.pdf"
             sym_path.write_text("sym", encoding="utf-8")
+            assembly_iam.write_text("iam", encoding="utf-8")
             write_pdf(part_pdf, text="PART", width=612, height=792)
             write_pdf(assembly_pdf, text="ASSEMBLY", width=792, height=1224)
             write_pdf(generated_print_packet, text="GENERATED PRINT", width=792, height=1224)
@@ -856,11 +1060,10 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(result.output_pages, 2)
             with fitz.open(result.packet_path) as doc:
                 self.assertEqual(doc.page_count, 2)
-                image_counts = [len(doc[index].get_images(full=True)) for index in range(doc.page_count)]
-                darkest_pixels = [min(doc[index].get_pixmap().samples) for index in range(doc.page_count)]
-            self.assertEqual(image_counts, [1, 1])
-            self.assertLess(darkest_pixels[0], 250)
-            self.assertLess(darkest_pixels[1], 250)
+                self.assertEqual((round(doc[0].rect.width), round(doc[0].rect.height)), (792, 1224))
+                self.assertEqual((round(doc[1].rect.width), round(doc[1].rect.height)), (1224, 792))
+                self.assertIn("ASSEMBLY A", doc[0].get_text())
+                self.assertIn("ASSEMBLY B", doc[1].get_text())
 
     def test_build_assembly_packet_includes_only_tabloid_pages_from_mixed_source_pdf(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -885,8 +1088,58 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(result.output_pages, 1)
             with fitz.open(result.packet_path) as doc:
                 self.assertEqual(doc.page_count, 1)
-                self.assertEqual(len(doc[0].get_images(full=True)), 1)
-                self.assertLess(min(doc[0].get_pixmap().samples), 250)
+                self.assertIn("TABLOID DRAWING", doc[0].get_text())
+                self.assertNotIn("LETTER COVER", doc[0].get_text())
+
+    def test_build_assembly_packet_includes_large_assembly_drawing_pages(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
+            rpd_path.parent.mkdir(parents=True, exist_ok=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+            assembly_pdf = temp_root / "fab" / "F55334-B-100.pdf"
+            write_pdf(assembly_pdf, text="LARGE ASSEMBLY", width=2448, height=1584)
+
+            result = build_assembly_packet(
+                rpd_path=rpd_path,
+                source_pdfs=(assembly_pdf,),
+            )
+
+            self.assertEqual(result.source_documents, 1)
+            self.assertEqual(result.output_pages, 1)
+            with fitz.open(result.packet_path) as doc:
+                self.assertEqual(doc.page_count, 1)
+                self.assertEqual((round(doc[0].rect.width), round(doc[0].rect.height)), (2448, 1584))
+                self.assertIn("LARGE ASSEMBLY", doc[0].get_text())
+
+    def test_build_cut_list_packet_combines_one_copy_of_each_source_pdf(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
+            rpd_path.parent.mkdir(parents=True, exist_ok=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+            cut_pdf_a = temp_root / "fab" / "ACH 3X2X.25-32-1.pdf"
+            cut_pdf_b = temp_root / "fab" / "AST SC 2X.25-49.75-1 R1.pdf"
+            write_pdf(cut_pdf_a, text="ACH CUT", width=1584, height=1224)
+            write_pdf_pages(
+                cut_pdf_b,
+                pages=[
+                    ("AST CUT PAGE 1", 1584, 1224),
+                    ("AST CUT PAGE 2", 1584, 1224),
+                ],
+            )
+
+            result = build_cut_list_packet(
+                rpd_path=rpd_path,
+                source_pdfs=(cut_pdf_a, cut_pdf_b),
+            )
+
+            self.assertTrue(Path(result.packet_path).name.startswith("CutList_"))
+            self.assertEqual(result.source_documents, 2)
+            self.assertEqual(result.output_pages, 3)
+            with fitz.open(result.packet_path) as doc:
+                self.assertEqual(doc.page_count, 3)
+                self.assertIn("ACH CUT", doc[0].get_text())
+                self.assertIn("AST CUT PAGE 1", doc[1].get_text())
+                self.assertIn("AST CUT PAGE 2", doc[2].get_text())
 
     def test_move_inventor_outputs_to_project_places_files_in_l_project_folder(self) -> None:
         with workspace_tempdir() as temp_root:

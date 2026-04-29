@@ -645,6 +645,16 @@ def _is_assembly_packet_pdf(path: Path) -> bool:
     )
 
 
+def _is_cut_list_packet_pdf(path: Path) -> bool:
+    stem_words = _normalize_pdf_name_words(path.stem)
+    return (
+        stem_words.startswith("cut list")
+        or stem_words.startswith("cutlist")
+        or " cut list " in f" {stem_words} "
+        or " cutlist " in f" {stem_words} "
+    )
+
+
 def _detect_named_packet_pdf(
     paths: KitPaths,
     *,
@@ -692,6 +702,10 @@ def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
 
 def detect_assembly_packet_pdf(paths: KitPaths) -> PdfMatch:
     return _detect_named_packet_pdf(paths, matches_fn=_is_assembly_packet_pdf)
+
+
+def detect_cut_list_packet_pdf(paths: KitPaths) -> PdfMatch:
+    return _detect_named_packet_pdf(paths, matches_fn=_is_cut_list_packet_pdf)
 
 
 def fabrication_folder_has_files(folder: Path | None) -> bool:

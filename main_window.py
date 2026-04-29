@@ -43,9 +43,12 @@ from PySide6.QtWidgets import (
 )
 
 from packet_build_service import (
+    PacketBuildReadinessError,
     build_assembly_packet,
+    build_cut_list_packet,
     create_main_packet_worker,
     prepare_packet_build_context,
+    validate_print_packet_readiness,
 )
 from flow_bridge import (
     FlowTruckInsight,
@@ -73,6 +76,7 @@ from services import (
     configured_kit_mappings,
     create_kit_scaffold,
     detect_assembly_packet_pdf,
+    detect_cut_list_packet_pdf,
     detect_print_packet_pdf,
     discover_trucks,
     filter_kit_statuses,
@@ -496,6 +500,7 @@ class MainWindow(QMainWindow):
         "Nest Summary",
         "Print Packet",
         "Assembly Packet",
+        "Cut List",
         "Release",
         "Flow",
         "Punch Code",
@@ -505,9 +510,10 @@ class MainWindow(QMainWindow):
     NEST_SUMMARY_COLUMN = 2
     PRINT_PACKET_COLUMN = 3
     ASSEMBLY_PACKET_COLUMN = 4
-    FLOW_COLUMN = 6
-    PUNCH_CODE_COLUMN = 7
-    NOTES_COLUMN = 8
+    CUT_LIST_COLUMN = 5
+    FLOW_COLUMN = 7
+    PUNCH_CODE_COLUMN = 8
+    NOTES_COLUMN = 9
 
     def __init__(
         self,
@@ -1000,9 +1006,14 @@ class MainWindow(QMainWindow):
         self.build_print_packet_button.clicked.connect(self.build_selected_print_packet)
         self.build_assembly_packet_button = QPushButton("Build Assembly Packet")
         self.build_assembly_packet_button.setToolTip(
-            "Build the as-is assembly packet from the unused tabloid PDFs in the selected kit's W-side and project folders."
+            "Build the as-is assembly packet from .iam-backed drawing PDFs in the selected kit's W-side and project folders."
         )
         self.build_assembly_packet_button.clicked.connect(self.build_selected_assembly_packet)
+        self.build_cut_list_button = QPushButton("Build Cut List")
+        self.build_cut_list_button.setToolTip(
+            "Build a one-copy cut list packet from W-side PDFs whose first filename token is marked non-laser in Inventor-to-RADAN."
+        )
+        self.build_cut_list_button.clicked.connect(self.build_selected_cut_list_packet)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
@@ -1064,6 +1075,7 @@ class MainWindow(QMainWindow):
             self.open_flow_pdf_button,
             self.build_print_packet_button,
             self.build_assembly_packet_button,
+            self.build_cut_list_button,
             self.launch_kitter_button,
             self.launch_inventor_button,
             self.toggle_selected_kits_hidden_button,
@@ -1198,6 +1210,7 @@ class MainWindow(QMainWindow):
     def _recommended_action_for_status(self, status: KitStatus) -> str:
         print_packet_match = detect_print_packet_pdf(status.paths)
         assembly_packet_match = detect_assembly_packet_pdf(status.paths)
+        cut_list_match = detect_cut_list_packet_pdf(status.paths)
         if not status.project_folder_exists or not status.rpd_exists:
             return "Repair Selected: the L-side project setup is incomplete."
         if status.spreadsheet_match.issue == "multiple_spreadsheets":
@@ -1221,7 +1234,14 @@ class MainWindow(QMainWindow):
             and status.paths.fabrication_kit_dir.exists()
             and assembly_packet_match.chosen_path is None
         ):
-            return "Build Assembly Packet: generate the unused tabloid assembly packet from Explorer."
+            return "Build Assembly Packet: generate the .iam-backed assembly drawing packet from Explorer."
+        if (
+            status.rpd_exists
+            and status.paths.fabrication_kit_dir is not None
+            and status.paths.fabrication_kit_dir.exists()
+            and cut_list_match.chosen_path is None
+        ):
+            return "Build Cut List: generate the non-laser first-token PDF packet from Explorer."
         if status.rpd_exists and self.settings.radan_kitter_launcher.strip():
             return "Run Kitter: the project file is ready."
         return "Open Project: the kit is mostly ready and worth a quick review."
@@ -1230,6 +1250,7 @@ class MainWindow(QMainWindow):
         flow_insight = self._flow_insight_for_status(status)
         packet_match = detect_print_packet_pdf(status.paths)
         assembly_packet_match = detect_assembly_packet_pdf(status.paths)
+        cut_list_match = detect_cut_list_packet_pdf(status.paths)
         actions: list[str] = []
         if not status.project_folder_exists or not status.rpd_exists:
             actions.append("Repair Selected")
@@ -1249,9 +1270,12 @@ class MainWindow(QMainWindow):
             actions.append("Open Print Packet")
         if assembly_packet_match.chosen_path is not None:
             actions.append("Open Assembly Packet")
+        if cut_list_match.chosen_path is not None:
+            actions.append("Open Cut List")
         if status.rpd_exists and status.paths.fabrication_kit_dir is not None and status.paths.fabrication_kit_dir.exists():
             actions.append("Build Print Packet")
             actions.append("Build Assembly Packet")
+            actions.append("Build Cut List")
         if status.rpd_exists and self.settings.radan_kitter_launcher.strip():
             actions.append("Run Kitter")
         if status.spreadsheet_match.chosen_path is not None and self.settings.inventor_to_radan_entry.strip():
@@ -1289,6 +1313,9 @@ class MainWindow(QMainWindow):
         assembly_packet_ready = sum(
             1 for status in self._all_statuses if detect_assembly_packet_pdf(status.paths).chosen_path is not None
         )
+        cut_list_ready = sum(
+            1 for status in self._all_statuses if detect_cut_list_packet_pdf(status.paths).chosen_path is not None
+        )
         hidden_filtered = max(0, total_kits - visible_kits)
         lines = [
             f"Kits in truck: {total_kits}",
@@ -1297,7 +1324,7 @@ class MainWindow(QMainWindow):
             f"Project files ready: {rpd_ready}/{total_kits}",
             f"Spreadsheets ready: {spreadsheet_ready} | Ambiguous: {spreadsheet_ambiguous} | Missing: {spreadsheet_missing}",
             f"Nest summaries ready: {nest_ready}/{total_kits}",
-            f"Print packets ready: {print_packet_ready}/{total_kits} | Assembly packets ready: {assembly_packet_ready}/{total_kits}",
+            f"Print packets ready: {print_packet_ready}/{total_kits} | Assembly packets ready: {assembly_packet_ready}/{total_kits} | Cut lists ready: {cut_list_ready}/{total_kits}",
         ]
         if hidden_filtered:
             lines.append(f"Filtered out by hidden toggle: {hidden_filtered}")
@@ -1356,6 +1383,9 @@ class MainWindow(QMainWindow):
             ),
             (
                 f"Assembly packet: {self._match_summary_text(chosen_path=assembly_packet_match.chosen_path, candidates=assembly_packet_match.candidates, missing_label='Missing')}"
+            ),
+            (
+                f"Cut list: {self._match_summary_text(chosen_path=cut_list_match.chosen_path, candidates=cut_list_match.candidates, missing_label='Missing')}"
             ),
             f"Punch code: {self._punch_code_text_for_status(status) or '(blank)'}",
             f"Notes: {self._note_text_for_status(status) or '(blank)'}",
@@ -1879,6 +1909,10 @@ class MainWindow(QMainWindow):
         if item.column() == self.ASSEMBLY_PACKET_COLUMN:
             if detect_assembly_packet_pdf(status.paths).chosen_path is not None:
                 self._open_assembly_packet_for_status(status)
+            return
+        if item.column() == self.CUT_LIST_COLUMN:
+            if detect_cut_list_packet_pdf(status.paths).chosen_path is not None:
+                self._open_cut_list_for_status(status)
 
     def _on_kit_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         row = item.row()
@@ -1900,6 +1934,10 @@ class MainWindow(QMainWindow):
         if item.column() == self.ASSEMBLY_PACKET_COLUMN:
             if detect_assembly_packet_pdf(status.paths).chosen_path is not None:
                 self._open_assembly_packet_for_status(status)
+            return
+        if item.column() == self.CUT_LIST_COLUMN:
+            if detect_cut_list_packet_pdf(status.paths).chosen_path is not None:
+                self._open_cut_list_for_status(status)
 
     def _populate_status_row(self, row: int, status: KitStatus) -> None:
         green = QColor("#D8F3DC")
@@ -1925,6 +1963,7 @@ class MainWindow(QMainWindow):
             nest_summary_color = yellow
         packet_match = detect_print_packet_pdf(status.paths)
         assembly_packet_match = detect_assembly_packet_pdf(status.paths)
+        cut_list_match = detect_cut_list_packet_pdf(status.paths)
         print_packet_color = red
         if packet_match.chosen_path is not None:
             print_packet_color = green if len(packet_match.candidates) == 1 else yellow
@@ -1935,6 +1974,11 @@ class MainWindow(QMainWindow):
             assembly_packet_color = green if len(assembly_packet_match.candidates) == 1 else yellow
         elif assembly_packet_match.candidates:
             assembly_packet_color = yellow
+        cut_list_color = red
+        if cut_list_match.chosen_path is not None:
+            cut_list_color = green if len(cut_list_match.candidates) == 1 else yellow
+        elif cut_list_match.candidates:
+            cut_list_color = yellow
 
         punch_code_item = self._make_item(
             self._punch_code_text_for_status(status),
@@ -1991,6 +2035,16 @@ class MainWindow(QMainWindow):
             background=assembly_packet_color,
             hidden_foreground=hidden_foreground,
         )
+        cut_list_item = self._make_open_link_item(
+            exists=cut_list_match.chosen_path is not None,
+            tooltip=(
+                f"Click to open Cut List:\n{cut_list_match.chosen_path}"
+                if cut_list_match.chosen_path is not None
+                else "No Cut List PDF found on L for this kit."
+            ),
+            background=cut_list_color,
+            hidden_foreground=hidden_foreground,
+        )
 
         flow_insight = self._flow_insight_for_status(status)
         flow_background = neutral
@@ -2019,6 +2073,7 @@ class MainWindow(QMainWindow):
             nest_summary_item,
             print_packet_item,
             assembly_packet_item,
+            cut_list_item,
             self._make_item(release_text, background=release_color, foreground=hidden_foreground),
             flow_item,
             punch_code_item,
@@ -2547,6 +2602,18 @@ class MainWindow(QMainWindow):
             return
         self._open_path_with_message(packet_path)
 
+    def _open_cut_list_for_status(self, status: KitStatus) -> None:
+        packet_match = detect_cut_list_packet_pdf(status.paths)
+        packet_path = packet_match.chosen_path
+        if packet_path is None:
+            QMessageBox.warning(
+                self,
+                "Open Cut List",
+                "Could not find a Cut List PDF on the L side for this kit.",
+            )
+            return
+        self._open_path_with_message(packet_path)
+
     def open_selected_nest_summary(self) -> None:
         status = self._current_status()
         if status is None:
@@ -2568,6 +2635,13 @@ class MainWindow(QMainWindow):
             return
         self._open_assembly_packet_for_status(status)
 
+    def open_selected_cut_list(self) -> None:
+        status = self._current_status()
+        if status is None:
+            QMessageBox.information(self, "Open Cut List", "Select a kit first.")
+            return
+        self._open_cut_list_for_status(status)
+
     def _prepare_packet_build_context(self, title: str):
         if bool(getattr(self, "_packet_build_running", False)):
             QMessageBox.information(
@@ -2586,6 +2660,16 @@ class MainWindow(QMainWindow):
                 self,
                 title,
                 "The L-side project file is missing for this kit.",
+            )
+            return None, None
+        running_import, _lock_path, lock_pid = radan_csv_import_lock_status(status.paths.rpd_path)
+        if running_import:
+            pid_text = f" PID {lock_pid}" if lock_pid is not None else ""
+            QMessageBox.warning(
+                self,
+                title,
+                "A RADAN CSV import is still running for this project.\n\n"
+                f"Let the import helper{pid_text} finish before building packets.",
             )
             return None, None
         if status.paths.fabrication_kit_dir is None or not status.paths.fabrication_kit_dir.exists():
@@ -2622,6 +2706,25 @@ class MainWindow(QMainWindow):
                 "Build Print Packet",
                 "No parts were found in the selected RPD.",
             )
+            return
+
+        expected_csv_path = None
+        if status.spreadsheet_match.chosen_path is not None:
+            try:
+                expected_csv_path = resolve_existing_inventor_csv(
+                    status.spreadsheet_match.chosen_path,
+                    status.paths.project_dir,
+                )
+            except Exception:
+                expected_csv_path = None
+        try:
+            validate_print_packet_readiness(
+                rpd_path=status.paths.rpd_path,
+                parts=context.parts,
+                expected_csv_path=expected_csv_path,
+            )
+        except PacketBuildReadinessError as exc:
+            QMessageBox.warning(self, "Build Print Packet", str(exc))
             return
 
         total_steps = max(1, len(context.parts))
@@ -2712,7 +2815,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Build Assembly Packet",
-                "No unused tabloid assembly PDFs were found.\n\nSearched:\n" + searched,
+                "No .iam-backed assembly drawing PDFs were found.\n\nSearched:\n" + searched,
             )
             return
 
@@ -2776,7 +2879,83 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Build Assembly Packet",
-            "No unused tabloid assembly PDFs were found.",
+            "No .iam-backed assembly drawing PDFs were found.",
+        )
+
+    def build_selected_cut_list_packet(self) -> None:
+        status, context = self._prepare_packet_build_context("Build Cut List")
+        if status is None or context is None:
+            return
+        if not context.cut_list_source_pdfs:
+            searched = "\n".join(str(path) for path in context.assembly_search_roots) or "(none)"
+            QMessageBox.information(
+                self,
+                "Build Cut List",
+                "No non-laser cut list PDFs were found.\n\nSearched:\n" + searched,
+            )
+            return
+
+        total_steps = max(1, len(context.cut_list_source_pdfs))
+        progress = QProgressDialog("Building cut list...", "Cancel", 0, total_steps, self)
+        progress.setWindowTitle("Build Cut List")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        setattr(self, "_packet_build_running", True)
+        try:
+            result = build_cut_list_packet(
+                rpd_path=status.paths.rpd_path,
+                source_pdfs=context.cut_list_source_pdfs,
+                progress_cb=lambda done, total, status_text: (
+                    progress.setMaximum(total_steps),
+                    progress.setValue(max(0, min(total_steps, int(done)))),
+                    progress.setLabelText(f"Building cut list...\n{status_text}"),
+                    QApplication.processEvents(),
+                ),
+                should_cancel_cb=progress.wasCanceled,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Build Cut List", str(exc))
+            result = None
+        finally:
+            setattr(self, "_packet_build_running", False)
+            try:
+                progress.close()
+            except Exception:
+                pass
+
+        if result is None:
+            return
+
+        self._refresh_packet_statuses(status)
+
+        if result.packet_path:
+            try:
+                open_path(Path(result.packet_path))
+            except Exception:
+                pass
+            QMessageBox.information(
+                self,
+                "Build Cut List",
+                (
+                    f"Cut list documents: {int(result.source_documents)}\n"
+                    f"Cut list pages: {int(result.output_pages)}\n"
+                    f"Cut list: {result.packet_path}"
+                ),
+            )
+            self.log(f"Built cut list for {status.paths.display_name}.")
+            return
+
+        if result.skipped:
+            self.log("Cut list build canceled.")
+            return
+
+        QMessageBox.information(
+            self,
+            "Build Cut List",
+            "No non-laser cut list PDFs were found.",
         )
 
     def launch_selected_kitter(self) -> None:

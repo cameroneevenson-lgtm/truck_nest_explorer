@@ -6,7 +6,7 @@ It also includes:
 
 - a direct `Flow App` action that launches `fabrication_flow_dashboard`
 - on-demand opening of the best matching Nest Summary PDF found in the L-side project area
-- direct packet generation from Explorer for the saved `.rpd`, including the QTY print packet and a separate assembly packet built from unused tabloid PDFs on W
+- direct packet generation from Explorer for the saved `.rpd`, including the QTY print packet, a separate assembly packet built from `.iam` drawing PDFs on W, and a cut list built from non-laser token part PDFs
 - editable per-kit punch-code notes directly in the kit table
 - saved client numbers per truck
 - persistent hide/unhide controls for completed trucks and kits that should stay on L
@@ -107,7 +107,8 @@ The actual nest summary PDF is opened on demand instead of previewed in a small 
 - A print packet PDF is ignored even if it is nearby.
 - Use `Open Nest Summary` or double-click the Nest Summary cell to open it.
 - Use `Build Print Packet` to generate the QTY packet directly from Explorer.
-- Use `Build Assembly Packet` to generate the unused tabloid assembly drawings packet directly from Explorer.
+- Use `Build Assembly Packet` to generate the `.iam` assembly drawings packet directly from Explorer.
+- Use `Build Cut List` to generate a one-copy packet from PDFs whose first filename token is listed in Inventor-to-RADAN's `nonlaser_tokens.csv`.
 - Double-click the `Print Packet` or `Assembly Packet` cell to open those generated PDFs from L.
 
 Example target filename:
