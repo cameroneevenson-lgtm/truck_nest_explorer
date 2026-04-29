@@ -494,6 +494,15 @@ def delete_paths(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], tuple[str, 
 
 class MainWindow(QMainWindow):
     FLOW_GANTT_HEIGHT = 176
+    ASSEMBLY_PACKET_BUILD_ENABLED = False
+    CUT_LIST_BUILD_ENABLED = False
+    ASSEMBLY_PACKET_DISABLED_REASON = (
+        "Assembly packet generation is paused because it is known to hang and is not production-ready yet."
+    )
+    CUT_LIST_DISABLED_REASON = "Cut list packet generation is paused until the flow has been tested."
+    EXTERNAL_STATUS_REFRESH_INTERVAL_MS = 10000
+    KITTER_STATUS_REFRESH_INTERVAL_MS = 5000
+    KITTER_STATUS_REFRESH_ATTEMPTS = 360
     TABLE_COLUMNS = (
         "Kit",
         "Project File",
@@ -550,6 +559,8 @@ class MainWindow(QMainWindow):
         self._flow_cache_by_truck: dict[str, tuple[str, FlowTruckInsight]] = {}
         self._flow_gantt_source_bytes: bytes | None = None
         self._flow_gantt_source_pixmap: QPixmap | None = None
+        self._kitter_refresh_truck_number = ""
+        self._kitter_refresh_remaining = 0
         self._truck_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_truck_future: Future[list[str]] | None = None
         self._truck_request_serial = 0
@@ -573,11 +584,18 @@ class MainWindow(QMainWindow):
         self._flow_cache_refresh_timer = QTimer(self)
         self._flow_cache_refresh_timer.setInterval(1500)
         self._flow_cache_refresh_timer.timeout.connect(self._check_current_flow_cache)
+        self._external_status_refresh_timer = QTimer(self)
+        self._external_status_refresh_timer.setInterval(self.EXTERNAL_STATUS_REFRESH_INTERVAL_MS)
+        self._external_status_refresh_timer.timeout.connect(self._refresh_current_status_from_external_changes)
+        self._kitter_status_refresh_timer = QTimer(self)
+        self._kitter_status_refresh_timer.setInterval(self.KITTER_STATUS_REFRESH_INTERVAL_MS)
+        self._kitter_status_refresh_timer.timeout.connect(self._poll_kitter_status_refresh)
 
         self._build_ui()
         self._apply_dashboard_style()
         self._load_settings_into_form()
         self._flow_cache_refresh_timer.start()
+        self._external_status_refresh_timer.start()
         QTimer.singleShot(0, self.refresh_trucks)
 
     def _build_ui(self) -> None:
@@ -1006,13 +1024,15 @@ class MainWindow(QMainWindow):
         self.build_print_packet_button.clicked.connect(self.build_selected_print_packet)
         self.build_assembly_packet_button = QPushButton("Build Assembly Packet")
         self.build_assembly_packet_button.setToolTip(
-            "Build the as-is assembly packet from .iam-backed drawing PDFs in the selected kit's W-side and project folders."
+            self.ASSEMBLY_PACKET_DISABLED_REASON
         )
+        self.build_assembly_packet_button.setEnabled(False)
         self.build_assembly_packet_button.clicked.connect(self.build_selected_assembly_packet)
         self.build_cut_list_button = QPushButton("Build Cut List")
         self.build_cut_list_button.setToolTip(
-            "Build a one-copy cut list packet from W-side PDFs whose first filename token is marked non-laser in Inventor-to-RADAN."
+            self.CUT_LIST_DISABLED_REASON
         )
+        self.build_cut_list_button.setEnabled(False)
         self.build_cut_list_button.clicked.connect(self.build_selected_cut_list_packet)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
@@ -1229,19 +1249,29 @@ class MainWindow(QMainWindow):
         ):
             return "Build Print Packet: generate the QTY packet from Explorer."
         if (
-            status.rpd_exists
+            self.ASSEMBLY_PACKET_BUILD_ENABLED
+            and status.rpd_exists
             and status.paths.fabrication_kit_dir is not None
             and status.paths.fabrication_kit_dir.exists()
             and assembly_packet_match.chosen_path is None
         ):
             return "Build Assembly Packet: generate the .iam-backed assembly drawing packet from Explorer."
         if (
-            status.rpd_exists
+            self.CUT_LIST_BUILD_ENABLED
+            and status.rpd_exists
             and status.paths.fabrication_kit_dir is not None
             and status.paths.fabrication_kit_dir.exists()
             and cut_list_match.chosen_path is None
         ):
             return "Build Cut List: generate the non-laser first-token PDF packet from Explorer."
+        if (
+            status.rpd_exists
+            and self.settings.radan_kitter_launcher.strip()
+            and status.paths.fabrication_kit_dir is not None
+            and status.paths.fabrication_kit_dir.exists()
+            and (assembly_packet_match.chosen_path is None or cut_list_match.chosen_path is None)
+        ):
+            return "Run Kitter: packet side-flows are paused in Explorer; use Kitter for assembly packets for now."
         if status.rpd_exists and self.settings.radan_kitter_launcher.strip():
             return "Run Kitter: the project file is ready."
         return "Open Project: the kit is mostly ready and worth a quick review."
@@ -1274,8 +1304,10 @@ class MainWindow(QMainWindow):
             actions.append("Open Cut List")
         if status.rpd_exists and status.paths.fabrication_kit_dir is not None and status.paths.fabrication_kit_dir.exists():
             actions.append("Build Print Packet")
-            actions.append("Build Assembly Packet")
-            actions.append("Build Cut List")
+            if self.ASSEMBLY_PACKET_BUILD_ENABLED:
+                actions.append("Build Assembly Packet")
+            if self.CUT_LIST_BUILD_ENABLED:
+                actions.append("Build Cut List")
         if status.rpd_exists and self.settings.radan_kitter_launcher.strip():
             actions.append("Run Kitter")
         if status.spreadsheet_match.chosen_path is not None and self.settings.inventor_to_radan_entry.strip():
@@ -2696,6 +2728,40 @@ class MainWindow(QMainWindow):
         if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
             self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
 
+    def _queue_status_refresh_for_truck(self, truck_number: str) -> bool:
+        truck_text = str(truck_number or "").strip()
+        if not truck_text:
+            return False
+        truck_key = truck_text.casefold()
+        if truck_key in self._pending_status_by_truck:
+            return False
+        self._pending_status_by_truck[truck_key] = (
+            truck_text,
+            self._status_executor.submit(collect_kit_statuses, truck_text, self.settings),
+        )
+        self._status_watch_timer.start()
+        return True
+
+    def _start_kitter_status_refresh(self, truck_number: str) -> None:
+        truck_text = str(truck_number or "").strip()
+        if not truck_text:
+            return
+        self._kitter_refresh_truck_number = truck_text
+        self._kitter_refresh_remaining = self.KITTER_STATUS_REFRESH_ATTEMPTS
+        self._queue_status_refresh_for_truck(truck_text)
+        self._kitter_status_refresh_timer.start()
+
+    def _poll_kitter_status_refresh(self) -> None:
+        truck_text = self._kitter_refresh_truck_number.strip()
+        if not truck_text or self._kitter_refresh_remaining <= 0:
+            self._kitter_status_refresh_timer.stop()
+            return
+        if self._queue_status_refresh_for_truck(truck_text):
+            self._kitter_refresh_remaining -= 1
+
+    def _refresh_current_status_from_external_changes(self) -> None:
+        self._queue_status_refresh_for_truck(self.current_truck_number())
+
     def build_selected_print_packet(self) -> None:
         status, context = self._prepare_packet_build_context("Build Print Packet")
         if status is None or context is None:
@@ -2807,6 +2873,9 @@ class MainWindow(QMainWindow):
         QThreadPool.globalInstance().start(worker)
 
     def build_selected_assembly_packet(self) -> None:
+        if not self.ASSEMBLY_PACKET_BUILD_ENABLED:
+            QMessageBox.information(self, "Build Assembly Packet", self.ASSEMBLY_PACKET_DISABLED_REASON)
+            return
         status, context = self._prepare_packet_build_context("Build Assembly Packet")
         if status is None or context is None:
             return
@@ -2883,6 +2952,9 @@ class MainWindow(QMainWindow):
         )
 
     def build_selected_cut_list_packet(self) -> None:
+        if not self.CUT_LIST_BUILD_ENABLED:
+            QMessageBox.information(self, "Build Cut List", self.CUT_LIST_DISABLED_REASON)
+            return
         status, context = self._prepare_packet_build_context("Build Cut List")
         if status is None or context is None:
             return
@@ -2972,6 +3044,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Launch RADAN Kitter", str(exc))
             return
+        self._start_kitter_status_refresh(status.paths.truck_number)
         self.log(f"Launched RADAN Kitter on {status.paths.rpd_path}")
 
     def open_flow_app(self) -> None:
