@@ -187,6 +187,24 @@ def parse_flow_probe_payload(payload: object) -> FlowTruckInsight:
     )
 
 
+def _truck_mismatch_insight(requested_truck: str, returned_truck: str) -> FlowTruckInsight:
+    returned_label = returned_truck or "(blank)"
+    return FlowTruckInsight(
+        available=False,
+        truck_number=requested_truck,
+        summary_text=f"Flow: dashboard returned {returned_label} while loading {requested_truck}.",
+        issue="truck_mismatch",
+        tooltip_text=(
+            "The fabrication flow probe returned data for a different truck, "
+            f"so Explorer ignored it.\nRequested: {requested_truck}\nReturned: {returned_label}"
+        ),
+        planned_start_date="",
+        current_week=None,
+        gantt_png_bytes=None,
+        kit_insights_by_flow_name={},
+    )
+
+
 def load_flow_truck_insight(
     truck_number: str,
     *,
@@ -284,7 +302,11 @@ def load_flow_truck_insight(
             gantt_png_bytes=None,
             kit_insights_by_flow_name={},
         )
-    return parse_flow_probe_payload(payload)
+    insight = parse_flow_probe_payload(payload)
+    returned_truck = str(insight.truck_number or "").strip()
+    if returned_truck.casefold() != clean_truck.casefold():
+        return _truck_mismatch_insight(clean_truck, returned_truck)
+    return insight
 
 
 def flow_kit_insight_for_explorer_kit(

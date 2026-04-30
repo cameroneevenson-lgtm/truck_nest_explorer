@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ if str(RADAN_DIR) not in sys.path:
 import rpd_io  # type: ignore[import-not-found]
 from flow_bridge import (
     flow_kit_insight_for_explorer_kit,
+    load_flow_truck_insight,
     map_explorer_kit_to_flow_kit,
     normalize_flow_insight_for_local_release,
     parse_flow_probe_payload,
@@ -290,6 +292,80 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         untracked_insight = flow_kit_insight_for_explorer_kit("UNKNOWN KIT", truck_insight)
         self.assertEqual(untracked_insight.display_text, "Not tracked")
         self.assertEqual(untracked_insight.status_key, "missing")
+
+    def test_load_flow_truck_insight_rejects_payload_for_different_truck(self) -> None:
+        with workspace_tempdir() as temp_root:
+            flow_dir = temp_root / "flow"
+            flow_dir.mkdir()
+            probe_path = temp_root / "flow_schedule_probe.py"
+            probe_path.write_text("# probe placeholder\n", encoding="utf-8")
+
+            def runner(command, **kwargs):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "available": True,
+                            "truck_number": "F55334",
+                            "summary_text": "Flow plan 2026-02-09",
+                            "kits": [
+                                {
+                                    "flow_kit_name": "Body",
+                                    "display_text": "Complete",
+                                    "status_key": "green",
+                                }
+                            ],
+                        }
+                    ),
+                    stderr="",
+                )
+
+            with patch("flow_bridge.FLOW_APP_DIR", flow_dir), patch("flow_bridge.FLOW_PROBE_PATH", probe_path):
+                insight = load_flow_truck_insight("F54410", runner=runner)
+
+        self.assertFalse(insight.available)
+        self.assertEqual(insight.truck_number, "F54410")
+        self.assertEqual(insight.issue, "truck_mismatch")
+        self.assertEqual(insight.kit_insights_by_flow_name, {})
+        self.assertIn("F55334", insight.summary_text)
+        self.assertIn("F54410", insight.summary_text)
+
+    def test_load_flow_truck_insight_accepts_matching_payload_case_insensitively(self) -> None:
+        with workspace_tempdir() as temp_root:
+            flow_dir = temp_root / "flow"
+            flow_dir.mkdir()
+            probe_path = temp_root / "flow_schedule_probe.py"
+            probe_path.write_text("# probe placeholder\n", encoding="utf-8")
+
+            def runner(command, **kwargs):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "available": True,
+                            "truck_number": "F55334",
+                            "summary_text": "Flow plan 2026-02-09",
+                            "kits": [
+                                {
+                                    "flow_kit_name": "Body",
+                                    "display_text": "Complete",
+                                    "status_key": "green",
+                                }
+                            ],
+                        }
+                    ),
+                    stderr="",
+                )
+
+            with patch("flow_bridge.FLOW_APP_DIR", flow_dir), patch("flow_bridge.FLOW_PROBE_PATH", probe_path):
+                insight = load_flow_truck_insight("f55334", runner=runner)
+
+        self.assertTrue(insight.available)
+        self.assertEqual(insight.truck_number, "F55334")
+        self.assertEqual(
+            insight.kit_insights_by_flow_name["body"].display_text,
+            "Complete",
+        )
 
     def test_normalize_flow_insight_for_local_release_prefers_local_unreleased_signal(self) -> None:
         truck_insight = parse_flow_probe_payload(

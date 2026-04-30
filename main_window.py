@@ -1072,17 +1072,6 @@ class MainWindow(QMainWindow):
         )
         self.radan_project_update_slider.setEnabled(False)
         self.radan_project_update_right_label.setEnabled(False)
-        self.radan_part_limit_label = QLabel("Rows:")
-        self.radan_part_limit_left_label = QLabel("All")
-        self.radan_part_limit_right_label = QLabel("10")
-        self.radan_part_limit_slider = QSlider(Qt.Horizontal)
-        self.radan_part_limit_slider.setRange(0, 1)
-        self.radan_part_limit_slider.setSingleStep(1)
-        self.radan_part_limit_slider.setPageStep(1)
-        self.radan_part_limit_slider.setFixedWidth(52)
-        self.radan_part_limit_slider.setToolTip(
-            "Temporary test limiter: import only the first 10 importable CSV part rows."
-        )
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
         self.toggle_selected_kits_hidden_button.setToolTip(
             "Hide or unhide the selected kits in the explorer without deleting anything."
@@ -1113,10 +1102,6 @@ class MainWindow(QMainWindow):
         radan_row.addWidget(self.radan_project_update_left_label)
         radan_row.addWidget(self.radan_project_update_slider)
         radan_row.addWidget(self.radan_project_update_right_label)
-        radan_row.addWidget(self.radan_part_limit_label)
-        radan_row.addWidget(self.radan_part_limit_left_label)
-        radan_row.addWidget(self.radan_part_limit_slider)
-        radan_row.addWidget(self.radan_part_limit_right_label)
         radan_row.addWidget(self.import_csv_button)
         radan_row.addStretch(1)
 
@@ -1666,6 +1651,8 @@ class MainWindow(QMainWindow):
             self._current_flow_truck_insight = empty_flow_truck_insight()
             self._set_current_statuses([])
             return
+        self._load_flow_for_truck(truck_number)
+
         cached_statuses = self._status_cache_by_truck.get(truck_key)
         if cached_statuses is not None:
             self._set_current_statuses(list(cached_statuses))
@@ -1680,6 +1667,17 @@ class MainWindow(QMainWindow):
                 )
                 self._status_watch_timer.start()
 
+    def _loading_flow_insight(self, truck_number: str) -> FlowTruckInsight:
+        return FlowTruckInsight(
+            available=False,
+            truck_number=truck_number,
+            summary_text="Flow: loading...",
+            issue="loading",
+            tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
+        )
+
+    def _load_flow_for_truck(self, truck_number: str) -> None:
+        truck_key = truck_number.casefold()
         current_flow_token = flow_probe_cache_token()
         cached_flow = self._flow_cache_by_truck.get(truck_key)
         if cached_flow is not None:
@@ -1694,24 +1692,12 @@ class MainWindow(QMainWindow):
         if pending_flow is not None:
             _pending_truck_number, pending_token, _future = pending_flow
             if pending_token == current_flow_token:
-                self._current_flow_truck_insight = FlowTruckInsight(
-                    available=False,
-                    truck_number=truck_number,
-                    summary_text="Flow: loading...",
-                    issue="loading",
-                    tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
-                )
+                self._current_flow_truck_insight = self._loading_flow_insight(truck_number)
                 self._refresh_current_truck_heading()
                 return
             self._pending_flow_by_truck.pop(truck_key, None)
 
-        self._current_flow_truck_insight = FlowTruckInsight(
-            available=False,
-            truck_number=truck_number,
-            summary_text="Flow: loading...",
-            issue="loading",
-            tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
-        )
+        self._current_flow_truck_insight = self._loading_flow_insight(truck_number)
         self._refresh_current_truck_heading()
         self._pending_flow_by_truck[truck_key] = (
             truck_number,
@@ -1802,7 +1788,8 @@ class MainWindow(QMainWindow):
         cached_flow = self._flow_cache_by_truck.get(truck_key)
         if cached_flow is not None and cached_flow[0] == current_token:
             return
-        self._load_selected_truck()
+        self._load_flow_for_truck(truck_number)
+        self._render_current_statuses()
 
     def _render_current_statuses(self) -> None:
         previous_kit_name = self._current_status().kit_name if self._current_status() is not None else ""
@@ -3222,12 +3209,6 @@ class MainWindow(QMainWindow):
             and self.radan_project_update_slider.value() == 1
         ):
             project_update_method = "radan-nst"
-        max_parts = None
-        if (
-            getattr(self, "radan_part_limit_slider", None) is not None
-            and self.radan_part_limit_slider.value() == 1
-        ):
-            max_parts = 10
         status = self._current_status()
         if status is None:
             QMessageBox.information(self, title, "Select a kit first.")
@@ -3280,7 +3261,7 @@ class MainWindow(QMainWindow):
             return
         allow_visible_radan = False
         try:
-            missing_symbols = radan_csv_missing_symbols(csv_path, output_folder, max_parts=max_parts)
+            missing_symbols = radan_csv_missing_symbols(csv_path, output_folder)
         except Exception as exc:
             QMessageBox.warning(self, title, f"Could not inspect CSV symbols:\n{exc}")
             return
@@ -3343,7 +3324,6 @@ class MainWindow(QMainWindow):
                 preprocess_dxf_tolerance=0.002 if use_cleaned_dxf else None,
                 project_update_method=project_update_method,
                 refresh_project_sheets=True,
-                max_parts=max_parts,
             )
         except Exception as exc:
             log_dialog.mark_launch_failed(str(exc))
@@ -3356,15 +3336,14 @@ class MainWindow(QMainWindow):
         )
         log_dialog.set_process(process)
 
-        part_limit_text = " (first 10 rows)" if max_parts == 10 else ""
         if use_cleaned_dxf:
             self.log(
-                f"Launched RADAN CSV import for {csv_path.name}{part_limit_text} using cleaned L-side DXF working copies; "
+                f"Launched RADAN CSV import for {csv_path.name} using cleaned L-side DXF working copies; "
                 f"output folder is {output_folder}; project_update={project_update_method}; sheet_refresh=on."
             )
         else:
             self.log(
-                f"Launched RADAN CSV import for {csv_path.name}{part_limit_text}; "
+                f"Launched RADAN CSV import for {csv_path.name}; "
                 f"output folder is {output_folder}; "
                 f"project_update={project_update_method}; sheet_refresh=on."
             )
