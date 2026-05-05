@@ -495,8 +495,8 @@ def delete_paths(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], tuple[str, 
 
 class MainWindow(QMainWindow):
     FLOW_GANTT_HEIGHT = 176
-    ASSEMBLY_PACKET_BUILD_ENABLED = False
-    CUT_LIST_BUILD_ENABLED = False
+    ASSEMBLY_PACKET_BUILD_ENABLED = True
+    CUT_LIST_BUILD_ENABLED = True
     ASSEMBLY_PACKET_DISABLED_REASON = (
         "Assembly packet generation is paused because it is known to hang and is not production-ready yet."
     )
@@ -1026,15 +1026,13 @@ class MainWindow(QMainWindow):
         self.build_print_packet_button.clicked.connect(self.build_selected_print_packet)
         self.build_assembly_packet_button = QPushButton("Build Assembly Packet")
         self.build_assembly_packet_button.setToolTip(
-            self.ASSEMBLY_PACKET_DISABLED_REASON
+            "Build the .iam-backed assembly drawing packet from the selected kit's saved RPD."
         )
-        self.build_assembly_packet_button.setEnabled(False)
         self.build_assembly_packet_button.clicked.connect(self.build_selected_assembly_packet)
         self.build_cut_list_button = QPushButton("Build Cut List")
         self.build_cut_list_button.setToolTip(
-            self.CUT_LIST_DISABLED_REASON
+            "Build the non-laser cut list packet from the selected kit's saved RPD."
         )
-        self.build_cut_list_button.setEnabled(False)
         self.build_cut_list_button.clicked.connect(self.build_selected_cut_list_packet)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
