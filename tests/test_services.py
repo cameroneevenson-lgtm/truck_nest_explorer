@@ -81,6 +81,7 @@ from services import (
     run_inventor_to_radan_inline,
     release_text_for_status,
     resolve_existing_inventor_csv,
+    restore_truck_visibility,
     sort_truck_numbers_by_fabrication_order,
 )
 
@@ -1520,6 +1521,24 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertEqual(all_trucks, ["F55333", "F55334", "F55335"])
         self.assertTrue(is_hidden_truck("F55334", settings))
         self.assertFalse(is_hidden_truck("F55335", settings))
+
+    def test_restore_truck_visibility_unhides_truck_and_its_kits(self) -> None:
+        settings = ExplorerSettings(
+            hidden_trucks=["F55333", "f55334"],
+            hidden_kits=[
+                "F55334::BODY",
+                "F55334::PUMPHOUSE",
+                "F55335::BODY",
+            ],
+            kit_templates=["BODY | PAINT PACK", "PUMPHOUSE"],
+        )
+
+        removed_truck, removed_kit_count = restore_truck_visibility("f55334", settings)
+
+        self.assertTrue(removed_truck)
+        self.assertEqual(removed_kit_count, 2)
+        self.assertEqual(settings.hidden_trucks, ["F55333"])
+        self.assertEqual(settings.hidden_kits, ["F55335::PAINT PACK"])
 
     def test_sort_truck_numbers_uses_saved_fabrication_order(self) -> None:
         settings = ExplorerSettings(truck_order=["F55335", "f55333", "bad-value"])

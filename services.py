@@ -25,8 +25,10 @@ from models import (
     build_hidden_kit_key,
     build_kit_mappings,
     canonicalize_kit_name,
+    canonicalize_hidden_kit_entries,
     kit_name_variants,
     normalize_hidden_kit_entries,
+    normalize_hidden_truck_number,
     normalize_hidden_truck_entries,
     normalize_truck_order_entries,
 )
@@ -122,6 +124,33 @@ def is_hidden_kit(truck_number: str, kit_name: str, settings: ExplorerSettings) 
     if not wanted:
         return False
     return wanted in {value.casefold() for value in normalize_hidden_kit_entries(settings.hidden_kits)}
+
+
+def restore_truck_visibility(truck_number: str, settings: ExplorerSettings) -> tuple[bool, int]:
+    truck_key = normalize_hidden_truck_number(truck_number)
+    if not truck_key:
+        return False, 0
+
+    hidden_trucks = normalize_hidden_truck_entries(settings.hidden_trucks)
+    visible_trucks = [
+        value
+        for value in hidden_trucks
+        if value.casefold() != truck_key.casefold()
+    ]
+    removed_truck = len(visible_trucks) != len(hidden_trucks)
+
+    hidden_kits = canonicalize_hidden_kit_entries(settings.hidden_kits, settings.kit_templates)
+    hidden_kit_prefix = f"{truck_key}::".casefold()
+    visible_kits = [
+        value
+        for value in hidden_kits
+        if not value.casefold().startswith(hidden_kit_prefix)
+    ]
+    removed_kit_count = len(hidden_kits) - len(visible_kits)
+
+    settings.hidden_trucks = visible_trucks
+    settings.hidden_kits = visible_kits
+    return removed_truck, removed_kit_count
 
 
 def filter_truck_numbers(

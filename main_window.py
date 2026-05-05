@@ -97,6 +97,7 @@ from services import (
     radan_csv_import_lock_status,
     release_text_for_status,
     resolve_existing_inventor_csv,
+    restore_truck_visibility,
     run_inventor_to_radan_inline,
     sort_truck_numbers_by_fabrication_order,
     visible_radan_sessions,
@@ -561,6 +562,7 @@ class MainWindow(QMainWindow):
         self._flow_gantt_source_pixmap: QPixmap | None = None
         self._kitter_refresh_truck_number = ""
         self._kitter_refresh_remaining = 0
+        self._pending_truck_selection = ""
         self._truck_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_truck_future: Future[list[str]] | None = None
         self._truck_request_serial = 0
@@ -1625,7 +1627,10 @@ class MainWindow(QMainWindow):
                 item.setToolTip("\n".join(tooltip_parts))
             self.truck_list.addItem(item)
         self._refresh_show_hidden_trucks_button()
-        if current and not self._select_truck(current) and self.truck_list.count():
+        pending_selection = self._pending_truck_selection.strip()
+        if pending_selection and self._select_truck(pending_selection):
+            self._pending_truck_selection = ""
+        elif current and not self._select_truck(current) and self.truck_list.count():
             self.truck_list.setCurrentRow(0)
         self._refresh_hidden_action_labels()
         self._refresh_truck_order_buttons()
@@ -2406,7 +2411,15 @@ class MainWindow(QMainWindow):
         if not ok or not truck_number.strip():
             return
 
-        truck_text = truck_number.strip()
+        truck_text = normalize_hidden_truck_number(truck_number)
+        if not truck_text:
+            QMessageBox.warning(
+                self,
+                "Add Truck",
+                "Enter a truck number in the F##### format, for example F55985.",
+            )
+            return
+
         fabrication_truck_dir = find_fabrication_truck_dir(truck_text, self.settings)
         if fabrication_truck_dir is None:
             QMessageBox.warning(
@@ -2425,8 +2438,13 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 errors.append(f"{mapping.kit_name}: {exc}")
 
+        restored_hidden_truck, restored_hidden_kit_count = restore_truck_visibility(truck_text, self.settings)
+        if restored_hidden_truck or restored_hidden_kit_count:
+            self._save_hidden_state()
+
+        self._pending_truck_selection = truck_text
+        self.search_edit.clear()
         self.refresh_trucks()
-        self._select_truck(truck_text)
         if errors:
             QMessageBox.warning(
                 self,
@@ -2436,6 +2454,11 @@ class MainWindow(QMainWindow):
         self.log(
             f"Created L-side truck scaffold for {truck_text} using W folder {fabrication_truck_dir}. "
             f"Paths touched: {created_count}"
+            + (
+                f"; restored hidden truck and {restored_hidden_kit_count} hidden kit(s)."
+                if restored_hidden_truck or restored_hidden_kit_count
+                else "."
+            )
         )
 
     def create_missing_kits_for_selected_truck(self) -> None:
