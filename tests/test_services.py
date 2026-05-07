@@ -1414,7 +1414,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     entry_path=entry_path,
                     allow_visible_radan=True,
                     rebuild_symbols=True,
-                    native_sym_experimental=True,
+                    lab_symbol_writer=True,
                     d_record_view_height_threshold_guard=True,
                     preprocess_dxf_outer_profile=True,
                     preprocess_dxf_tolerance=0.002,
@@ -1433,7 +1433,8 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertNotIn("--kitter-launcher", command)
             self.assertIn("--allow-visible-radan", command)
             self.assertIn("--rebuild-symbols", command)
-            self.assertIn("--native-sym-experimental", command)
+            self.assertIn("--lab-symbol-writer", command)
+            self.assertNotIn("--native-sym-experimental", command)
             self.assertIn("--d-record-view-height-threshold-guard", command)
             self.assertIn("--preprocess-dxf-outer-profile", command)
             self.assertIn("--preprocess-dxf-tolerance", command)

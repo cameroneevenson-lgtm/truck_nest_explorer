@@ -1044,7 +1044,7 @@ class MainWindow(QMainWindow):
         self.launch_inventor_button.clicked.connect(self.run_selected_inventor_flow)
         self.import_csv_button = QPushButton("Import CSV")
         self.import_csv_button.setToolTip(
-            "Import the selected kit's generated _Radan.csv. Use the SYM slider to choose RADAN conversion or the lab native SYM writer."
+            "Import the selected kit's generated _Radan.csv. Use the SYM slider to choose RADAN conversion or the lab symbol writer."
         )
         self.import_csv_button.clicked.connect(lambda _checked=False: self.import_selected_csv_to_radan())
         self.radan_dxf_source_label = QLabel("DXF:")
@@ -1069,7 +1069,7 @@ class MainWindow(QMainWindow):
         self.radan_sym_writer_slider.setFixedWidth(52)
         self.radan_sym_writer_slider.setValue(0)
         self.radan_sym_writer_slider.setToolTip(
-            "Experimental: rebuild existing .sym files with the current lab native SYM writer and D-record height guard. "
+            "Experimental: rebuild existing .sym files with the current lab symbol writer and D-record height guard. "
             "Requires existing .sym templates for every CSV row."
         )
         self.radan_project_update_label = QLabel("Project:")
@@ -3243,7 +3243,7 @@ class MainWindow(QMainWindow):
             getattr(self, "radan_sym_writer_slider", None) is not None
             and self.radan_sym_writer_slider.value() == 1
         )
-        title = "Import CSV Lab SYM" if use_lab_sym_writer else "Import CSV to RADAN"
+        title = "Import CSV with Lab Writer" if use_lab_sym_writer else "Import CSV to RADAN"
         project_update_method = "direct-xml"
         if (
             getattr(self, "radan_project_update_slider", None) is not None
@@ -3334,7 +3334,7 @@ class MainWindow(QMainWindow):
             choice = QMessageBox.warning(
                 self,
                 title,
-                "This is the experimental lab native DXF-to-SYM writer path.\n\n"
+                "This is the experimental lab symbol writer path.\n\n"
                 "It will back up and overwrite the existing .sym files for every CSV row, using the current "
                 "heldout-context writer options including the D-record view height threshold guard. It does not use "
                 "oracle text or donor-created symbols, but it is still a lab candidate and must be verified before "
@@ -3347,7 +3347,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.No,
             )
             if choice != QMessageBox.Yes:
-                self.log("Lab SYM CSV import cancelled before launch.")
+                self.log("Lab symbol writer import cancelled before launch.")
                 return
             allow_visible_radan = bool(visible_sessions)
         elif missing_symbols or use_cleaned_dxf or project_update_method == "radan-nst":
@@ -3407,7 +3407,7 @@ class MainWindow(QMainWindow):
                 log_path=log_path,
                 allow_visible_radan=allow_visible_radan,
                 rebuild_symbols=use_cleaned_dxf or use_lab_sym_writer,
-                native_sym_experimental=use_lab_sym_writer,
+                lab_symbol_writer=use_lab_sym_writer,
                 d_record_view_height_threshold_guard=use_lab_sym_writer,
                 preprocess_dxf_outer_profile=use_cleaned_dxf,
                 preprocess_dxf_tolerance=0.002 if use_cleaned_dxf else None,
@@ -3428,7 +3428,7 @@ class MainWindow(QMainWindow):
         if use_lab_sym_writer:
             dxf_source_text = "cleaned L-side DXF working copies" if use_cleaned_dxf else "source DXFs"
             self.log(
-                f"Launched lab SYM CSV import for {csv_path.name} using {dxf_source_text}; "
+                f"Launched CSV import with lab symbol writer for {csv_path.name} using {dxf_source_text}; "
                 f"output folder is {output_folder}; project_update={project_update_method}; "
                 "d_record_height_guard=on; sheet_refresh=on."
             )

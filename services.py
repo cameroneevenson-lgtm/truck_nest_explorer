@@ -1088,6 +1088,7 @@ def launch_radan_csv_import(
     entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     allow_visible_radan: bool = False,
     rebuild_symbols: bool = False,
+    lab_symbol_writer: bool = False,
     native_sym_experimental: bool = False,
     d_record_view_height_threshold_guard: bool = False,
     preprocess_dxf_outer_profile: bool = False,
@@ -1125,8 +1126,8 @@ def launch_radan_csv_import(
         command.append("--allow-visible-radan")
     if rebuild_symbols:
         command.append("--rebuild-symbols")
-    if native_sym_experimental:
-        command.append("--native-sym-experimental")
+    if lab_symbol_writer or native_sym_experimental:
+        command.append("--lab-symbol-writer")
     if d_record_view_height_threshold_guard:
         command.append("--d-record-view-height-threshold-guard")
     if preprocess_dxf_outer_profile:
