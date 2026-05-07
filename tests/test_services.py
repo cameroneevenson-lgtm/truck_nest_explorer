@@ -1415,6 +1415,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     allow_visible_radan=True,
                     rebuild_symbols=True,
                     native_sym_experimental=True,
+                    d_record_view_height_threshold_guard=True,
                     preprocess_dxf_outer_profile=True,
                     preprocess_dxf_tolerance=0.002,
                     assign_project_colors=True,
@@ -1433,6 +1434,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn("--allow-visible-radan", command)
             self.assertIn("--rebuild-symbols", command)
             self.assertIn("--native-sym-experimental", command)
+            self.assertIn("--d-record-view-height-threshold-guard", command)
             self.assertIn("--preprocess-dxf-outer-profile", command)
             self.assertIn("--preprocess-dxf-tolerance", command)
             self.assertIn("0.002", command)
@@ -1476,6 +1478,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn("0.002", command)
             self.assertIn("--rebuild-symbols", command)
             self.assertNotIn("--native-sym-experimental", command)
+            self.assertNotIn("--d-record-view-height-threshold-guard", command)
             self.assertNotIn("--assign-project-colors", command)
 
     def test_discover_trucks_uses_release_root_only(self) -> None:
