@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-import html
 import json
 import subprocess
 import time
@@ -15,7 +14,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -37,11 +35,14 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from controllers.hot_reload_controller import HotReloadController
+from dialogs.import_log_dialog import ImportLogDialog
+from dialogs.inventor_report_review_dialog import InventorReportReviewDialog, delete_paths
+from dialogs.multiline_editor_dialog import MultilineEditorDialog
 from packet_build_service import (
     PacketBuildReadinessError,
     build_assembly_packet,
@@ -103,6 +104,7 @@ from services import (
     visible_radan_sessions,
 )
 from settings_store import load_settings, save_settings
+from ui.main_window_styles import dashboard_stylesheet
 
 
 @dataclass
@@ -118,379 +120,6 @@ class PendingInventorJob:
     last_output_signature: tuple[tuple[str, int, int], ...] | None = None
     stable_polls: int = 0
     launcher_exit_code: int | None = None
-
-
-class MultilineEditorDialog(QDialog):
-    def __init__(self, title: str, value: str, helper_text: str, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(760, 520)
-
-        helper = QLabel(helper_text)
-        helper.setWordWrap(True)
-
-        self.editor = QPlainTextEdit()
-        self.editor.setPlainText(value)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(helper)
-        layout.addWidget(self.editor, 1)
-        layout.addWidget(buttons)
-
-    def value(self) -> str:
-        return self.editor.toPlainText()
-
-
-class ImportLogDialog(QDialog):
-    def __init__(self, log_path: Path, parent: QWidget | None = None, completion_callback=None):
-        super().__init__(parent)
-        self.log_path = log_path
-        self._process: subprocess.Popen[object] | None = None
-        self._process_assigned = False
-        self._completed = False
-        self._completion_callback = completion_callback
-        self._completion_notified = False
-        self.setWindowTitle("RADAN CSV Import Log")
-        self.resize(900, 520)
-
-        self.label = QLabel(str(log_path))
-        self.label.setWordWrap(True)
-        self.helper_label = QLabel("Import is running. This window will stay open until the helper finishes.")
-        self.helper_label.setWordWrap(True)
-        self.helper_label.setStyleSheet("color: #64748B;")
-
-        self.viewer = QPlainTextEdit()
-        self.viewer.setReadOnly(True)
-        self.viewer.setPlaceholderText("Waiting for the RADAN import helper to write progress...")
-
-        self.close_button = QPushButton("Running...")
-        self.close_button.setEnabled(False)
-        self.close_button.clicked.connect(self.close)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.label)
-        layout.addWidget(self.helper_label)
-        layout.addWidget(self.viewer, 1)
-        layout.addWidget(self.close_button)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(500)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-        self.refresh_log()
-
-    @property
-    def is_complete(self) -> bool:
-        return self._completed
-
-    @property
-    def process_id(self) -> int | None:
-        if self._process is None:
-            return None
-        return int(self._process.pid)
-
-    def set_process(self, process: subprocess.Popen[object]) -> None:
-        self._process = process
-        self._process_assigned = True
-        self._completed = False
-        self.helper_label.setText("Import is running. This window will stay open until the helper finishes.")
-        self.helper_label.setStyleSheet("color: #64748B;")
-        self.close_button.setText("Running...")
-        self.close_button.setEnabled(False)
-        self._refresh_process_state()
-
-    def mark_launch_failed(self, message: str) -> None:
-        detail = message.strip() or "The import helper could not be launched."
-        self._process = None
-        self._process_assigned = True
-        self._mark_complete(f"Import did not launch: {detail}", success=False)
-
-    def force_close(self) -> None:
-        self._completed = True
-        self.close()
-
-    def reject(self) -> None:
-        if not self._completed:
-            self.raise_()
-            self.activateWindow()
-            return
-        super().reject()
-
-    def closeEvent(self, event) -> None:
-        if not self._completed:
-            event.ignore()
-            self.raise_()
-            self.activateWindow()
-            return
-        super().closeEvent(event)
-
-    def _tick(self) -> None:
-        self.refresh_log()
-        self._refresh_process_state()
-
-    def refresh_log(self) -> None:
-        try:
-            text = self.log_path.read_text(encoding="utf-8")
-        except OSError:
-            text = "Starting RADAN import helper..."
-        if self.viewer.toPlainText() == text:
-            return
-        scrollbar = self.viewer.verticalScrollBar()
-        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
-        self.viewer.setPlainText(text)
-        if was_at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
-
-    def _refresh_process_state(self) -> None:
-        if self._completed or not self._process_assigned or self._process is None:
-            return
-        return_code = self._process.poll()
-        if return_code is None:
-            return
-        if return_code == 0:
-            self._mark_complete("Import helper finished successfully. Review the log, then dismiss this window.", success=True)
-        else:
-            self._mark_complete(
-                f"Import helper finished with exit code {return_code}. Review the log, then dismiss this window.",
-                success=False,
-            )
-
-    def _mark_complete(self, message: str, *, success: bool) -> None:
-        self.refresh_log()
-        self._completed = True
-        self.helper_label.setText(message)
-        self.helper_label.setStyleSheet("color: #15803D;" if success else "color: #B91C1C; font-weight: 700;")
-        self.close_button.setText("Dismiss")
-        self.close_button.setEnabled(True)
-        self._timer.stop()
-        if not self._completion_notified and callable(self._completion_callback):
-            self._completion_notified = True
-            self._completion_callback(self)
-
-
-class InventorReportReviewDialog(QDialog):
-    REVIEW_SECTION_LEVELS = {
-        "Expected laser but missing DXF": "red",
-        "Orphan DXFs": "yellow",
-        "DXFs missing PDFs": "yellow",
-        "Non-laser parts": "yellow",
-    }
-
-    def __init__(self, report_path: Path, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.report_path = report_path
-        self._acknowledged = False
-        self.rejected_without_ack = False
-        self.setWindowTitle("Review Inventor-to-RADAN Report")
-        self.resize(920, 680)
-
-        title = QLabel("Review required before production use")
-        title.setStyleSheet("font-weight: 700;")
-        title.setWordWrap(True)
-
-        report_text = self._read_report_text()
-        critical_count, review_count = self._warning_counts(report_text)
-        if critical_count:
-            detail_text = (
-                f"This report contains {critical_count} critical line(s) and "
-                f"{review_count} review line(s). "
-                "Read the report below before acknowledging completion."
-            )
-            detail_style = "color: #B91C1C; font-weight: 700;"
-        elif review_count:
-            detail_text = (
-                f"This report contains {review_count} line(s) to check. "
-                "Read the yellow sections below before acknowledging completion."
-            )
-            detail_style = "color: #A16207; font-weight: 700;"
-        else:
-            detail_text = "No report warnings were found. Review the green confirmation sections before continuing."
-            detail_style = "color: #15803D; font-weight: 700;"
-        detail = QLabel(detail_text)
-        detail.setWordWrap(True)
-        detail.setStyleSheet(detail_style)
-
-        path_label = QLabel(str(report_path))
-        path_label.setWordWrap(True)
-        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        self.viewer = QTextEdit()
-        self.viewer.setReadOnly(True)
-        self.viewer.setLineWrapMode(QTextEdit.NoWrap)
-        self.viewer.setHtml(self._report_html(report_text))
-
-        self.ack_checkbox = QCheckBox(
-            "I have reviewed this report and understand any warnings before production."
-        )
-        self.ack_checkbox.stateChanged.connect(self._update_ack_button)
-
-        self.open_button = QPushButton("Open Report File")
-        self.open_button.clicked.connect(self.open_report)
-        self.ack_button = QPushButton("Acknowledge Report")
-        self.ack_button.setEnabled(False)
-        self.ack_button.clicked.connect(self.accept)
-        self.discard_button = QPushButton("Discard CSV/Report")
-        self.discard_button.clicked.connect(self.reject)
-
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.open_button)
-        button_row.addWidget(self.discard_button)
-        button_row.addWidget(self.ack_button)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(title)
-        layout.addWidget(detail)
-        layout.addWidget(path_label)
-        layout.addWidget(self.viewer, 1)
-        layout.addWidget(self.ack_checkbox)
-        layout.addLayout(button_row)
-
-    def _read_report_text(self) -> str:
-        try:
-            return self.report_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            return f"Could not read report file:\n{exc}"
-
-    @classmethod
-    def _warning_counts(cls, report_text: str) -> tuple[int, int]:
-        critical_count = 0
-        review_count = 0
-        active_section = ""
-        active_level = ""
-        for line in report_text.splitlines():
-            stripped = line.strip()
-            if stripped.endswith(":"):
-                active_section = stripped
-                active_level = ""
-                for section, level in cls.REVIEW_SECTION_LEVELS.items():
-                    if active_section.startswith(section):
-                        active_level = level
-                        break
-                continue
-            if not stripped or stripped == "(none)":
-                continue
-            if active_level == "red":
-                critical_count += 1
-            elif active_level == "yellow":
-                review_count += 1
-        return critical_count, review_count
-
-    @classmethod
-    def _report_html(cls, report_text: str) -> str:
-        colors = {
-            "base": "#111827",
-            "muted": "#475569",
-            "green": "#15803D",
-            "yellow": "#A16207",
-            "red": "#B91C1C",
-        }
-        active_level = ""
-        rows: list[str] = []
-        for line in report_text.splitlines():
-            stripped = line.strip()
-            if stripped.endswith(":"):
-                active_level = ""
-                for section, level in cls.REVIEW_SECTION_LEVELS.items():
-                    if stripped.startswith(section):
-                        active_level = level
-                        break
-                color = colors.get(active_level, colors["base"])
-                weight = "700" if active_level else "600"
-            elif stripped == "(none)" and active_level:
-                color = colors["green"]
-                weight = "700"
-            elif stripped and active_level:
-                color = colors[active_level]
-                weight = "700"
-            elif stripped:
-                color = colors["base"]
-                weight = "400"
-            else:
-                color = colors["muted"]
-                weight = "400"
-            rows.append(
-                "<div style='white-space: pre-wrap; "
-                f"color: {color}; font-weight: {weight};'>"
-                f"{html.escape(line) or '&nbsp;'}</div>"
-            )
-        body = "\n".join(rows)
-        return (
-            "<html><body style='font-family: Consolas, monospace; "
-            "font-size: 10pt; background: #FFFFFF;'>"
-            f"{body}</body></html>"
-        )
-
-    def _update_ack_button(self) -> None:
-        self.ack_button.setEnabled(self.ack_checkbox.isChecked())
-
-    def open_report(self) -> None:
-        try:
-            open_path(self.report_path)
-        except Exception as exc:
-            QMessageBox.warning(self, "Open Report", str(exc))
-
-    def accept(self) -> None:
-        if not self.ack_checkbox.isChecked():
-            QMessageBox.warning(
-                self,
-                "Review Required",
-                "Review the report and check the acknowledgement before continuing.",
-            )
-            return
-        self._acknowledged = True
-        super().accept()
-
-    def reject(self) -> None:
-        if not self._acknowledged:
-            choice = QMessageBox.question(
-                self,
-                "Discard Inventor Output?",
-                "Close without acknowledging this report?\n\n"
-                "The generated RADAN CSV and report will be deleted.",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if choice != QMessageBox.Yes:
-                return
-            self.rejected_without_ack = True
-            super().reject()
-            return
-        super().reject()
-
-    def closeEvent(self, event) -> None:
-        if self._acknowledged:
-            event.accept()
-            return
-        choice = QMessageBox.question(
-            self,
-            "Discard Inventor Output?",
-            "Close without acknowledging this report?\n\n"
-            "The generated RADAN CSV and report will be deleted.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if choice == QMessageBox.Yes:
-            self.rejected_without_ack = True
-            event.accept()
-            return
-        event.ignore()
-
-
-def delete_paths(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], tuple[str, ...]]:
-    deleted: list[Path] = []
-    failed: list[str] = []
-    for path in paths:
-        try:
-            if path.exists():
-                path.unlink()
-                deleted.append(path)
-        except OSError as exc:
-            failed.append(f"{path}: {exc}")
-    return tuple(deleted), tuple(failed)
 
 
 class MainWindow(QMainWindow):
@@ -551,6 +180,7 @@ class MainWindow(QMainWindow):
         self._hot_reload_cancel_button: QPushButton | None = None
         self._hot_reload_timer = None
         self._hot_reload_end_time: float | None = None
+        self._hot_reload_controller = HotReloadController(self, self._runtime_dir)
         self._updating_kit_table = False
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
         self._pending_inventor_job: PendingInventorJob | None = None
@@ -608,35 +238,7 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(10)
 
         if self._hot_reload_enabled:
-            self._hot_reload_request_path = self._runtime_dir / "_runtime" / "hot_reload_request.json"
-            self._hot_reload_response_path = self._runtime_dir / "_runtime" / "hot_reload_response.json"
-
-            hot_reload_bar = QFrame()
-            hot_reload_bar.setVisible(False)
-            hot_reload_bar.setFixedHeight(36)
-            hot_reload_bar.setStyleSheet(
-                "QFrame { background: #fff4cf; border: 1px solid #d7be6f; border-radius: 6px; }"
-                "QLabel { color: #4f3f07; background: transparent; border: none; }"
-            )
-            hot_reload_layout = QHBoxLayout(hot_reload_bar)
-            hot_reload_layout.setContentsMargins(10, 3, 10, 3)
-            hot_reload_layout.setSpacing(8)
-            hot_reload_label = QLabel("Hot reload requested.")
-            hot_reload_label.setStyleSheet("font-size: 13px; font-weight: 700;")
-            hot_reload_accept_button = QPushButton("Accept Reload")
-            hot_reload_accept_button.setMinimumHeight(24)
-            hot_reload_accept_button.clicked.connect(self._accept_hot_reload_from_banner)
-            hot_reload_cancel_button = QPushButton("Cancel Reload")
-            hot_reload_cancel_button.setMinimumHeight(24)
-            hot_reload_cancel_button.clicked.connect(self._cancel_hot_reload_from_banner)
-            hot_reload_layout.addWidget(hot_reload_label)
-            hot_reload_layout.addWidget(hot_reload_accept_button)
-            hot_reload_layout.addWidget(hot_reload_cancel_button)
-            root_layout.addWidget(hot_reload_bar)
-            self._hot_reload_bar = hot_reload_bar
-            self._hot_reload_label = hot_reload_label
-            self._hot_reload_accept_button = hot_reload_accept_button
-            self._hot_reload_cancel_button = hot_reload_cancel_button
+            self._hot_reload_controller.build_banner(root_layout)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left_panel())
@@ -653,141 +255,7 @@ class MainWindow(QMainWindow):
             self._poll_hot_reload_request()
 
     def _apply_dashboard_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget#main_root {
-                background-color: #EEF3F8;
-            }
-            QGroupBox {
-                background-color: #F8FAFC;
-                border: 1px solid #D5DEE7;
-                border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 10px;
-                color: #0F172A;
-                font-weight: 600;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 12px;
-                padding: 0 4px;
-                background-color: #F8FAFC;
-                color: #0F172A;
-                font-size: 14px;
-                font-weight: 700;
-            }
-            QPushButton {
-                color: #0F172A;
-                background-color: #FFFFFF;
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover {
-                background-color: #F1F5F9;
-                border-color: #94A3B8;
-            }
-            QPushButton:pressed {
-                background-color: #E2E8F0;
-            }
-            QPushButton:checked {
-                background-color: #DBEAFE;
-                border-color: #60A5FA;
-            }
-            QPushButton:disabled {
-                color: #94A3B8;
-                background-color: #F8FAFC;
-                border-color: #E2E8F0;
-            }
-            QLineEdit, QPlainTextEdit {
-                color: #0F172A;
-                background-color: #FFFFFF;
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-                padding: 6px 8px;
-            }
-            QListWidget#truck_list, QTableWidget#kit_table {
-                background: #FFFFFF;
-                color: #0F172A;
-                alternate-background-color: #F8FAFC;
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-                gridline-color: #E2E8F0;
-                selection-color: #0F172A;
-            }
-            QListWidget#truck_list {
-                selection-background-color: #E2E8F0;
-            }
-            QListWidget#truck_list::item:selected {
-                background: #E2E8F0;
-                color: #0F172A;
-            }
-            QTableWidget#kit_table {
-                selection-background-color: rgba(148, 163, 184, 0.18);
-            }
-            QTableWidget#kit_table QLineEdit {
-                padding: 2px 6px;
-                margin: 0px;
-            }
-            QTableWidget#kit_table::item:selected {
-                background: rgba(148, 163, 184, 0.18);
-                color: #0F172A;
-            }
-            QTableWidget#kit_table::item:hover {
-                background: rgba(226, 232, 240, 0.20);
-                color: #0F172A;
-            }
-            QListWidget#truck_list::item:hover {
-                background: #EEF4FB;
-                color: #0F172A;
-            }
-            QHeaderView::section, QTableCornerButton::section {
-                background: #E2E8F0;
-                color: #334155;
-                border: 1px solid #CBD5E1;
-                padding: 6px;
-                font-weight: 700;
-            }
-            QLabel {
-                color: #334155;
-            }
-            QCheckBox {
-                color: #334155;
-                spacing: 6px;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #94A3B8;
-                border-radius: 3px;
-                background: #FFFFFF;
-            }
-            QCheckBox::indicator:checked {
-                background: #93C5FD;
-                border-color: #60A5FA;
-            }
-            QSplitter::handle {
-                background: #E2E8F0;
-            }
-            QStatusBar {
-                background: #F8FAFC;
-                color: #475569;
-                border-top: 1px solid #D5DEE7;
-            }
-            QStatusBar::item {
-                border: none;
-            }
-            QScrollArea#flow_gantt_scroll {
-                background: #FFFFFF;
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-            }
-            QLabel#flow_gantt_label {
-                background: #FFFFFF;
-            }
-            """
-        )
+        self.setStyleSheet(dashboard_stylesheet())
 
     def timerEvent(self, event):  # type: ignore[override]
         if self._hot_reload_timer is not None and event.timerId() == self._hot_reload_timer:
@@ -2751,7 +2219,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_packet_statuses(self, status: KitStatus) -> None:
         if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
-            self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
+            self._queue_status_refresh_for_truck(status.paths.truck_number)
 
     def _queue_status_refresh_for_truck(self, truck_number: str) -> bool:
         truck_text = str(truck_number or "").strip()
@@ -2851,8 +2319,8 @@ class MainWindow(QMainWindow):
             _set_progress(int(done), status_text)
 
         def _on_done(packet_path: str, pages: int, missing: int) -> None:
-            self._refresh_packet_statuses(status)
             _cleanup()
+            self._refresh_packet_statuses(status)
             try:
                 open_path(Path(packet_path))
             except Exception:
@@ -3643,112 +3111,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 8000)
 
     def _poll_hot_reload_request(self) -> None:
-        if not self._hot_reload_enabled:
-            return
-        if self._hot_reload_request_path is None:
-            return
-
-        if not self._hot_reload_request_path.exists():
-            if self._hot_reload_request_id:
-                self._hot_reload_request_id = ""
-                self._hot_reload_canceled_request_id = ""
-                self._clear_hot_reload_banner()
-            return
-
-        request = self._read_hot_reload_request()
-        request_id = str(request.get("request_id", "")).strip()
-        if not request_id:
-            return
-        if request_id == self._hot_reload_canceled_request_id:
-            return
-        if request_id != self._hot_reload_request_id:
-            self._hot_reload_request_id = request_id
-            self._hot_reload_canceled_request_id = ""
-            ts_epoch = request.get("ts_epoch", 0)
-            timeout_sec = request.get("decision_timeout_sec", 10.0)
-            try:
-                ts_float = float(ts_epoch)
-            except (TypeError, ValueError):
-                ts_float = float(time.time())
-            try:
-                timeout_float = max(1.0, float(timeout_sec))
-            except (TypeError, ValueError):
-                timeout_float = 10.0
-            self._hot_reload_end_time = ts_float + timeout_float
-
-        now = float(time.time())
-        end_time = self._hot_reload_end_time
-        if end_time is None:
-            end_time = now + 10.0
-            self._hot_reload_end_time = end_time
-
-        file_count = request.get("change_count", None)
-        files = request.get("files", [])
-        seconds_remaining = max(0, int(end_time - now))
-        file_text = f"{int(file_count)} file(s)" if isinstance(file_count, int) else "update(s)"
-        if self._hot_reload_label is None:
-            return
-        if isinstance(files, list) and files:
-            sample = ", ".join(str(x) for x in files[:3])
-            if len(files) > 3:
-                sample += ", ..."
-            self._hot_reload_label.setText(
-                f"Hot reload requested ({file_text}). Auto-reload in {seconds_remaining}s unless canceled. "
-                f"Click Accept Reload to apply now. Sample: {sample}"
-            )
-        else:
-            self._hot_reload_label.setText(
-                f"Hot reload requested ({file_text}). Auto-reload in {seconds_remaining}s unless canceled. "
-                f"Click Accept Reload to apply now."
-            )
-        if self._hot_reload_bar is not None:
-            self._hot_reload_bar.setVisible(True)
+        self._hot_reload_controller.poll_request()
 
     def _read_hot_reload_request(self) -> dict[str, str | int | float | list[str]]:
-        if self._hot_reload_request_path is None or not self._hot_reload_request_path.exists():
-            return {}
-        try:
-            with self._hot_reload_request_path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        out: dict[str, str | int | float | list[str]] = {}
-        for key in ("request_id", "ts_epoch", "decision_timeout_sec", "change_count", "files"):
-            if key not in payload:
-                continue
-            out[key] = payload[key]  # type: ignore[assignment]
-        return out
+        return self._hot_reload_controller.read_request()
 
     def _clear_hot_reload_banner(self) -> None:
-        if self._hot_reload_bar is not None:
-            self._hot_reload_bar.setVisible(False)
+        self._hot_reload_controller.clear_banner()
 
     def _accept_hot_reload_from_banner(self) -> None:
-        if not self._hot_reload_request_id:
-            return
-        self._write_hot_reload_response("accept")
-        self._clear_hot_reload_banner()
-        self.statusBar().showMessage("Hot reload accepted; restarting app.", 3000)
+        self._hot_reload_controller.accept_from_banner()
 
     def _cancel_hot_reload_from_banner(self) -> None:
-        if not self._hot_reload_request_id:
-            return
-        self._write_hot_reload_response("reject")
-        self._hot_reload_canceled_request_id = self._hot_reload_request_id
-        self._clear_hot_reload_banner()
-        self.statusBar().showMessage("Hot reload canceled for current change batch.", 3000)
+        self._hot_reload_controller.cancel_from_banner()
 
     def _write_hot_reload_response(self, action: str) -> None:
-        if not self._hot_reload_response_path or not self._hot_reload_request_id:
-            return
-        payload = {
-            "request_id": self._hot_reload_request_id,
-            "action": str(action or "").strip().lower(),
-        }
-        try:
-            self._hot_reload_response_path.parent.mkdir(parents=True, exist_ok=True)
-            self._hot_reload_response_path.write_text(json.dumps(payload), encoding="utf-8")
-        except OSError:
-            return
+        self._hot_reload_controller.write_response(action)

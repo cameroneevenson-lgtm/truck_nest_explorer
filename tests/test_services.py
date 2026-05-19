@@ -1305,12 +1305,14 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
             batch = tool_dir / "inventor_to_radan.bat"
             batch.write_text("@echo off\n", encoding="utf-8")
+            (tool_dir / "bom_reader.py").write_text("ADDED_COUNT = 3\n", encoding="utf-8")
             (tool_dir / "inventor_to_radan.py").write_text(
+                "import bom_reader\n"
                 "from types import SimpleNamespace\n"
                 "def convert_bom_to_radan_csv(path, *, allow_prompts, show_summary):\n"
                 "    if allow_prompts or show_summary:\n"
                 "        raise AssertionError('inline mode should not prompt')\n"
-                "    return SimpleNamespace(added_count=3, bom_path=path)\n",
+                "    return SimpleNamespace(added_count=bom_reader.ADDED_COUNT, bom_path=path)\n",
                 encoding="utf-8",
             )
 
@@ -1318,6 +1320,53 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(result.added_count, 3)
             self.assertEqual(result.bom_path, str(spreadsheet))
+
+    def test_run_inventor_to_radan_inline_prefers_inventor_dialog_package(self) -> None:
+        saved_path = list(sys.path)
+        saved_dialog_modules = {
+            name: sys.modules[name]
+            for name in list(sys.modules)
+            if name == "dialogs" or name.startswith("dialogs.")
+        }
+        try:
+            for name in saved_dialog_modules:
+                sys.modules.pop(name, None)
+
+            with workspace_tempdir() as temp_root:
+                foreign_root = temp_root / "foreign"
+                foreign_dialogs = foreign_root / "dialogs"
+                foreign_dialogs.mkdir(parents=True)
+                (foreign_dialogs / "__init__.py").write_text("ORIGIN = 'foreign'\n", encoding="utf-8")
+                sys.path.insert(0, str(foreign_root))
+                foreign_module = __import__("dialogs")
+                self.assertEqual(foreign_module.ORIGIN, "foreign")
+
+                tool_dir = temp_root / "inventor_to_radan"
+                tool_dialogs = tool_dir / "dialogs"
+                tool_dialogs.mkdir(parents=True)
+                spreadsheet = temp_root / "bom.csv"
+                spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
+                entry = tool_dir / "inventor_to_radan.py"
+                (tool_dialogs / "__init__.py").write_text("", encoding="utf-8")
+                (tool_dialogs / "missing_dxf_dialog.py").write_text("VALUE = 'inventor'\n", encoding="utf-8")
+                entry.write_text(
+                    "from dialogs.missing_dxf_dialog import VALUE\n"
+                    "from types import SimpleNamespace\n"
+                    "def convert_bom_to_radan_csv(path, *, allow_prompts, show_summary):\n"
+                    "    return SimpleNamespace(dialog_value=VALUE)\n",
+                    encoding="utf-8",
+                )
+
+                result = run_inventor_to_radan_inline(entry, spreadsheet)
+
+                self.assertEqual(result.dialog_value, "inventor")
+                self.assertIs(sys.modules.get("dialogs"), foreign_module)
+                self.assertNotIn("dialogs.missing_dxf_dialog", sys.modules)
+        finally:
+            sys.path[:] = saved_path
+            for name in [name for name in sys.modules if name == "dialogs" or name.startswith("dialogs.")]:
+                sys.modules.pop(name, None)
+            sys.modules.update(saved_dialog_modules)
 
     def test_run_inventor_to_radan_inline_wraps_prompt_required_signal(self) -> None:
         with workspace_tempdir() as temp_root:

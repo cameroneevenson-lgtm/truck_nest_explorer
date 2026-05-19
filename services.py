@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 from models import (
@@ -900,6 +901,33 @@ def _inventor_to_radan_module_path(entry_path: Path) -> Path:
     return entry_path.parent / "inventor_to_radan.py"
 
 
+_INVENTOR_INLINE_IMPORT_NAMES = {"bom_reader", "config", "dialogs", "report_writer", "rule_store"}
+
+
+def _is_inventor_inline_import_name(module_name: str) -> bool:
+    return module_name in _INVENTOR_INLINE_IMPORT_NAMES or module_name.startswith("dialogs.")
+
+
+@contextmanager
+def _inventor_inline_import_context(module_dir: Path):
+    previous_sys_path = list(sys.path)
+    previous_modules = {
+        name: sys.modules[name]
+        for name in list(sys.modules)
+        if _is_inventor_inline_import_name(name)
+    }
+    for name in previous_modules:
+        sys.modules.pop(name, None)
+    sys.path.insert(0, str(module_dir))
+    try:
+        yield
+    finally:
+        for name in [name for name in sys.modules if _is_inventor_inline_import_name(name)]:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.path[:] = previous_sys_path
+
+
 def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path | str) -> object:
     entry = Path(str(entry_path))
     spreadsheet = Path(str(spreadsheet_path))
@@ -919,40 +947,41 @@ def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path 
 
     module = importlib.util.module_from_spec(spec)
     previous_module = sys.modules.get(module_name)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        if previous_module is not None:
-            sys.modules[module_name] = previous_module
-        else:
-            sys.modules.pop(module_name, None)
+    with _inventor_inline_import_context(module_path.parent):
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
 
-    converter = getattr(module, "convert_bom_to_radan_csv", None)
-    if not callable(converter):
-        raise RuntimeError(
-            f"{module_path} does not expose convert_bom_to_radan_csv(). "
-            "Use the external launcher for this version."
-        )
+            converter = getattr(module, "convert_bom_to_radan_csv", None)
+            if not callable(converter):
+                raise RuntimeError(
+                    f"{module_path} does not expose convert_bom_to_radan_csv(). "
+                    "Use the external launcher for this version."
+                )
 
-    try:
-        return converter(str(spreadsheet), allow_prompts=False, show_summary=False)
-    except Exception as exc:
-        if exc.__class__.__name__ != "InventorToRadanNeedsUi":
-            raise
-        missing_dxf_items = getattr(exc, "missing_dxf_items", ()) or ()
-        missing_rules = getattr(exc, "missing_rules", ()) or ()
-        parts: list[str] = []
-        if missing_dxf_items:
-            parts.append(f"{len(missing_dxf_items)} missing-DXF classification(s)")
-        if missing_rules:
-            parts.append(f"{len(missing_rules)} RADAN rule(s)")
-        detail = " and ".join(parts) if parts else "user input"
-        raise InventorToRadanInlineNeedsUi(
-            f"Inline conversion needs {detail}.",
-            missing_dxf_count=len(missing_dxf_items),
-            missing_rule_count=len(missing_rules),
-        ) from exc
+            try:
+                return converter(str(spreadsheet), allow_prompts=False, show_summary=False)
+            except Exception as exc:
+                if exc.__class__.__name__ != "InventorToRadanNeedsUi":
+                    raise
+                missing_dxf_items = getattr(exc, "missing_dxf_items", ()) or ()
+                missing_rules = getattr(exc, "missing_rules", ()) or ()
+                parts: list[str] = []
+                if missing_dxf_items:
+                    parts.append(f"{len(missing_dxf_items)} missing-DXF classification(s)")
+                if missing_rules:
+                    parts.append(f"{len(missing_rules)} RADAN rule(s)")
+                detail = " and ".join(parts) if parts else "user input"
+                raise InventorToRadanInlineNeedsUi(
+                    f"Inline conversion needs {detail}.",
+                    missing_dxf_count=len(missing_dxf_items),
+                    missing_rule_count=len(missing_rules),
+                ) from exc
+        finally:
+            if previous_module is not None:
+                sys.modules[module_name] = previous_module
+            else:
+                sys.modules.pop(module_name, None)
 
 
 def radan_csv_missing_symbols(
