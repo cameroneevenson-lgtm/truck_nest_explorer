@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 from models import (
@@ -46,6 +45,7 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 """
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
+FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
 
@@ -111,6 +111,59 @@ def normalize_kit_templates(values: list[str]) -> list[str]:
 
 def configured_kit_mappings(settings: ExplorerSettings) -> list[KitMapping]:
     return build_kit_mappings(settings.kit_templates)
+
+
+def _truthy_registry_value(value: object) -> bool:
+    text = clean_text(value).casefold()
+    if not text:
+        return True
+    return text not in {"0", "false", "no", "n", "inactive", "archived"}
+
+
+def active_registered_truck_numbers(registry_path: Path | str | None = None) -> set[str]:
+    path = Path(str(registry_path)) if registry_path is not None else FLOW_TRUCK_REGISTRY_PATH
+    if not path.exists():
+        return set()
+    numbers: set[str] = set()
+    try:
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                truck = normalize_hidden_truck_number(row.get("truck_number", ""))
+                if not truck:
+                    continue
+                if not _truthy_registry_value(row.get("is_active", "1")):
+                    continue
+                numbers.add(truck.upper())
+    except OSError:
+        return set()
+    return numbers
+
+
+def is_release_truck_discoverable(
+    truck_number: str,
+    release_truck_dir: Path | str | None,
+    settings: ExplorerSettings,
+) -> bool:
+    truck = normalize_hidden_truck_number(truck_number)
+    if not truck or not TRUCK_FOLDER_PATTERN.fullmatch(truck):
+        return False
+    if release_truck_dir is None or not Path(str(release_truck_dir)).exists():
+        return False
+    registered_trucks = active_registered_truck_numbers()
+    if registered_trucks:
+        return truck.upper() in registered_trucks
+    return True
+
+
+def assert_truck_scaffold_allowed(truck_number: str, settings: ExplorerSettings) -> None:
+    truck = normalize_hidden_truck_number(truck_number)
+    registered_trucks = active_registered_truck_numbers()
+    if not registered_trucks or truck.upper() in registered_trucks:
+        return
+    raise RuntimeError(
+        f"Refusing to create kit scaffolds for {truck or truck_number}. "
+        f"It is not listed as an active whole-truck job in {FLOW_TRUCK_REGISTRY_PATH}."
+    )
 
 
 def is_hidden_truck(truck_number: str, settings: ExplorerSettings) -> bool:
@@ -334,7 +387,9 @@ def discover_trucks(settings: ExplorerSettings) -> list[str]:
         with os.scandir(root) as entries:
             for entry in entries:
                 try:
-                    if entry.is_dir() and TRUCK_FOLDER_PATTERN.fullmatch(entry.name):
+                    if not entry.is_dir():
+                        continue
+                    if is_release_truck_discoverable(entry.name, Path(entry.path), settings):
                         names.add(entry.name)
                 except OSError:
                     continue
@@ -522,6 +577,7 @@ def create_kit_scaffold(
     kit_name: str,
     settings: ExplorerSettings,
 ) -> ScaffoldResult:
+    assert_truck_scaffold_allowed(truck_number, settings)
     paths = build_kit_paths(truck_number, kit_name, settings)
     if paths.release_truck_dir is None or paths.release_kit_dir is None or paths.project_dir is None:
         raise ValueError("Release root is not configured.")
@@ -837,6 +893,15 @@ def open_path(path: Path) -> None:
     target = Path(path)
     if not target.exists():
         raise FileNotFoundError(str(target))
+    if os.name == "nt":
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", str(target)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **_hidden_process_kwargs(),
+        )
+        return
     os.startfile(str(target))  # type: ignore[attr-defined]
 
 
@@ -845,6 +910,15 @@ def open_external_target(target: str | Path) -> None:
     if not text:
         raise FileNotFoundError("No external target was provided.")
     if "://" in text:
+        if os.name == "nt":
+            subprocess.Popen(
+                ["cmd.exe", "/c", "start", "", text],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_hidden_process_kwargs(),
+            )
+            return
         os.startfile(text)  # type: ignore[attr-defined]
         return
     open_path(Path(text))
@@ -882,6 +956,10 @@ def launch_tool(
     subprocess.Popen(
         build_launch_command(entry, argument_path=argument_path),
         cwd=str(entry.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **_hidden_process_kwargs(),
     )
 
 
@@ -895,37 +973,56 @@ def _python_executable() -> str:
     raise FileNotFoundError(f"Shared venv Python was not found: {DEFAULT_VENV_PYTHON}")
 
 
+def _hidden_startupinfo() -> subprocess.STARTUPINFO | None:
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return startupinfo
+
+
+def _hidden_process_kwargs() -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    startupinfo = _hidden_startupinfo()
+    if startupinfo is not None:
+        kwargs["startupinfo"] = startupinfo
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    return kwargs
+
+
 def _inventor_to_radan_module_path(entry_path: Path) -> Path:
     if entry_path.suffix.casefold() == ".py":
         return entry_path
     return entry_path.parent / "inventor_to_radan.py"
 
 
-_INVENTOR_INLINE_IMPORT_NAMES = {"bom_reader", "config", "dialogs", "report_writer", "rule_store"}
+def _inventor_to_radan_inline_runner_path(module_path: Path) -> Path:
+    return module_path.parent / "inline_runner.py"
 
 
-def _is_inventor_inline_import_name(module_name: str) -> bool:
-    return module_name in _INVENTOR_INLINE_IMPORT_NAMES or module_name.startswith("dialogs.")
+def _load_inventor_to_radan_inline_runner(runner_path: Path) -> object:
+    if not runner_path.exists():
+        raise FileNotFoundError(f"Could not find inline Inventor-to-RADAN runner: {runner_path}")
 
+    module_name = "_truck_nest_inventor_to_radan_inline_runner"
+    spec = importlib.util.spec_from_file_location(module_name, runner_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load inline Inventor-to-RADAN runner: {runner_path}")
 
-@contextmanager
-def _inventor_inline_import_context(module_dir: Path):
-    previous_sys_path = list(sys.path)
-    previous_modules = {
-        name: sys.modules[name]
-        for name in list(sys.modules)
-        if _is_inventor_inline_import_name(name)
-    }
-    for name in previous_modules:
-        sys.modules.pop(name, None)
-    sys.path.insert(0, str(module_dir))
+    module = importlib.util.module_from_spec(spec)
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
     try:
-        yield
+        spec.loader.exec_module(module)
+        return module
     finally:
-        for name in [name for name in sys.modules if _is_inventor_inline_import_name(name)]:
-            sys.modules.pop(name, None)
-        sys.modules.update(previous_modules)
-        sys.path[:] = previous_sys_path
+        if previous_module is not None:
+            sys.modules[module_name] = previous_module
+        else:
+            sys.modules.pop(module_name, None)
 
 
 def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path | str) -> object:
@@ -940,48 +1037,29 @@ def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path 
     if not module_path.exists():
         raise FileNotFoundError(f"Could not find inline Inventor-to-RADAN module: {module_path}")
 
-    module_name = "_truck_nest_inventor_to_radan_inline"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load inline Inventor-to-RADAN module: {module_path}")
+    runner = _load_inventor_to_radan_inline_runner(_inventor_to_radan_inline_runner_path(module_path))
+    run_inline = getattr(runner, "run_inline", None)
+    if not callable(run_inline):
+        raise RuntimeError(f"{module_path.parent / 'inline_runner.py'} does not expose run_inline().")
 
-    module = importlib.util.module_from_spec(spec)
-    previous_module = sys.modules.get(module_name)
-    with _inventor_inline_import_context(module_path.parent):
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-
-            converter = getattr(module, "convert_bom_to_radan_csv", None)
-            if not callable(converter):
-                raise RuntimeError(
-                    f"{module_path} does not expose convert_bom_to_radan_csv(). "
-                    "Use the external launcher for this version."
-                )
-
-            try:
-                return converter(str(spreadsheet), allow_prompts=False, show_summary=False)
-            except Exception as exc:
-                if exc.__class__.__name__ != "InventorToRadanNeedsUi":
-                    raise
-                missing_dxf_items = getattr(exc, "missing_dxf_items", ()) or ()
-                missing_rules = getattr(exc, "missing_rules", ()) or ()
-                parts: list[str] = []
-                if missing_dxf_items:
-                    parts.append(f"{len(missing_dxf_items)} missing-DXF classification(s)")
-                if missing_rules:
-                    parts.append(f"{len(missing_rules)} RADAN rule(s)")
-                detail = " and ".join(parts) if parts else "user input"
-                raise InventorToRadanInlineNeedsUi(
-                    f"Inline conversion needs {detail}.",
-                    missing_dxf_count=len(missing_dxf_items),
-                    missing_rule_count=len(missing_rules),
-                ) from exc
-        finally:
-            if previous_module is not None:
-                sys.modules[module_name] = previous_module
-            else:
-                sys.modules.pop(module_name, None)
+    try:
+        return run_inline(entry, spreadsheet, allow_prompts=False, show_summary=False)
+    except Exception as exc:
+        if exc.__class__.__name__ != "InventorToRadanNeedsUi":
+            raise
+        missing_dxf_items = getattr(exc, "missing_dxf_items", ()) or ()
+        missing_rules = getattr(exc, "missing_rules", ()) or ()
+        parts: list[str] = []
+        if missing_dxf_items:
+            parts.append(f"{len(missing_dxf_items)} missing-DXF classification(s)")
+        if missing_rules:
+            parts.append(f"{len(missing_rules)} RADAN rule(s)")
+        detail = " and ".join(parts) if parts else "user input"
+        raise InventorToRadanInlineNeedsUi(
+            f"Inline conversion needs {detail}.",
+            missing_dxf_count=len(missing_dxf_items),
+            missing_rule_count=len(missing_rules),
+        ) from exc
 
 
 def radan_csv_missing_symbols(
@@ -1026,7 +1104,7 @@ def visible_radan_sessions() -> tuple[tuple[int, str], ...]:
         capture_output=True,
         text=True,
         timeout=5,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **_hidden_process_kwargs(),
     )
     if completed.returncode != 0 or not completed.stdout.strip():
         return ()
@@ -1102,9 +1180,8 @@ def launch_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | st
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
+        **_hidden_process_kwargs(),
     }
-    if suffix in {".bat", ".cmd"}:
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     return subprocess.Popen(command, **popen_kwargs)
 
 
@@ -1184,7 +1261,7 @@ def launch_radan_csv_import(
                 stdin=subprocess.DEVNULL,
                 stdout=log_stream,
                 stderr=log_stream,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **_hidden_process_kwargs(),
             )
         finally:
             log_stream.close()
@@ -1194,7 +1271,7 @@ def launch_radan_csv_import(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **_hidden_process_kwargs(),
     )
 
 
@@ -1217,15 +1294,11 @@ def run_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) 
     run_kwargs = {
         "cwd": str(entry.parent),
         "text": True,
+        "stdin": subprocess.DEVNULL,
+        "capture_output": True,
+        **_hidden_process_kwargs(),
     }
-    if suffix in {".bat", ".cmd"}:
-        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-        return subprocess.run(command, **run_kwargs)
-    return subprocess.run(
-        command,
-        capture_output=True,
-        **run_kwargs,
-    )
+    return subprocess.run(command, **run_kwargs)
 
 
 def _move_or_replace(

@@ -192,9 +192,10 @@ def _quantity_mismatch_message(expected: dict[str, int], actual: dict[str, int],
         details.append("quantity mismatch " + sample + ("" if len(mismatched) <= 8 else f", and {len(mismatched) - 8} more"))
     detail_text = "; ".join(details) if details else "part quantities do not match"
     return (
-        "The RPD is not ready for a print packet yet. "
-        f"Expected {len(expected)} part(s) from {expected_csv_path.name}, but found {len(actual)} populated RPD part(s): "
-        f"{detail_text}. Finish the RADAN CSV import and save the project before building the packet."
+        "The selected RPD does not match the generated RADAN CSV. "
+        "That can be OK if you intentionally removed or changed parts in RADAN.\n\n"
+        f"{expected_csv_path.name} has {len(expected)} part(s), but the saved RPD has {len(actual)} populated part(s): "
+        f"{detail_text}."
     )
 
 
@@ -203,8 +204,8 @@ def validate_print_packet_readiness(
     rpd_path: Path,
     parts: Sequence[object],
     expected_csv_path: Path | None = None,
-) -> None:
-    """Fail fast when the RPD is empty, partially imported, or qtys are not populated."""
+) -> str | None:
+    """Fail fast for unusable RPDs; return a warning for CSV/RPD drift."""
 
     if not parts:
         raise PacketBuildReadinessError(
@@ -218,13 +219,18 @@ def validate_print_packet_readiness(
         )
 
     if expected_csv_path is None or not Path(expected_csv_path).exists():
-        return
+        return None
 
-    expected_quantities = _read_radan_csv_quantities(Path(expected_csv_path))
-    if expected_quantities and actual_quantities != expected_quantities:
-        raise PacketBuildReadinessError(
-            _quantity_mismatch_message(expected_quantities, actual_quantities, Path(expected_csv_path))
+    try:
+        expected_quantities = _read_radan_csv_quantities(Path(expected_csv_path))
+    except PacketBuildReadinessError as exc:
+        return (
+            "The saved RPD can be used, but the generated RADAN CSV could not be checked.\n\n"
+            f"{Path(expected_csv_path).name}: {exc}"
         )
+    if expected_quantities and actual_quantities != expected_quantities:
+        return _quantity_mismatch_message(expected_quantities, actual_quantities, Path(expected_csv_path))
+    return None
 
 
 def _natural_sort_key(value: str) -> list[object]:
@@ -505,6 +511,8 @@ def prepare_packet_build_context(
     rpd_path: Path,
     fabrication_dir: Path | None,
     settings: ExplorerSettings,
+    include_assembly_sources: bool = True,
+    include_cut_list_sources: bool = True,
 ) -> PacketBuildContext:
     if not rpd_path.exists():
         raise FileNotFoundError(str(rpd_path))
@@ -518,14 +526,22 @@ def prepare_packet_build_context(
     # W-side PDFs live under kit-specific subfolders such as PUMP PACK\PUMP HOUSE.
     resolve_asset_fn = rk_assets.resolve_asset
     assembly_search_roots = _assembly_search_roots(fabrication_dir, rpd_path.parent)
-    assembly_source_pdfs = collect_unused_tabloid_pdfs(
-        parts,
-        search_roots=assembly_search_roots,
-        resolve_asset_fn=resolve_asset_fn,
+    assembly_source_pdfs = (
+        collect_unused_tabloid_pdfs(
+            parts,
+            search_roots=assembly_search_roots,
+            resolve_asset_fn=resolve_asset_fn,
+        )
+        if include_assembly_sources
+        else ()
     )
-    cut_list_source_pdfs = collect_cut_list_pdfs(
-        search_roots=assembly_search_roots,
-        settings=settings,
+    cut_list_source_pdfs = (
+        collect_cut_list_pdfs(
+            search_roots=assembly_search_roots,
+            settings=settings,
+        )
+        if include_cut_list_sources
+        else ()
     )
     return PacketBuildContext(
         parts=tuple(parts),
@@ -550,6 +566,29 @@ def create_main_packet_worker(
         out_dirname=str(out_dirname or DEFAULT_PACKET_OUT_DIR),
         resolve_asset_fn=context.resolve_asset_fn,
         render_mode=str(render_mode or "vector").strip().lower() or "vector",
+    )
+
+
+def review_pdf_assets_for_action(
+    *,
+    parent,
+    action_name: str,
+    context: PacketBuildContext,
+    rpd_path: Path,
+    out_dirname: str = DEFAULT_PACKET_OUT_DIR,
+) -> bool:
+    _ensure_radan_kitter_on_path()
+    import pdf_asset_review as rk_pdf_asset_review  # type: ignore[import-not-found]
+
+    return bool(
+        rk_pdf_asset_review.review_pdf_assets_for_action(
+            parent=parent,
+            action_name=action_name,
+            parts=list(context.parts),
+            rpd_path=str(rpd_path),
+            resolve_asset_fn=context.resolve_asset_fn,
+            out_dirname=str(out_dirname or DEFAULT_PACKET_OUT_DIR),
+        )
     )
 
 

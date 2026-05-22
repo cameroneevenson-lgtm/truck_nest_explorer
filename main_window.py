@@ -5,9 +5,10 @@ from dataclasses import dataclass
 import json
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QThreadPool
+from PySide6.QtCore import QObject, QRunnable, Qt, QTimer, QThreadPool, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -49,6 +50,7 @@ from packet_build_service import (
     build_cut_list_packet,
     create_main_packet_worker,
     prepare_packet_build_context,
+    review_pdf_assets_for_action,
     validate_print_packet_readiness,
 )
 from flow_bridge import (
@@ -120,6 +122,35 @@ class PendingInventorJob:
     last_output_signature: tuple[tuple[str, int, int], ...] | None = None
     stable_polls: int = 0
     launcher_exit_code: int | None = None
+
+
+class PacketJobSignals(QObject):
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    error = Signal(str)
+
+
+class PacketJobWorker(QRunnable):
+    def __init__(self, job_fn):
+        super().__init__()
+        self.job_fn = job_fn
+        self.signals = PacketJobSignals()
+        self._stop = False
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def should_cancel(self) -> bool:
+        return bool(self._stop)
+
+    def emit_progress(self, done: int, total: int, status_text: str) -> None:
+        self.signals.progress.emit(int(done), int(total), str(status_text))
+
+    def run(self) -> None:
+        try:
+            self.signals.done.emit(self.job_fn(self))
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
 
 
 class MainWindow(QMainWindow):
@@ -2167,7 +2198,13 @@ class MainWindow(QMainWindow):
             return
         self._open_cut_list_for_status(status)
 
-    def _prepare_packet_build_context(self, title: str):
+    def _prepare_packet_build_context(
+        self,
+        title: str,
+        *,
+        include_assembly_sources: bool = False,
+        include_cut_list_sources: bool = False,
+    ):
         if bool(getattr(self, "_packet_build_running", False)):
             QMessageBox.information(
                 self,
@@ -2210,6 +2247,8 @@ class MainWindow(QMainWindow):
                 rpd_path=status.paths.rpd_path,
                 fabrication_dir=status.paths.fabrication_kit_dir,
                 settings=self.settings,
+                include_assembly_sources=include_assembly_sources,
+                include_cut_list_sources=include_cut_list_sources,
             )
         except Exception as exc:
             QMessageBox.critical(self, title, str(exc))
@@ -2277,13 +2316,32 @@ class MainWindow(QMainWindow):
             except Exception:
                 expected_csv_path = None
         try:
-            validate_print_packet_readiness(
+            readiness_warning = validate_print_packet_readiness(
                 rpd_path=status.paths.rpd_path,
                 parts=context.parts,
                 expected_csv_path=expected_csv_path,
             )
         except PacketBuildReadinessError as exc:
             QMessageBox.warning(self, "Build Print Packet", str(exc))
+            return
+        if readiness_warning:
+            choice = QMessageBox.question(
+                self,
+                "Build Print Packet",
+                f"{readiness_warning}\n\nBuild the print packet from the current saved RPD anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if choice != QMessageBox.Yes:
+                return
+
+        if not review_pdf_assets_for_action(
+            parent=self,
+            action_name="Build Print Packet",
+            context=context,
+            rpd_path=status.paths.rpd_path,
+        ):
+            self.log("Print packet build canceled during PDF asset review.")
             return
 
         total_steps = max(1, len(context.parts))
@@ -2372,77 +2430,124 @@ class MainWindow(QMainWindow):
         status, context = self._prepare_packet_build_context("Build Assembly Packet")
         if status is None or context is None:
             return
-        if not context.assembly_source_pdfs:
-            searched = "\n".join(str(path) for path in context.assembly_search_roots) or "(none)"
-            QMessageBox.information(
-                self,
-                "Build Assembly Packet",
-                "No .iam-backed assembly drawing PDFs were found.\n\nSearched:\n" + searched,
-            )
-            return
 
-        total_steps = max(1, len(context.assembly_source_pdfs))
-        progress = QProgressDialog("Building assembly packet...", "Cancel", 0, total_steps, self)
+        progress = QProgressDialog("Searching for assembly drawing PDFs...", "Cancel", 0, 0, self)
         progress.setWindowTitle("Build Assembly Packet")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
 
-        setattr(self, "_packet_build_running", True)
-        try:
+        def _job(worker: PacketJobWorker) -> dict[str, object]:
+            worker.emit_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
+            discovered_context = prepare_packet_build_context(
+                rpd_path=status.paths.rpd_path,
+                fabrication_dir=status.paths.fabrication_kit_dir,
+                settings=self.settings,
+                include_assembly_sources=True,
+                include_cut_list_sources=False,
+            )
+            if worker.should_cancel():
+                return {"state": "canceled", "context": discovered_context, "result": None}
+            if not discovered_context.assembly_source_pdfs:
+                return {"state": "empty", "context": discovered_context, "result": None}
             result = build_assembly_packet(
                 rpd_path=status.paths.rpd_path,
-                source_pdfs=context.assembly_source_pdfs,
-                progress_cb=lambda done, total, status_text: (
-                    progress.setMaximum(total_steps),
-                    progress.setValue(max(0, min(total_steps, int(done)))),
-                    progress.setLabelText(f"Building assembly packet...\n{status_text}"),
-                    QApplication.processEvents(),
-                ),
-                should_cancel_cb=progress.wasCanceled,
+                source_pdfs=discovered_context.assembly_source_pdfs,
+                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
+                should_cancel_cb=worker.should_cancel,
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "Build Assembly Packet", str(exc))
-            result = None
-        finally:
-            setattr(self, "_packet_build_running", False)
+            return {"state": "done", "context": discovered_context, "result": result}
+
+        worker = PacketJobWorker(_job)
+        setattr(self, "_packet_build_running", True)
+        setattr(self, "_packet_build_worker", worker)
+
+        def _set_progress(done: int, total: int, status_text: str) -> None:
+            if int(total) <= 0:
+                progress.setRange(0, 0)
+            else:
+                progress.setRange(0, int(total))
+                progress.setValue(max(0, min(int(total), int(done))))
+            progress.setLabelText(f"Building assembly packet...\n{status_text}")
+
+        def _cleanup() -> None:
             try:
                 progress.close()
             except Exception:
                 pass
+            setattr(self, "_packet_build_worker", None)
+            setattr(self, "_packet_build_running", False)
 
-        if result is None:
-            return
+        def _on_progress(done: int, total: int, status_text: str) -> None:
+            _set_progress(int(done), int(total), status_text)
 
-        self._refresh_packet_statuses(status)
+        def _on_done(payload: object) -> None:
+            _cleanup()
+            data = payload if isinstance(payload, dict) else {}
+            result = data.get("result")
+            discovered_context = data.get("context")
+            state = str(data.get("state") or "")
+            if state == "empty":
+                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
+                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
+                QMessageBox.information(
+                    self,
+                    "Build Assembly Packet",
+                    "No .iam-backed assembly drawing PDFs were found.\n\nSearched:\n" + searched,
+                )
+                return
+            if state == "canceled" or bool(getattr(result, "skipped", False)):
+                self.log("Assembly packet build canceled.")
+                return
+            if result is None:
+                QMessageBox.information(
+                    self,
+                    "Build Assembly Packet",
+                    "No .iam-backed assembly drawing PDFs were found.",
+                )
+                return
 
-        if result.packet_path:
-            try:
-                open_path(Path(result.packet_path))
-            except Exception:
-                pass
+            self._refresh_packet_statuses(status)
+
+            packet_path = str(getattr(result, "packet_path", "") or "")
+            if packet_path:
+                try:
+                    open_path(Path(packet_path))
+                except Exception:
+                    pass
+                QMessageBox.information(
+                    self,
+                    "Build Assembly Packet",
+                    (
+                        f"Assembly packet documents: {int(getattr(result, 'source_documents', 0))}\n"
+                        f"Assembly packet pages: {int(getattr(result, 'output_pages', 0))}\n"
+                        f"Assembly packet: {packet_path}"
+                    ),
+                )
+                self.log(f"Built assembly packet for {status.paths.display_name}.")
+                return
+
             QMessageBox.information(
                 self,
                 "Build Assembly Packet",
-                (
-                    f"Assembly packet documents: {int(result.source_documents)}\n"
-                    f"Assembly packet pages: {int(result.output_pages)}\n"
-                    f"Assembly packet: {result.packet_path}"
-                ),
+                "No drawing-size pages were found in the .iam-backed PDFs.",
             )
-            self.log(f"Built assembly packet for {status.paths.display_name}.")
-            return
 
-        if result.skipped:
-            self.log("Assembly packet build canceled.")
-            return
+        def _on_error(tb: str) -> None:
+            _cleanup()
+            QMessageBox.critical(
+                self,
+                "Build Assembly Packet",
+                str(tb or "").strip() or "Assembly packet build failed.",
+            )
 
-        QMessageBox.information(
-            self,
-            "Build Assembly Packet",
-            "No .iam-backed assembly drawing PDFs were found.",
-        )
+        worker.signals.progress.connect(_on_progress)
+        worker.signals.done.connect(_on_done)
+        worker.signals.error.connect(_on_error)
+        progress.canceled.connect(worker.request_stop)
+        _set_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
+        QThreadPool.globalInstance().start(worker)
 
     def build_selected_cut_list_packet(self) -> None:
         if not self.CUT_LIST_BUILD_ENABLED:
@@ -2451,77 +2556,124 @@ class MainWindow(QMainWindow):
         status, context = self._prepare_packet_build_context("Build Cut List")
         if status is None or context is None:
             return
-        if not context.cut_list_source_pdfs:
-            searched = "\n".join(str(path) for path in context.assembly_search_roots) or "(none)"
-            QMessageBox.information(
-                self,
-                "Build Cut List",
-                "No non-laser cut list PDFs were found.\n\nSearched:\n" + searched,
-            )
-            return
 
-        total_steps = max(1, len(context.cut_list_source_pdfs))
-        progress = QProgressDialog("Building cut list...", "Cancel", 0, total_steps, self)
+        progress = QProgressDialog("Searching for non-laser cut list PDFs...", "Cancel", 0, 0, self)
         progress.setWindowTitle("Build Cut List")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
 
-        setattr(self, "_packet_build_running", True)
-        try:
+        def _job(worker: PacketJobWorker) -> dict[str, object]:
+            worker.emit_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
+            discovered_context = prepare_packet_build_context(
+                rpd_path=status.paths.rpd_path,
+                fabrication_dir=status.paths.fabrication_kit_dir,
+                settings=self.settings,
+                include_assembly_sources=False,
+                include_cut_list_sources=True,
+            )
+            if worker.should_cancel():
+                return {"state": "canceled", "context": discovered_context, "result": None}
+            if not discovered_context.cut_list_source_pdfs:
+                return {"state": "empty", "context": discovered_context, "result": None}
             result = build_cut_list_packet(
                 rpd_path=status.paths.rpd_path,
-                source_pdfs=context.cut_list_source_pdfs,
-                progress_cb=lambda done, total, status_text: (
-                    progress.setMaximum(total_steps),
-                    progress.setValue(max(0, min(total_steps, int(done)))),
-                    progress.setLabelText(f"Building cut list...\n{status_text}"),
-                    QApplication.processEvents(),
-                ),
-                should_cancel_cb=progress.wasCanceled,
+                source_pdfs=discovered_context.cut_list_source_pdfs,
+                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
+                should_cancel_cb=worker.should_cancel,
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "Build Cut List", str(exc))
-            result = None
-        finally:
-            setattr(self, "_packet_build_running", False)
+            return {"state": "done", "context": discovered_context, "result": result}
+
+        worker = PacketJobWorker(_job)
+        setattr(self, "_packet_build_running", True)
+        setattr(self, "_packet_build_worker", worker)
+
+        def _set_progress(done: int, total: int, status_text: str) -> None:
+            if int(total) <= 0:
+                progress.setRange(0, 0)
+            else:
+                progress.setRange(0, int(total))
+                progress.setValue(max(0, min(int(total), int(done))))
+            progress.setLabelText(f"Building cut list...\n{status_text}")
+
+        def _cleanup() -> None:
             try:
                 progress.close()
             except Exception:
                 pass
+            setattr(self, "_packet_build_worker", None)
+            setattr(self, "_packet_build_running", False)
 
-        if result is None:
-            return
+        def _on_progress(done: int, total: int, status_text: str) -> None:
+            _set_progress(int(done), int(total), status_text)
 
-        self._refresh_packet_statuses(status)
+        def _on_done(payload: object) -> None:
+            _cleanup()
+            data = payload if isinstance(payload, dict) else {}
+            result = data.get("result")
+            discovered_context = data.get("context")
+            state = str(data.get("state") or "")
+            if state == "empty":
+                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
+                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
+                QMessageBox.information(
+                    self,
+                    "Build Cut List",
+                    "No non-laser cut list PDFs were found.\n\nSearched:\n" + searched,
+                )
+                return
+            if state == "canceled" or bool(getattr(result, "skipped", False)):
+                self.log("Cut list build canceled.")
+                return
+            if result is None:
+                QMessageBox.information(
+                    self,
+                    "Build Cut List",
+                    "No non-laser cut list PDFs were found.",
+                )
+                return
 
-        if result.packet_path:
-            try:
-                open_path(Path(result.packet_path))
-            except Exception:
-                pass
+            self._refresh_packet_statuses(status)
+
+            packet_path = str(getattr(result, "packet_path", "") or "")
+            if packet_path:
+                try:
+                    open_path(Path(packet_path))
+                except Exception:
+                    pass
+                QMessageBox.information(
+                    self,
+                    "Build Cut List",
+                    (
+                        f"Cut list documents: {int(getattr(result, 'source_documents', 0))}\n"
+                        f"Cut list pages: {int(getattr(result, 'output_pages', 0))}\n"
+                        f"Cut list: {packet_path}"
+                    ),
+                )
+                self.log(f"Built cut list for {status.paths.display_name}.")
+                return
+
             QMessageBox.information(
                 self,
                 "Build Cut List",
-                (
-                    f"Cut list documents: {int(result.source_documents)}\n"
-                    f"Cut list pages: {int(result.output_pages)}\n"
-                    f"Cut list: {result.packet_path}"
-                ),
+                "No pages were found in the non-laser cut list PDFs.",
             )
-            self.log(f"Built cut list for {status.paths.display_name}.")
-            return
 
-        if result.skipped:
-            self.log("Cut list build canceled.")
-            return
+        def _on_error(tb: str) -> None:
+            _cleanup()
+            QMessageBox.critical(
+                self,
+                "Build Cut List",
+                str(tb or "").strip() or "Cut list build failed.",
+            )
 
-        QMessageBox.information(
-            self,
-            "Build Cut List",
-            "No non-laser cut list PDFs were found.",
-        )
+        worker.signals.progress.connect(_on_progress)
+        worker.signals.done.connect(_on_done)
+        worker.signals.error.connect(_on_error)
+        progress.canceled.connect(worker.request_stop)
+        _set_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
+        QThreadPool.globalInstance().start(worker)
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()

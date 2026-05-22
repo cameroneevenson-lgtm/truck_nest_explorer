@@ -43,19 +43,19 @@
       <ReadMDBClearances>n</ReadMDBClearances>
       <PartGapX>0.5</PartGapX>
       <PartGapY>0.5</PartGapY>
-      <PartGapXY>0.25</PartGapXY>
-      <MinDatumVert>0.25</MinDatumVert>
-      <MinNondatumVert>0.25</MinNondatumVert>
+      <PartGapXY>0.375</PartGapXY>
+      <MinDatumVert>0.375</MinDatumVert>
+      <MinNondatumVert>0.375</MinNondatumVert>
       <OptVert>1</OptVert>
       <ClampStripFlag>y</ClampStripFlag>
       <ClampZoneFlag>n</ClampZoneFlag>
       <ClampStripWidth>1.25</ClampStripWidth>
       <ClampSizeParallel>120</ClampSizeParallel>
       <ClampSizePerpendicular>40</ClampSizePerpendicular>
-      <MinUnclamped>0.25</MinUnclamped>
+      <MinUnclamped>0.375</MinUnclamped>
       <OptUnclamped>1</OptUnclamped>
       <MinClamped>20</MinClamped>
-      <SheetDrgBorder>0.25</SheetDrgBorder>
+      <SheetDrgBorder>0.375</SheetDrgBorder>
       <PickingClusterBorder>0</PickingClusterBorder>
       <PickingClusterGapXY>0</PickingClusterGapXY>
       <PickingClusterMaxArea>0</PickingClusterMaxArea>
@@ -100,7 +100,7 @@
       <Objective>default</Objective>
       <OffcutEvalMinDim>0</OffcutEvalMinDim>
       <OffcutEvalMinArea>0</OffcutEvalMinArea>
-      <OffcutEvalDeprecationRatio>0.4</OffcutEvalDeprecationRatio>
+      <OffcutEvalDeprecationRatio>0</OffcutEvalDeprecationRatio>
       <SheetSource source="multiple">
         <Sheet>
           <Material>-</Material>

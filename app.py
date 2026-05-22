@@ -31,10 +31,22 @@ def _running_from_shared_venv() -> bool:
 
 
 def _preferred_shared_python() -> Path:
-    current_name = Path(sys.executable).name.casefold()
-    if current_name == "pythonw.exe" and SHARED_VENV_PYTHONW.exists():
+    if SHARED_VENV_PYTHONW.exists():
         return SHARED_VENV_PYTHONW
     return SHARED_VENV_PYTHON
+
+
+def _hidden_process_kwargs() -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+    return kwargs
 
 
 def _ensure_shared_venv() -> None:
@@ -47,7 +59,15 @@ def _ensure_shared_venv() -> None:
         raise SystemExit(f"Shared venv Python was not found: {target}")
     env = os.environ.copy()
     env[_REEXEC_ENV] = "1"
-    subprocess.Popen([str(target), str(Path(__file__).resolve()), *sys.argv[1:]], cwd=str(Path(__file__).resolve().parent), env=env)
+    subprocess.Popen(
+        [str(target), str(Path(__file__).resolve()), *sys.argv[1:]],
+        cwd=str(Path(__file__).resolve().parent),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **_hidden_process_kwargs(),
+    )
     raise SystemExit(0)
 
 

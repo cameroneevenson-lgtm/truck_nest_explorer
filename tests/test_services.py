@@ -122,6 +122,10 @@ def write_pdf_pages(path: Path, *, pages: list[tuple[str, float, float]]) -> Non
         doc.close()
 
 
+def copy_inventor_inline_runner(tool_dir: Path) -> None:
+    shutil.copyfile(PROJECT_DIR.parent / "inventor_to_radan" / "inline_runner.py", tool_dir / "inline_runner.py")
+
+
 def write_simple_rpd(path: Path, *, sym_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -203,10 +207,13 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             with patch("services.subprocess.Popen") as popen_mock:
                 launch_tool(launcher_path)
 
-            popen_mock.assert_called_once_with(
-                ["cmd.exe", "/c", str(launcher_path)],
-                cwd=str(temp_dir),
-            )
+            popen_mock.assert_called_once()
+            self.assertEqual(popen_mock.call_args.args[0], ["cmd.exe", "/c", str(launcher_path)])
+            self.assertEqual(popen_mock.call_args.kwargs["cwd"], str(temp_dir))
+            self.assertIs(popen_mock.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIs(popen_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertIs(popen_mock.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertIn("creationflags", popen_mock.call_args.kwargs)
 
     def test_map_explorer_kit_to_flow_kit_uses_built_in_schedule_rollups(self) -> None:
         self.assertEqual(map_explorer_kit_to_flow_kit("PAINT PACK"), "Body")
@@ -906,15 +913,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             )
             _tree, parts, _debug = rpd_io.load_rpd(str(rpd_path))
 
-            validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path)
+            self.assertIsNone(validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path))
 
             csv_path.write_text(
                 f"{temp_root / 'Part A.dxf'},2,Aluminum,0.125,in,AIR\n"
                 f"{temp_root / 'Part B.dxf'},4,Aluminum,0.125,in,AIR\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PacketBuildReadinessError, "quantity mismatch"):
-                validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path)
+            warning = validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path)
+
+            self.assertIsNotNone(warning)
+            self.assertIn("does not match", warning or "")
+            self.assertIn("quantity mismatch", warning or "")
+
+    def test_validate_print_packet_readiness_warns_when_rpd_parts_were_removed(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "ready.rpd"
+            csv_path = temp_root / "TruckBom_Radan.csv"
+            sym_a = temp_root / "Part A.sym"
+            sym_a.write_text("sym", encoding="utf-8")
+            write_rpd_parts(rpd_path, [(str(sym_a), 2)])
+            csv_path.write_text(
+                f"{temp_root / 'Part A.dxf'},2,Aluminum,0.125,in,AIR\n"
+                f"{temp_root / 'Part B.dxf'},3,Aluminum,0.125,in,AIR\n",
+                encoding="utf-8",
+            )
+            _tree, parts, _debug = rpd_io.load_rpd(str(rpd_path))
+
+            warning = validate_print_packet_readiness(rpd_path=rpd_path, parts=parts, expected_csv_path=csv_path)
+
+            self.assertIsNotNone(warning)
+            self.assertIn("intentionally removed", warning or "")
+            self.assertIn("missing part b", warning or "")
 
     def test_prepare_packet_build_context_collects_iam_backed_assembly_drawings(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -1301,6 +1331,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         with workspace_tempdir() as temp_root:
             tool_dir = temp_root / "inventor_to_radan"
             tool_dir.mkdir()
+            copy_inventor_inline_runner(tool_dir)
             spreadsheet = temp_root / "bom.csv"
             spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
             batch = tool_dir / "inventor_to_radan.bat"
@@ -1344,6 +1375,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 tool_dir = temp_root / "inventor_to_radan"
                 tool_dialogs = tool_dir / "dialogs"
                 tool_dialogs.mkdir(parents=True)
+                copy_inventor_inline_runner(tool_dir)
                 spreadsheet = temp_root / "bom.csv"
                 spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
                 entry = tool_dir / "inventor_to_radan.py"
@@ -1372,6 +1404,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         with workspace_tempdir() as temp_root:
             tool_dir = temp_root / "inventor_to_radan"
             tool_dir.mkdir()
+            copy_inventor_inline_runner(tool_dir)
             spreadsheet = temp_root / "bom.csv"
             spreadsheet.write_text("Part Number,Description,Qty\n", encoding="utf-8")
             entry = tool_dir / "inventor_to_radan.py"
@@ -1535,20 +1568,45 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "release"
             fabrication_root = temp_root / "fab"
+            registry_path = temp_root / "truck_registry.csv"
             (release_root / "F55334").mkdir(parents=True)
+            (release_root / "F59999").mkdir(parents=True)
             (release_root / "Templates").mkdir(parents=True)
             (release_root / "_runtime").mkdir(parents=True)
             (release_root / "F5533").mkdir(parents=True)
             (fabrication_root / "F55335").mkdir(parents=True)
+            registry_path.write_text(
+                "truck_number,day_zero,is_active,notes\n"
+                "F55334,2026-02-09,1,Whole truck\n",
+                encoding="utf-8",
+            )
 
             settings = ExplorerSettings(
                 release_root=str(release_root),
                 fabrication_root=str(fabrication_root),
             )
 
-            trucks = discover_trucks(settings)
+            with patch("services.FLOW_TRUCK_REGISTRY_PATH", registry_path):
+                trucks = discover_trucks(settings)
 
             self.assertEqual(trucks, ["F55334"])
+
+    def test_create_kit_scaffold_rejects_unregistered_f_job_when_registry_exists(self) -> None:
+        with workspace_tempdir() as temp_root:
+            registry_path = temp_root / "truck_registry.csv"
+            registry_path.write_text(
+                "truck_number,day_zero,is_active,notes\n"
+                "F55334,2026-02-09,1,Whole truck\n",
+                encoding="utf-8",
+            )
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+
+            with patch("services.FLOW_TRUCK_REGISTRY_PATH", registry_path):
+                with self.assertRaisesRegex(RuntimeError, "not listed as an active whole-truck job"):
+                    create_kit_scaffold("F59999", "PAINT PACK", settings)
 
     def test_find_fabrication_truck_dir_matches_case_insensitively(self) -> None:
         with workspace_tempdir() as temp_root:
