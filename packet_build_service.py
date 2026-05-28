@@ -76,6 +76,31 @@ class AssemblyPacketBuildResult:
     source_pdfs: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class AssemblyBomReference:
+    part_name: str
+    assembly_name: str
+    assembly_pdf_path: str
+    page_number: int
+    bom_qty: int
+    evidence: str
+
+
+@dataclass(frozen=True)
+class AssemblyBomContextResult:
+    assembly_pdf_count: int
+    checked_part_count: int
+    references: tuple[AssemblyBomReference, ...]
+    read_errors: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _PartAlias:
+    part_name: str
+    alias: str
+    pattern: re.Pattern[str]
+
+
 class PacketBuildReadinessError(RuntimeError):
     """Raised when an RPD is not populated enough for a packet build."""
 
@@ -117,6 +142,99 @@ def _parse_positive_int(value: str, *, field_name: str) -> int:
 
 def _part_key_from_symbol_path(path_text: str) -> str:
     return Path(str(path_text or "").strip()).stem.casefold()
+
+
+def _part_display_name(part: object) -> str:
+    value = str(getattr(part, "part", "") or "").strip()
+    if value:
+        return value
+    return Path(str(getattr(part, "sym", "") or "").strip()).stem.strip()
+
+
+def _part_alias_pattern(alias: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def _part_aliases(part_name: str) -> tuple[str, ...]:
+    clean = str(part_name or "").strip()
+    if not clean:
+        return ()
+    aliases = [clean]
+    match = re.match(r"^(F\d{3,})[-_\s]+(.+)$", clean, flags=re.IGNORECASE)
+    if match:
+        suffix = match.group(2).strip()
+        aliases.append(suffix)
+        aliases.append(f"{match.group(1)} {suffix}")
+    seen: set[str] = set()
+    out: list[str] = []
+    for alias in aliases:
+        key = alias.casefold()
+        if not alias or key in seen:
+            continue
+        seen.add(key)
+        out.append(alias)
+    return tuple(out)
+
+
+def _build_part_aliases(parts: Sequence[object]) -> tuple[_PartAlias, ...]:
+    aliases: list[_PartAlias] = []
+    seen: set[tuple[str, str]] = set()
+    for part in parts:
+        part_name = _part_display_name(part)
+        for alias in _part_aliases(part_name):
+            key = (part_name.casefold(), alias.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            aliases.append(_PartAlias(part_name=part_name, alias=alias, pattern=_part_alias_pattern(alias)))
+    aliases.sort(key=lambda item: len(item.alias), reverse=True)
+    return tuple(aliases)
+
+
+def _text_line_evidence(text: str, pattern: re.Pattern[str]) -> str:
+    for raw_line in str(text or "").replace("\r", "\n").splitlines():
+        line = " ".join(raw_line.split())
+        if line and pattern.search(line):
+            return line[:260]
+    match = pattern.search(str(text or ""))
+    if not match:
+        return ""
+    start = max(0, match.start() - 100)
+    end = min(len(text), match.end() + 100)
+    return " ".join(text[start:end].split())[:260]
+
+
+def _quantity_from_bom_evidence(evidence: str, alias: str) -> int:
+    text = str(evidence or "").strip()
+    if not text:
+        return 0
+    match = re.search(r"\bqty\b\s*[:#-]?\s*(\d{1,4})\b", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    alias_match = re.search(re.escape(str(alias or "").strip()), text, flags=re.IGNORECASE) if str(alias or "").strip() else None
+    after_alias: list[int] = []
+    before_alias: list[int] = []
+    anywhere: list[int] = []
+    for number in re.finditer(r"\b(\d{1,4})\b", text):
+        value = int(number.group(1))
+        if value <= 0:
+            continue
+        anywhere.append(value)
+        if alias_match is None:
+            continue
+        # Part numbers carry digits; do not treat those digits as BOM quantities.
+        if number.start() >= alias_match.start() and number.end() <= alias_match.end():
+            continue
+        if number.start() >= alias_match.end():
+            after_alias.append(value)
+        elif number.end() <= alias_match.start():
+            before_alias.append(value)
+    if after_alias:
+        return after_alias[-1]
+    if before_alias:
+        return before_alias[-1]
+    return anywhere[-1] if anywhere else 0
 
 
 def _aggregate_quantities(rows: Sequence[tuple[str, int]]) -> dict[str, int]:
@@ -590,6 +708,101 @@ def review_pdf_assets_for_action(
             out_dirname=str(out_dirname or DEFAULT_PACKET_OUT_DIR),
         )
     )
+
+
+def scan_assembly_bom_context(
+    *,
+    parts: Sequence[object],
+    source_pdfs: Sequence[Path],
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    should_cancel_cb: Optional[Callable[[], bool]] = None,
+) -> AssemblyBomContextResult:
+    aliases = _build_part_aliases(parts)
+    pdfs = tuple(Path(path) for path in source_pdfs if Path(path).exists())
+    references: list[AssemblyBomReference] = []
+    read_errors: list[tuple[str, str]] = []
+    seen_refs: set[tuple[str, str, int]] = set()
+    fitz = _fitz_module()
+
+    def _should_cancel() -> bool:
+        if should_cancel_cb is None:
+            return False
+        try:
+            return bool(should_cancel_cb())
+        except Exception:
+            return False
+
+    for pdf_index, pdf_path in enumerate(pdfs, start=1):
+        if progress_cb is not None:
+            progress_cb(pdf_index - 1, len(pdfs), f"Assembly context | Scanning {pdf_path.name}")
+        if _should_cancel():
+            break
+        try:
+            with fitz.open(str(pdf_path)) as doc:
+                for page_index in range(doc.page_count):
+                    text = str(doc[page_index].get_text("text") or "")
+                    for alias in aliases:
+                        if not alias.pattern.search(text):
+                            continue
+                        key = (alias.part_name.casefold(), _normalize_path_key(pdf_path), page_index + 1)
+                        if key in seen_refs:
+                            continue
+                        evidence = _text_line_evidence(text, alias.pattern)
+                        references.append(
+                            AssemblyBomReference(
+                                part_name=alias.part_name,
+                                assembly_name=pdf_path.stem,
+                                assembly_pdf_path=str(pdf_path),
+                                page_number=page_index + 1,
+                                bom_qty=_quantity_from_bom_evidence(evidence, alias.alias),
+                                evidence=evidence,
+                            )
+                        )
+                        seen_refs.add(key)
+        except Exception as exc:
+            read_errors.append((str(pdf_path), str(exc)))
+        if progress_cb is not None:
+            progress_cb(pdf_index, len(pdfs), f"Assembly context | Scanned {pdf_path.name}")
+
+    references.sort(
+        key=lambda item: (
+            item.part_name.casefold(),
+            item.assembly_name.casefold(),
+            int(item.page_number),
+        )
+    )
+    return AssemblyBomContextResult(
+        assembly_pdf_count=len(pdfs),
+        checked_part_count=len({_part_display_name(part).casefold() for part in parts if _part_display_name(part)}),
+        references=tuple(references),
+        read_errors=tuple(read_errors),
+    )
+
+
+def write_assembly_bom_context_csv(
+    *,
+    rpd_path: Path,
+    result: AssemblyBomContextResult,
+    out_dirname: str = DEFAULT_PACKET_OUT_DIR,
+) -> Path:
+    out_dir = Path(rpd_path).parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / f"AssemblyContext_{_make_stamp()}.csv"
+    with report_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["part_name", "assembly_name", "assembly_pdf_path", "page_number", "bom_qty", "evidence"])
+        for ref in result.references:
+            writer.writerow(
+                [
+                    ref.part_name,
+                    ref.assembly_name,
+                    ref.assembly_pdf_path,
+                    int(ref.page_number),
+                    int(ref.bom_qty),
+                    ref.evidence,
+                ]
+            )
+    return report_path
 
 
 def build_assembly_packet(

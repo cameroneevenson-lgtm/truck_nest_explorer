@@ -180,6 +180,38 @@ def canonicalize_client_numbers_by_truck(values: object) -> dict[str, str]:
     return cleaned
 
 
+def normalize_odd_jobs_by_truck(values: object) -> dict[str, list[str]]:
+    if not isinstance(values, dict):
+        return {}
+
+    cleaned: dict[str, list[str]] = {}
+    for raw_truck, raw_jobs in values.items():
+        truck_number = normalize_hidden_truck_number(raw_truck)
+        if not truck_number:
+            continue
+        if isinstance(raw_jobs, str):
+            source_jobs = [raw_jobs]
+        elif isinstance(raw_jobs, list):
+            source_jobs = raw_jobs
+        else:
+            continue
+
+        jobs: list[str] = []
+        seen: set[str] = set()
+        for raw_job in source_jobs:
+            job_name = canonicalize_kit_name(raw_job)
+            if not job_name:
+                continue
+            key = job_name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            jobs.append(job_name)
+        if jobs:
+            cleaned[truck_number] = jobs
+    return cleaned
+
+
 def build_hidden_kit_key(truck_number: object, kit_name: object) -> str:
     truck_text = normalize_hidden_truck_number(truck_number)
     kit_text = canonicalize_kit_name(kit_name)
@@ -347,6 +379,7 @@ class ExplorerSettings:
     punch_codes_by_kit: dict[str, str] = field(default_factory=dict)
     notes_by_kit: dict[str, str] = field(default_factory=dict)
     client_numbers_by_truck: dict[str, str] = field(default_factory=dict)
+    odd_jobs_by_truck: dict[str, list[str]] = field(default_factory=dict)
     create_support_folders: bool = True
     kit_templates: list[str] = field(default_factory=lambda: list(DEFAULT_KIT_TEMPLATES))
     truck_order: list[str] = field(default_factory=list)

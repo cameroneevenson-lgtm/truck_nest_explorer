@@ -48,12 +48,15 @@ from packet_build_service import (
     build_assembly_packet,
     build_cut_list_packet,
     prepare_packet_build_context,
+    scan_assembly_bom_context,
     validate_print_packet_readiness,
+    write_assembly_bom_context_csv,
 )
 from settings_store import load_settings, save_settings
 from services import (
     DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     InventorToRadanInlineNeedsUi,
+    add_odd_job_to_truck,
     assert_w_drive_write_allowed,
     build_kit_paths,
     build_launch_command,
@@ -76,6 +79,7 @@ from services import (
     launch_tool,
     launch_radan_csv_import,
     move_inventor_outputs_to_project,
+    odd_job_names_for_truck,
     radan_csv_missing_symbols,
     radan_csv_import_lock_status,
     run_inventor_to_radan_inline,
@@ -699,8 +703,12 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             empty_status = build_kit_status("F55334", "PAINT PACK", settings)
             self.assertTrue(empty_status.fabrication_folder_exists)
             self.assertFalse(empty_status.fabrication_has_files)
+            self.assertTrue(empty_status.rpd_exists)
+            self.assertTrue(empty_status.paths.rpd_path is not None and empty_status.paths.rpd_path.exists())
             self.assertIn("Not released", empty_status.status_summary)
+            self.assertIn("BOM missing", empty_status.status_summary)
             self.assertNotIn("Spreadsheet missing", empty_status.status_summary)
+            self.assertNotIn("RPD missing", empty_status.status_summary)
 
             released_file = empty_folder / "TruckBom.xlsx"
             released_file.write_text("bom", encoding="utf-8")
@@ -708,7 +716,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             released_status = build_kit_status("F55334", "PAINT PACK", settings)
             self.assertTrue(released_status.fabrication_has_files)
             self.assertIn("Released", released_status.status_summary)
-            self.assertIn("Spreadsheet ready", released_status.status_summary)
+            self.assertNotIn("BOM missing", released_status.status_summary)
+            self.assertNotIn("Spreadsheet ready", released_status.status_summary)
+            self.assertNotIn("BOM ready", released_status.status_summary)
 
     def test_release_text_for_status_prefers_flow_complete(self) -> None:
         self.assertEqual(
@@ -1217,6 +1227,81 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 self.assertEqual(doc.page_count, 1)
                 self.assertEqual((round(doc[0].rect.width), round(doc[0].rect.height)), (2448, 1584))
                 self.assertIn("LARGE ASSEMBLY", doc[0].get_text())
+
+    def test_scan_assembly_bom_context_maps_laser_parts_and_ignores_nonlaser_rows(self) -> None:
+        with workspace_tempdir() as temp_root:
+            parts = [
+                SimpleNamespace(sym=str(temp_root / "F55334-B-1001.sym"), part="F55334-B-1001"),
+                SimpleNamespace(sym=str(temp_root / "F55334-B-1002.sym"), part="F55334-B-1002"),
+            ]
+            assembly_a = temp_root / "fab" / "F55334-BODY.pdf"
+            assembly_b = temp_root / "fab" / "F55334-DOOR.pdf"
+            write_pdf(
+                assembly_a,
+                text=(
+                    "BOM\n"
+                    "ITEM PART NUMBER DESCRIPTION QTY\n"
+                    "1 F55334-B-1001 LASER BRACKET 2\n"
+                    "2 ACH 3X2X.25 NON LASER ANGLE 4\n"
+                    "3 F55334-B-1002 LASER GUSSET 1\n"
+                ),
+                width=2448,
+                height=1584,
+            )
+            write_pdf(
+                assembly_b,
+                text=(
+                    "BOM\n"
+                    "ITEM PART NUMBER DESCRIPTION QTY\n"
+                    "1 F55334-B-1001 LASER BRACKET 1\n"
+                    "2 BOLT 3/8 NON LASER 12\n"
+                ),
+                width=2448,
+                height=1584,
+            )
+
+            result = scan_assembly_bom_context(
+                parts=parts,
+                source_pdfs=(assembly_a, assembly_b),
+            )
+
+            refs = [(ref.part_name, ref.assembly_name) for ref in result.references]
+            self.assertEqual(
+                refs,
+                [
+                    ("F55334-B-1001", "F55334-BODY"),
+                    ("F55334-B-1001", "F55334-DOOR"),
+                    ("F55334-B-1002", "F55334-BODY"),
+                ],
+            )
+            self.assertEqual(result.assembly_pdf_count, 2)
+            self.assertEqual(result.checked_part_count, 2)
+            self.assertEqual(result.read_errors, ())
+            self.assertEqual([ref.bom_qty for ref in result.references], [2, 1, 1])
+            self.assertNotIn("ACH", "\n".join(ref.part_name for ref in result.references))
+
+    def test_write_assembly_bom_context_csv_persists_many_to_many_mapping(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "job" / "job.rpd"
+            rpd_path.parent.mkdir(parents=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+            assembly_pdf = temp_root / "fab" / "F55334-BODY.pdf"
+            write_pdf(
+                assembly_pdf,
+                text="1 F55334-B-1001 LASER BRACKET 2",
+                width=2448,
+                height=1584,
+            )
+            result = scan_assembly_bom_context(
+                parts=[SimpleNamespace(sym=str(temp_root / "F55334-B-1001.sym"), part="F55334-B-1001")],
+                source_pdfs=(assembly_pdf,),
+            )
+
+            report_path = write_assembly_bom_context_csv(rpd_path=rpd_path, result=result)
+
+            text = report_path.read_text(encoding="utf-8")
+            self.assertIn("part_name,assembly_name,assembly_pdf_path,page_number,bom_qty,evidence", text)
+            self.assertIn("F55334-B-1001,F55334-BODY", text)
 
     def test_build_cut_list_packet_combines_one_copy_of_each_source_pdf(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -1802,6 +1887,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     "bad-value::PUMPHOUSE": "ignore",
                 },
                 kit_templates=["BODY | PAINT PACK", "PUMPHOUSE"],
+                odd_jobs_by_truck={"f55334": ["Loose Brackets", "loose brackets", ""]},
             )
 
             with patch("settings_store.RUNTIME_DIR", runtime_dir), patch("settings_store.SETTINGS_PATH", settings_path):
@@ -1815,6 +1901,34 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     "PAINT PACK": "Shared paint note",
                 },
             )
+            self.assertEqual(loaded.odd_jobs_by_truck, {"F55334": ["Loose Brackets"]})
+
+    def test_odd_jobs_are_truck_specific_extra_kit_rows(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+                kit_templates=["BODY | PAINT PACK"],
+            )
+
+            self.assertTrue(add_odd_job_to_truck(settings, "F55334", "Loose Brackets"))
+            self.assertFalse(add_odd_job_to_truck(settings, "F55334", "Loose Brackets"))
+            self.assertEqual(odd_job_names_for_truck("F55334", settings), ["Loose Brackets"])
+
+            statuses = collect_kit_statuses("F55334", settings)
+
+            self.assertEqual([status.kit_name for status in statuses], ["PAINT PACK", "Loose Brackets"])
+            odd_status = statuses[-1]
+            self.assertTrue(odd_status.rpd_exists)
+            self.assertTrue(odd_status.paths.release_kit_dir is not None and odd_status.paths.release_kit_dir.exists())
+
+    def test_odd_job_rejects_canonical_kit_name(self) -> None:
+        settings = ExplorerSettings(kit_templates=["BODY | PAINT PACK"])
+
+        with self.assertRaises(ValueError):
+            add_odd_job_to_truck(settings, "F55334", "PAINT PACK")
 
 
 def detect_status_from_paths(paths):

@@ -51,7 +51,9 @@ from packet_build_service import (
     create_main_packet_worker,
     prepare_packet_build_context,
     review_pdf_assets_for_action,
+    scan_assembly_bom_context,
     validate_print_packet_readiness,
+    write_assembly_bom_context_csv,
 )
 from flow_bridge import (
     FlowTruckInsight,
@@ -735,11 +737,11 @@ class MainWindow(QMainWindow):
         if not status.project_folder_exists or not status.rpd_exists:
             return "Repair Selected: the L-side project setup is incomplete."
         if status.spreadsheet_match.issue == "multiple_spreadsheets":
-            return "BOM: clean up multiple spreadsheet matches in W before running tools."
+            return "BOM: clean up multiple BOM matches in W before running tools."
         if status.spreadsheet_match.chosen_path is not None and not status.fabrication_has_files:
             if self.settings.inventor_to_radan_entry.strip():
-                return "Run Inventor Tool: spreadsheet is ready and the kit is not released yet."
-            return "BOM: spreadsheet is ready, but the Inventor launcher is not configured."
+                return "Run Inventor Tool: the kit is not released yet."
+            return "BOM: Inventor launcher is not configured."
         if status.preview_pdf_match.chosen_path is None:
             return "Open Project: review the kit because the Nest Summary is still missing."
         if (
@@ -832,11 +834,10 @@ class MainWindow(QMainWindow):
         not_released = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Not released")
         w_missing = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "W missing")
         rpd_ready = sum(1 for status in self._all_statuses if status.rpd_exists)
-        spreadsheet_ready = sum(1 for status in self._all_statuses if status.spreadsheet_match.is_unique)
-        spreadsheet_ambiguous = sum(
+        bom_ambiguous = sum(
             1 for status in self._all_statuses if status.spreadsheet_match.issue == "multiple_spreadsheets"
         )
-        spreadsheet_missing = sum(
+        bom_missing = sum(
             1
             for status in self._all_statuses
             if status.spreadsheet_match.chosen_path is None and status.spreadsheet_match.issue != "multiple_spreadsheets"
@@ -855,7 +856,7 @@ class MainWindow(QMainWindow):
             f"Kits visible in table: {visible_kits}",
             f"Complete: {complete} | Released: {released} | Not released: {not_released} | W missing: {w_missing}",
             f"Project files ready: {rpd_ready}/{total_kits}",
-            f"Spreadsheets ready: {spreadsheet_ready} | Ambiguous: {spreadsheet_ambiguous} | Missing: {spreadsheet_missing}",
+            f"BOMs ambiguous: {bom_ambiguous} | Missing: {bom_missing}",
             f"Nest summaries ready: {nest_ready}/{total_kits}",
             f"Print packets ready: {print_packet_ready}/{total_kits} | Assembly packets ready: {assembly_packet_ready}/{total_kits} | Cut lists ready: {cut_list_ready}/{total_kits}",
         ]
@@ -871,8 +872,7 @@ class MainWindow(QMainWindow):
             for status in statuses
             if self._release_text_for_status(status) in {"Not released", "W missing"}
         )
-        spreadsheet_ready = sum(1 for status in statuses if status.spreadsheet_match.is_unique)
-        spreadsheet_ambiguous = sum(
+        bom_ambiguous = sum(
             1 for status in statuses if status.spreadsheet_match.issue == "multiple_spreadsheets"
         )
         nest_missing = sum(1 for status in statuses if status.preview_pdf_match.chosen_path is None)
@@ -886,7 +886,7 @@ class MainWindow(QMainWindow):
             f"Need repair: {missing_projects}",
             f"Complete in flow: {complete}",
             f"Not fully released yet: {unreleased}",
-            f"Spreadsheets ready: {spreadsheet_ready} | Ambiguous: {spreadsheet_ambiguous}",
+            f"BOMs ambiguous: {bom_ambiguous}",
             f"Nest summaries missing: {nest_missing}",
         ]
         if hidden_count:
@@ -897,6 +897,7 @@ class MainWindow(QMainWindow):
         flow_insight = self._flow_insight_for_status(status)
         packet_match = detect_print_packet_pdf(status.paths)
         assembly_packet_match = detect_assembly_packet_pdf(status.paths)
+        cut_list_match = detect_cut_list_packet_pdf(status.paths)
         lines = [
             f"Kit: {status.paths.display_name}",
             f"RADAN name: {status.kit_name}",
@@ -904,12 +905,12 @@ class MainWindow(QMainWindow):
             f"Status summary: {self._status_summary_for_display(status)}",
             f"Release state: {self._release_text_for_status(status)}",
             f"Flow status: {flow_insight.display_text or 'Not mapped'}",
-            f"Project file: {'Ready' if status.rpd_exists else 'Missing'}",
+            f"Project setup: {'Ready' if status.rpd_exists else 'Needs repair'}",
             (
                 f"Nest summary: {self._match_summary_text(chosen_path=status.preview_pdf_match.chosen_path, candidates=status.preview_pdf_match.candidates, missing_label='Missing')}"
             ),
             (
-                f"Spreadsheet: {self._match_summary_text(chosen_path=status.spreadsheet_match.chosen_path, candidates=status.spreadsheet_match.candidates, missing_label='Missing')}"
+                f"BOM: {self._match_summary_text(chosen_path=status.spreadsheet_match.chosen_path, candidates=status.spreadsheet_match.candidates, missing_label='Missing')}"
             ),
             (
                 f"Print packet: {self._match_summary_text(chosen_path=packet_match.chosen_path, candidates=packet_match.candidates, missing_label='Missing')}"
@@ -1012,6 +1013,7 @@ class MainWindow(QMainWindow):
             punch_codes_by_kit=dict(self.settings.punch_codes_by_kit),
             notes_by_kit=dict(self.settings.notes_by_kit),
             client_numbers_by_truck=dict(self.settings.client_numbers_by_truck),
+            odd_jobs_by_truck={truck: list(jobs) for truck, jobs in self.settings.odd_jobs_by_truck.items()},
             create_support_folders=self.settings.create_support_folders,
             kit_templates=list(self.settings.kit_templates),
             truck_order=list(self.settings.truck_order),
@@ -2080,14 +2082,14 @@ class MainWindow(QMainWindow):
     def open_selected_spreadsheet(self) -> None:
         status = self._current_status()
         if status is None:
-            QMessageBox.information(self, "Open Spreadsheet", "Select a kit first.")
+            QMessageBox.information(self, "Open BOM", "Select a kit first.")
             return
         spreadsheet_path = status.spreadsheet_match.chosen_path
         if spreadsheet_path is None:
             QMessageBox.warning(
                 self,
-                "Open Spreadsheet",
-                "This kit does not have exactly one spreadsheet candidate in the W folder.",
+                "Open BOM",
+                "This kit does not have exactly one BOM candidate in the W folder.",
             )
             return
         self._open_path_with_message(spreadsheet_path)
@@ -2451,13 +2453,37 @@ class MainWindow(QMainWindow):
                 return {"state": "canceled", "context": discovered_context, "result": None}
             if not discovered_context.assembly_source_pdfs:
                 return {"state": "empty", "context": discovered_context, "result": None}
+            context_result = scan_assembly_bom_context(
+                parts=discovered_context.parts,
+                source_pdfs=discovered_context.assembly_source_pdfs,
+                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
+                should_cancel_cb=worker.should_cancel,
+            )
+            context_report_path = write_assembly_bom_context_csv(
+                rpd_path=status.paths.rpd_path,
+                result=context_result,
+            )
+            if worker.should_cancel():
+                return {
+                    "state": "canceled",
+                    "context": discovered_context,
+                    "result": None,
+                    "assembly_context": context_result,
+                    "assembly_context_report": context_report_path,
+                }
             result = build_assembly_packet(
                 rpd_path=status.paths.rpd_path,
                 source_pdfs=discovered_context.assembly_source_pdfs,
                 progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
                 should_cancel_cb=worker.should_cancel,
             )
-            return {"state": "done", "context": discovered_context, "result": result}
+            return {
+                "state": "done",
+                "context": discovered_context,
+                "result": result,
+                "assembly_context": context_result,
+                "assembly_context_report": context_report_path,
+            }
 
         worker = PacketJobWorker(_job)
         setattr(self, "_packet_build_running", True)
@@ -2487,6 +2513,8 @@ class MainWindow(QMainWindow):
             data = payload if isinstance(payload, dict) else {}
             result = data.get("result")
             discovered_context = data.get("context")
+            assembly_context = data.get("assembly_context")
+            assembly_context_report = data.get("assembly_context_report")
             state = str(data.get("state") or "")
             if state == "empty":
                 searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
@@ -2511,6 +2539,9 @@ class MainWindow(QMainWindow):
             self._refresh_packet_statuses(status)
 
             packet_path = str(getattr(result, "packet_path", "") or "")
+            context_report_text = str(assembly_context_report or "")
+            reference_count = len(getattr(assembly_context, "references", ()) or ())
+            read_error_count = len(getattr(assembly_context, "read_errors", ()) or ())
             if packet_path:
                 try:
                     open_path(Path(packet_path))
@@ -2522,6 +2553,9 @@ class MainWindow(QMainWindow):
                     (
                         f"Assembly packet documents: {int(getattr(result, 'source_documents', 0))}\n"
                         f"Assembly packet pages: {int(getattr(result, 'output_pages', 0))}\n"
+                        f"Assembly part references: {reference_count}\n"
+                        f"Assembly context read errors: {read_error_count}\n"
+                        f"Assembly context: {context_report_text}\n"
                         f"Assembly packet: {packet_path}"
                     ),
                 )
@@ -2725,7 +2759,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Run Inventor Tool",
-                "This kit does not have exactly one spreadsheet candidate in the W folder.",
+                "This kit does not have exactly one BOM candidate in the W folder.",
             )
             return
         if status.paths.project_dir is None:
@@ -2880,7 +2914,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 title,
-                "This kit does not have exactly one spreadsheet candidate, so the expected _Radan.csv path is ambiguous.",
+                "This kit does not have exactly one BOM candidate, so the expected _Radan.csv path is ambiguous.",
             )
             return
         if status.paths.project_dir is None or not status.paths.project_dir.exists():

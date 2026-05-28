@@ -113,6 +113,48 @@ def configured_kit_mappings(settings: ExplorerSettings) -> list[KitMapping]:
     return build_kit_mappings(settings.kit_templates)
 
 
+def odd_job_names_for_truck(truck_number: str, settings: ExplorerSettings) -> list[str]:
+    truck = normalize_hidden_truck_number(truck_number)
+    if not truck:
+        return []
+    jobs = settings.odd_jobs_by_truck.get(truck, [])
+    cleaned: list[str] = []
+    seen: set[str] = {mapping.kit_name.casefold() for mapping in configured_kit_mappings(settings)}
+    for raw_job in jobs:
+        job_name = canonicalize_kit_name(raw_job)
+        if not job_name:
+            continue
+        key = job_name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(job_name)
+    return cleaned
+
+
+def add_odd_job_to_truck(settings: ExplorerSettings, truck_number: str, kit_name: str) -> bool:
+    truck = normalize_hidden_truck_number(truck_number)
+    job_name = canonicalize_kit_name(kit_name)
+    if not truck:
+        raise ValueError("Truck number is required.")
+    if not job_name:
+        raise ValueError("Odd job name is required.")
+
+    canonical_keys = {mapping.kit_name.casefold() for mapping in configured_kit_mappings(settings)}
+    canonical_keys.update(mapping.display_name.casefold() for mapping in configured_kit_mappings(settings))
+    if job_name.casefold() in canonical_keys:
+        raise ValueError("That name is already a canonical kit.")
+
+    jobs = list(settings.odd_jobs_by_truck.get(truck, []))
+    if job_name.casefold() in {job.casefold() for job in jobs}:
+        return False
+    jobs.append(job_name)
+    updated = dict(settings.odd_jobs_by_truck)
+    updated[truck] = jobs
+    settings.odd_jobs_by_truck = updated
+    return True
+
+
 def _truthy_registry_value(value: object) -> bool:
     text = clean_text(value).casefold()
     if not text:
@@ -631,6 +673,35 @@ def create_kit_scaffold(
     )
 
 
+def ensure_rpd_exists(paths: KitPaths, settings: ExplorerSettings) -> tuple[Path, ...]:
+    if paths.release_truck_dir is None or paths.release_kit_dir is None or paths.project_dir is None:
+        return ()
+    if paths.rpd_path is None or paths.rpd_path.exists():
+        return ()
+
+    created: list[Path] = []
+    for folder in (paths.release_truck_dir, paths.release_kit_dir, paths.project_dir):
+        if not folder.exists():
+            folder.mkdir(parents=True, exist_ok=True)
+            created.append(folder)
+
+    template_path = _path_from_setting(settings.rpd_template_path)
+    if template_path is not None and template_path.exists():
+        _write_template_clone(
+            template_path,
+            paths.rpd_path,
+            truck_number=paths.truck_number,
+            kit_name=paths.kit_name,
+            project_name=paths.project_name,
+            replacements_text=settings.template_replacements_text,
+        )
+        _clone_template_subfolders(template_path.parent, paths.project_dir)
+    else:
+        _write_minimal_rpd(paths.rpd_path, project_name=paths.project_name)
+    created.append(paths.rpd_path)
+    return tuple(created)
+
+
 def inventor_output_paths(spreadsheet_path: Path, project_dir: Path | None) -> InventorOutputPaths:
     source_csv_path = spreadsheet_path.with_name(f"{spreadsheet_path.stem}_Radan.csv")
     source_report_path = spreadsheet_path.with_name(f"{spreadsheet_path.stem}_report.txt")
@@ -833,6 +904,10 @@ def release_text_for_status(
 
 def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSettings) -> KitStatus:
     paths = build_kit_paths(truck_number, kit_name, settings)
+    try:
+        ensure_rpd_exists(paths, settings)
+    except OSError:
+        pass
     release_folder_exists = bool(paths.release_kit_dir and paths.release_kit_dir.exists())
     project_folder_exists = bool(paths.project_dir and paths.project_dir.exists())
     rpd_exists = bool(paths.rpd_path and paths.rpd_path.exists())
@@ -846,7 +921,6 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
         outputs = inventor_output_paths(spreadsheet_match.chosen_path, paths.project_dir)
 
     summary_parts: list[str] = []
-    summary_parts.append("RPD ready" if rpd_exists else "RPD missing")
     release_text = release_text_for_status(
         fabrication_folder_exists=fabrication_folder_exists,
         fabrication_has_files=fabrication_has_files,
@@ -857,12 +931,10 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
         summary_parts.append("Not released")
     else:
         summary_parts.append("W folder missing")
-    if spreadsheet_match.is_unique:
-        summary_parts.append("Spreadsheet ready")
-    elif spreadsheet_match.issue == "multiple_spreadsheets":
-        summary_parts.append("Spreadsheet ambiguous")
-    elif fabrication_has_files:
-        summary_parts.append("Spreadsheet missing")
+    if spreadsheet_match.issue == "multiple_spreadsheets":
+        summary_parts.append("BOM ambiguous")
+    elif fabrication_folder_exists and spreadsheet_match.chosen_path is None:
+        summary_parts.append("BOM missing")
     if preview_pdf_match.chosen_path is not None:
         summary_parts.append("Nest Summary")
 
@@ -883,10 +955,15 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
 
 
 def collect_kit_statuses(truck_number: str, settings: ExplorerSettings) -> list[KitStatus]:
-    return [
+    statuses = [
         build_kit_status(truck_number, mapping.kit_name, settings)
         for mapping in configured_kit_mappings(settings)
     ]
+    statuses.extend(
+        build_kit_status(truck_number, kit_name, settings)
+        for kit_name in odd_job_names_for_truck(truck_number, settings)
+    )
+    return statuses
 
 
 def open_path(path: Path) -> None:

@@ -9,6 +9,7 @@ from models import (
     canonicalize_client_numbers_by_truck,
     canonicalize_hidden_kit_entries,
     canonicalize_notes_by_kit,
+    normalize_odd_jobs_by_truck,
     canonicalize_punch_codes_by_kit,
     ExplorerSettings,
     normalize_hidden_truck_entries,
@@ -55,6 +56,7 @@ def load_settings() -> ExplorerSettings:
         punch_codes_by_kit=canonicalize_punch_codes_by_kit(payload.get("punch_codes_by_kit"), kit_templates),
         notes_by_kit=canonicalize_notes_by_kit(payload.get("notes_by_kit"), kit_templates),
         client_numbers_by_truck=canonicalize_client_numbers_by_truck(payload.get("client_numbers_by_truck")),
+        odd_jobs_by_truck=normalize_odd_jobs_by_truck(payload.get("odd_jobs_by_truck")),
         create_support_folders=default_settings.create_support_folders,
         kit_templates=kit_templates,
         truck_order=normalize_truck_order_entries(payload.get("truck_order")),
@@ -87,6 +89,7 @@ def save_settings(settings: ExplorerSettings) -> Path:
     payload["client_numbers_by_truck"] = canonicalize_client_numbers_by_truck(
         settings.client_numbers_by_truck
     )
+    payload["odd_jobs_by_truck"] = normalize_odd_jobs_by_truck(settings.odd_jobs_by_truck)
     payload["truck_order"] = normalize_truck_order_entries(settings.truck_order)
     payload["hidden_trucks"] = normalize_hidden_truck_entries(settings.hidden_trucks)
     payload["hidden_kits"] = canonicalize_hidden_kit_entries(settings.hidden_kits, settings.kit_templates)
