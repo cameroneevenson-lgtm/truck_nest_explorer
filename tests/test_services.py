@@ -45,6 +45,8 @@ from models import (
 )
 from packet_build_service import (
     PacketBuildReadinessError,
+    apply_assembly_context_to_sym_comments,
+    assembly_comment_shorthand,
     build_assembly_packet,
     build_cut_list_packet,
     prepare_packet_build_context,
@@ -1302,6 +1304,79 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             text = report_path.read_text(encoding="utf-8")
             self.assertIn("part_name,assembly_name,assembly_pdf_path,page_number,bom_qty,evidence", text)
             self.assertIn("F55334-B-1001,F55334-BODY", text)
+
+    def test_assembly_comment_shorthand_uses_last_hyphen_token(self) -> None:
+        self.assertEqual(assembly_comment_shorthand("F55334-BODY"), "BODY")
+        self.assertEqual(assembly_comment_shorthand("F55334-DOOR R2"), "DOOR")
+        self.assertEqual(assembly_comment_shorthand("F55334-B-100"), "100")
+
+    def test_apply_assembly_context_to_sym_comments_appends_shorthands(self) -> None:
+        with workspace_tempdir() as temp_root:
+            sym_path = temp_root / "F55334-B-1001.sym"
+            sym_path.write_text(
+                '<Symbol><Attr num="109" name="Comments" desc="Comments about this file." type="s" value="Walls"></Attr></Symbol>',
+                encoding="utf-8",
+            )
+            parts = [SimpleNamespace(sym=str(sym_path), part="F55334-B-1001")]
+            context = scan_assembly_bom_context(
+                parts=parts,
+                source_pdfs=(),
+            )
+            context = type(context)(
+                assembly_pdf_count=context.assembly_pdf_count,
+                checked_part_count=context.checked_part_count,
+                references=(
+                    SimpleNamespace(
+                        part_name="F55334-B-1001",
+                        assembly_name="F55334-BODY",
+                        assembly_pdf_path="",
+                        page_number=1,
+                        bom_qty=1,
+                        evidence="",
+                    ),
+                    SimpleNamespace(
+                        part_name="F55334-B-1001",
+                        assembly_name="F55334-DOOR",
+                        assembly_pdf_path="",
+                        page_number=1,
+                        bom_qty=1,
+                        evidence="",
+                    ),
+                ),
+                read_errors=(),
+            )
+
+            backup_dir = temp_root / "_bak" / "assembly_comments"
+            result = apply_assembly_context_to_sym_comments(parts=parts, result=context, backup_dir=backup_dir)
+            second_result = apply_assembly_context_to_sym_comments(parts=parts, result=context)
+
+            text = sym_path.read_text(encoding="utf-8")
+            self.assertEqual(result.updated_count, 1)
+            self.assertEqual(second_result.updated_count, 0)
+            self.assertIn('value="Walls | ASM: BODY, DOOR"', text)
+            self.assertIn('value="Walls"', (backup_dir / sym_path.name).read_text(encoding="utf-8"))
+
+    def test_apply_assembly_context_to_sym_comments_uses_scan_result(self) -> None:
+        with workspace_tempdir() as temp_root:
+            sym_path = temp_root / "F55334-B-1001.sym"
+            sym_path.write_text(
+                '<Symbol><Attr num="109" name="Comments" desc="Comments about this file." type="s"></Attr></Symbol>',
+                encoding="utf-8",
+            )
+            assembly_pdf = temp_root / "fab" / "F55334-BODY.pdf"
+            write_pdf(
+                assembly_pdf,
+                text="1 F55334-B-1001 LASER BRACKET 2",
+                width=2448,
+                height=1584,
+            )
+            parts = [SimpleNamespace(sym=str(sym_path), part="F55334-B-1001")]
+            context = scan_assembly_bom_context(parts=parts, source_pdfs=(assembly_pdf,))
+
+            result = apply_assembly_context_to_sym_comments(parts=parts, result=context)
+
+            self.assertEqual(result.updated_count, 1)
+            self.assertIn('value="ASM: BODY"', sym_path.read_text(encoding="utf-8"))
 
     def test_build_cut_list_packet_combines_one_copy_of_each_source_pdf(self) -> None:
         with workspace_tempdir() as temp_root:

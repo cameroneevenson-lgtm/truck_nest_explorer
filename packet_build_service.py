@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+import hashlib
+import html
 import os
 from pathlib import Path
 import re
@@ -95,6 +97,14 @@ class AssemblyBomContextResult:
 
 
 @dataclass(frozen=True)
+class AssemblySymCommentUpdateResult:
+    updated_count: int
+    skipped_count: int
+    missing_count: int
+    errors: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class _PartAlias:
     part_name: str
     alias: str
@@ -149,6 +159,13 @@ def _part_display_name(part: object) -> str:
     if value:
         return value
     return Path(str(getattr(part, "sym", "") or "").strip()).stem.strip()
+
+
+def _part_sym_path(part: object) -> Path | None:
+    sym_text = str(getattr(part, "sym", "") or "").strip()
+    if not sym_text:
+        return None
+    return Path(sym_text)
 
 
 def _part_alias_pattern(alias: str) -> re.Pattern[str]:
@@ -235,6 +252,156 @@ def _quantity_from_bom_evidence(evidence: str, alias: str) -> int:
     if before_alias:
         return before_alias[-1]
     return anywhere[-1] if anywhere else 0
+
+
+def assembly_comment_shorthand(assembly_name: str) -> str:
+    stem = Path(str(assembly_name or "").strip()).stem.strip()
+    if not stem:
+        return ""
+    stem = REVISION_SUFFIX_PATTERN.sub("", stem).strip()
+    token = stem.rsplit("-", 1)[-1].strip()
+    return token or stem
+
+
+def _read_text_fallback(path: Path) -> str:
+    data = Path(path).read_bytes()
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _write_text_utf8(path: Path, text: str) -> None:
+    path = Path(path)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_bytes(text.encode("utf-8"))
+    os.replace(tmp_path, path)
+
+
+def _backup_sym_before_comment_update(sym_path: Path, backup_dir: Path | None) -> None:
+    if backup_dir is None:
+        return
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    candidate = backup_dir / sym_path.name
+    if candidate.exists():
+        digest = hashlib.sha1(str(sym_path.resolve()).casefold().encode("utf-8")).hexdigest()[:8]
+        candidate = backup_dir / f"{sym_path.stem}.{digest}{sym_path.suffix}"
+    candidate.write_bytes(sym_path.read_bytes())
+
+
+def _sym_attr_109_comment(text: str) -> str:
+    match = re.search(r'<Attr\s+num="109"[^>]*\bvalue="([^"]*)"', str(text or ""), flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return html.unescape(match.group(1))
+
+
+def _set_sym_attr_109_comment_text(text: str, comment: str) -> tuple[str, bool]:
+    match = re.search(r'(<Attr\s+num="109"[^>]*)(>)', str(text or ""), flags=re.IGNORECASE)
+    if not match:
+        return text, False
+    open_tag = match.group(1)
+    escaped = html.escape(str(comment or ""), quote=True)
+    if re.search(r'\bvalue="[^"]*"', open_tag, flags=re.IGNORECASE):
+        open_tag = re.sub(r'\bvalue="[^"]*"', f'value="{escaped}"', open_tag, flags=re.IGNORECASE)
+    else:
+        open_tag = open_tag + f' value="{escaped}"'
+    new_text = text[: match.start(1)] + open_tag + text[match.end(1) :]
+    return new_text, True
+
+
+def _append_assembly_shorthands_to_comment(existing_comment: str, shorthands: Sequence[str]) -> str:
+    clean_shorthands: list[str] = []
+    seen: set[str] = set()
+    for shorthand in shorthands:
+        clean = str(shorthand or "").strip()
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_shorthands.append(clean)
+    if not clean_shorthands:
+        return str(existing_comment or "").strip()
+
+    comment = str(existing_comment or "").strip()
+    marker_match = re.search(r"(?:^|\s\|\s)ASM:\s*([^|]*)", comment, flags=re.IGNORECASE)
+    existing_assemblies: list[str] = []
+    base_comment = comment
+    if marker_match:
+        existing_assemblies = [item.strip() for item in re.split(r"[,;/]", marker_match.group(1)) if item.strip()]
+        base_comment = (comment[: marker_match.start()] + comment[marker_match.end() :]).strip(" |")
+
+    combined: list[str] = []
+    seen_combined: set[str] = set()
+    for item in [*existing_assemblies, *clean_shorthands]:
+        key = item.casefold()
+        if key in seen_combined:
+            continue
+        seen_combined.add(key)
+        combined.append(item)
+
+    assembly_text = "ASM: " + ", ".join(combined)
+    if not base_comment:
+        return assembly_text
+    return f"{base_comment} | {assembly_text}"
+
+
+def apply_assembly_context_to_sym_comments(
+    *,
+    parts: Sequence[object],
+    result: AssemblyBomContextResult,
+    backup_dir: Path | None = None,
+) -> AssemblySymCommentUpdateResult:
+    sym_by_part: dict[str, Path] = {}
+    for part in parts:
+        part_name = _part_display_name(part)
+        sym_path = _part_sym_path(part)
+        if part_name and sym_path is not None:
+            sym_by_part.setdefault(part_name.casefold(), sym_path)
+
+    shorthands_by_part: dict[str, list[str]] = {}
+    for ref in result.references:
+        shorthand = assembly_comment_shorthand(ref.assembly_name)
+        if shorthand:
+            shorthands_by_part.setdefault(ref.part_name.casefold(), []).append(shorthand)
+
+    updated = 0
+    skipped = 0
+    missing = 0
+    errors: list[tuple[str, str]] = []
+    for part_key, shorthands in sorted(shorthands_by_part.items(), key=lambda item: _natural_sort_key(item[0])):
+        sym_path = sym_by_part.get(part_key)
+        if sym_path is None:
+            skipped += 1
+            continue
+        if not sym_path.exists():
+            missing += 1
+            continue
+        try:
+            text = _read_text_fallback(sym_path)
+            updated_comment = _append_assembly_shorthands_to_comment(_sym_attr_109_comment(text), shorthands)
+            updated_text, found_attr = _set_sym_attr_109_comment_text(text, updated_comment)
+            if not found_attr:
+                skipped += 1
+                continue
+            if updated_text != text:
+                _backup_sym_before_comment_update(sym_path, backup_dir)
+                _write_text_utf8(sym_path, updated_text)
+                updated += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            errors.append((str(sym_path), str(exc)))
+    return AssemblySymCommentUpdateResult(
+        updated_count=updated,
+        skipped_count=skipped,
+        missing_count=missing,
+        errors=tuple(errors),
+    )
 
 
 def _aggregate_quantities(rows: Sequence[tuple[str, int]]) -> dict[str, int]:
