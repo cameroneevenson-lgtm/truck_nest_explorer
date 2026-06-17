@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
-from typing import Callable
+from typing import Callable, Iterator
 
 from models import ExplorerSettings, KitStatus
 from packet_build_service import (
@@ -43,6 +45,7 @@ class FullFlowNeedsUserAction(FullFlowError):
 class InventorFlowResult:
     moved_paths: tuple[Path, ...]
     added_count: int | None = None
+    report_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -57,7 +60,8 @@ class RfAssignmentResult:
     skipped_count: int
     model_source: str
     kit_count: int
-    backup_path: Path
+    backup_path: Path | None
+    skipped_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,7 @@ class NesterResult:
     elapsed_seconds: float
     log_path: Path
     drg_count: int
+    changed_drg_paths: tuple[Path, ...] = ()
     before_snapshot: dict[str, object] | None = None
     after_snapshot: dict[str, object] | None = None
 
@@ -122,25 +127,61 @@ def _radan_kitter_root(settings: ExplorerSettings) -> Path:
     return _tools_root() / "radan_kitter"
 
 
-def _ensure_sys_path(path: Path) -> None:
-    text = str(path)
-    if text not in sys.path:
-        sys.path.insert(0, text)
+def _module_is_from_root(module: object, root: Path) -> bool:
+    file_text = str(getattr(module, "__file__", "") or "")
+    if not file_text:
+        return False
+    try:
+        Path(file_text).resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@contextmanager
+def _isolated_import_root(root: Path, module_names: tuple[str, ...]) -> Iterator[None]:
+    root = Path(root).resolve()
+    path_text = str(root)
+    old_path = list(sys.path)
+    sentinel = object()
+    saved_modules: dict[str, object] = {}
+    try:
+        sys.path.insert(0, path_text)
+        for name in module_names:
+            existing = sys.modules.get(name, sentinel)
+            saved_modules[name] = existing
+            if existing is not sentinel and not _module_is_from_root(existing, root):
+                del sys.modules[name]
+        yield
+    finally:
+        for name, existing in saved_modules.items():
+            current = sys.modules.get(name)
+            if current is not None and _module_is_from_root(current, root):
+                del sys.modules[name]
+            if existing is not sentinel:
+                sys.modules[name] = existing
+        sys.path[:] = old_path
+
+
+def _python_module_names(root: Path) -> tuple[str, ...]:
+    names = {path.stem for path in Path(root).glob("*.py") if path.name != "__init__.py"}
+    return tuple(sorted(names))
 
 
 def _load_radan_kitter_modules(settings: ExplorerSettings):
     root = _radan_kitter_root(settings)
     if not root.exists():
         raise FileNotFoundError(f"RADAN Kitter folder not found: {root}")
-    _ensure_sys_path(root)
-    modules = {
-        "assets": importlib.import_module("assets"),
-        "config": importlib.import_module("config"),
-        "kit_service": importlib.import_module("kit_service"),
-        "packet_service": importlib.import_module("packet_service"),
-        "rf_service": importlib.import_module("rf_service"),
-        "rpd_io": importlib.import_module("rpd_io"),
-    }
+    module_names = _python_module_names(root)
+    with _isolated_import_root(root, module_names):
+        modules = {
+            "assets": importlib.import_module("assets"),
+            "config": importlib.import_module("config"),
+            "kit_service": importlib.import_module("kit_service"),
+            "packet_service": importlib.import_module("packet_service"),
+            "rf_service": importlib.import_module("rf_service"),
+            "rpd_io": importlib.import_module("rpd_io"),
+        }
     return modules
 
 
@@ -148,18 +189,19 @@ def _load_radan_automation_modules():
     root = _tools_root() / "radan_automation"
     if not root.exists():
         raise FileNotFoundError(f"RADAN Automation folder not found: {root}")
-    _ensure_sys_path(root)
-    import_parts = importlib.import_module("import_parts_csv_headless")
-    radan_com = importlib.import_module("radan_com")
+    module_names = _python_module_names(root)
+    with _isolated_import_root(root, module_names):
+        import_parts = importlib.import_module("import_parts_csv_headless")
+        radan_com = importlib.import_module("radan_com")
     return import_parts, radan_com
 
 
 def _project_snapshot(project_path: Path) -> dict[str, object]:
     root = _tools_root() / "radan_automation"
-    if root.exists():
-        _ensure_sys_path(root)
     try:
-        gate = importlib.import_module("copied_project_nester_gate")
+        module_names = _python_module_names(root)
+        with _isolated_import_root(root, module_names):
+            gate = importlib.import_module("copied_project_nester_gate")
         snapshot = gate.project_snapshot(Path(project_path))
         return dict(snapshot)
     except Exception as exc:
@@ -181,6 +223,10 @@ def _snapshot_summary(snapshot: dict[str, object] | None) -> str:
         f"{snapshot.get('made_nonzero_count', '?')} made row(s), "
         f"{snapshot.get('used_nest_count', '?')} used nest row(s)"
     )
+
+
+def should_run_kitter_rf_for_status(status: KitStatus) -> bool:
+    return str(getattr(status, "kit_name", "") or "").strip().casefold() == "paint pack"
 
 
 def _configure_kitter_assets(rk_assets, settings: ExplorerSettings) -> None:
@@ -227,13 +273,71 @@ def run_inventor_inline_for_status(
         ) from exc
 
     _emit(progress_cb, "Inventor: moving generated CSV/report to L")
-    _outputs, moved_paths = move_inventor_outputs_to_project(spreadsheet_path, status.paths.project_dir)
+    outputs, moved_paths = move_inventor_outputs_to_project(spreadsheet_path, status.paths.project_dir)
     added_count = getattr(result, "added_count", None)
     try:
         added_count = int(added_count) if added_count is not None else None
     except (TypeError, ValueError):
         added_count = None
-    return InventorFlowResult(moved_paths=tuple(Path(path) for path in moved_paths), added_count=added_count)
+    report_path = outputs.target_report_path
+    moved = tuple(Path(path) for path in moved_paths)
+    if report_path is None or not report_path.exists():
+        report_path = next((path for path in moved if path.suffix.casefold() == ".txt"), None)
+    return InventorFlowResult(moved_paths=moved, added_count=added_count, report_path=report_path)
+
+
+def _clean_import_log_line(line: str) -> str:
+    text = str(line or "").strip()
+    if text.startswith("[") and "]" in text[:24]:
+        text = text.split("]", 1)[1].strip()
+    return text
+
+
+def _is_useful_import_progress_line(line: str) -> bool:
+    text = _clean_import_log_line(line)
+    if not text or text in {"{", "}", "[", "]"}:
+        return False
+    if text[0] in {'"', ","}:
+        return False
+    prefixes = (
+        "Read ",
+        "Temporary part limit",
+        "Project update method",
+        "Reusing ",
+        "Conversion needed",
+        "All symbols",
+        "Converting ",
+        "Converted ",
+        "Conversion stage complete",
+        "Checking ",
+        "Refreshing ",
+        "Verified ",
+        "Backed up project",
+        "Reconciling ",
+        "Skipped ",
+        "RPD post-write",
+        "RPD post-sheet",
+        "RADAN project sheet refresh",
+        "RADAN NST",
+        "Project sheet refresh",
+        "Project part",
+        "Added ",
+        "Headless RADAN CSV import completed",
+        "ERROR",
+        "WARNING",
+    )
+    return text.startswith(prefixes)
+
+
+def latest_import_progress_message(log_path: Path) -> str | None:
+    try:
+        lines = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines[-80:]):
+        if _is_useful_import_progress_line(line):
+            return _clean_import_log_line(line)
+    return None
 
 
 def run_csv_import_for_status(
@@ -273,11 +377,19 @@ def run_csv_import_for_status(
     )
 
     started = time.time()
+    last_progress_message = ""
+    last_fallback_at = 0.0
     while True:
         return_code = process.poll()
         if return_code is not None:
             break
-        _emit(progress_cb, f"RADAN import: helper PID {process.pid} still running ({time.time() - started:.0f}s)")
+        progress_message = latest_import_progress_message(log_path)
+        if progress_message and progress_message != last_progress_message:
+            last_progress_message = progress_message
+            _emit(progress_cb, f"RADAN import: {progress_message}")
+        elif time.time() - last_fallback_at >= 5.0:
+            last_fallback_at = time.time()
+            _emit(progress_cb, f"RADAN import: helper PID {process.pid} still running ({time.time() - started:.0f}s)")
         time.sleep(0.35)
 
     if int(return_code) != 0:
@@ -339,8 +451,12 @@ def run_kitter_rf_assignment_for_project(
     if predicted_count <= 0:
         raise FullFlowError("Kitter RF did not produce any kit assignments.")
 
-    _emit(progress_cb, f"Kitter RF: writing {predicted_count} predicted assignment(s)")
-    kit_count = rk_kit_service.prepare_kits(
+    _emit(
+        progress_cb,
+        f"Kitter RF: conditioning priorities and kit files for {predicted_count} predicted assignment(s); skipping RF kit-label Attr109 comments",
+    )
+    kit_count = _prepare_full_flow_kits_without_attr109(
+        rk_kit_service,
         parts,
         rpd_path=str(project_path),
         donor_template_path=rk_config.DONOR_TEMPLATE_PATH,
@@ -364,6 +480,61 @@ def run_kitter_rf_assignment_for_project(
         kit_count=int(kit_count),
         backup_path=backup_path,
     )
+
+
+def _prepare_full_flow_kits_without_attr109(
+    rk_kit_service,
+    parts: list[object],
+    *,
+    rpd_path: str,
+    donor_template_path: str,
+    bak_dirname: str,
+    kits_dirname: str,
+    kit_to_priority: dict[str, str],
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> int:
+    def _kit_progress(done: int, total: int, status: str) -> None:
+        if progress_cb is None:
+            return
+        progress_cb(int(done), int(total), str(status))
+
+    rk_kit_service.apply_balance_and_update_kit_texts(
+        parts,
+        kits_dirname=kits_dirname,
+        kit_to_priority=kit_to_priority,
+    )
+
+    if not os.path.exists(donor_template_path):
+        raise RuntimeError(f"Donor not found: {donor_template_path}")
+
+    base_dir = os.path.dirname(rpd_path)
+    kits_backup_dir = os.path.join(base_dir, bak_dirname, "kits")
+    rk_kit_service.ensure_dir(kits_backup_dir)
+    kits_to_parts = rk_kit_service.sym_io.group_parts_by_kit(
+        parts=parts,
+        sanitize_kit_name=rk_kit_service.sanitize_kit_name,
+        is_valid_kit_name=rk_kit_service.is_valid_kit_name,
+    )
+
+    total_steps = max(1, len(kits_to_parts))
+    done_steps = 0
+    _kit_progress(done_steps, total_steps, "Preparing kits without updating RF kit-label Attr109 comments...")
+    for kit_label, part_rows in kits_to_parts.items():
+        status = "Skipping invalid kit label"
+        clean_kit = rk_kit_service.sanitize_kit_name(kit_label)
+        if clean_kit and rk_kit_service.is_valid_kit_name(clean_kit):
+            member_syms = [rk_kit_service.force_l_drive_path(part.sym) for part in part_rows]
+            out_path = rk_kit_service.kit_file_path_for_part_sym(part_rows[0].sym, clean_kit, kits_dirname)
+            rk_kit_service.sym_io.build_kit_sym_from_donor(
+                donor_path=donor_template_path,
+                member_part_syms=member_syms,
+                out_kit_sym_path=out_path,
+                backup_dir=kits_backup_dir,
+            )
+            status = f"Building kit: {clean_kit}"
+        done_steps += 1
+        _kit_progress(done_steps, total_steps, status)
+    return len(kits_to_parts)
 
 
 def build_all_packets_for_status(
@@ -472,14 +643,39 @@ def run_full_flow_before_nester(
     runtime_dir: Path,
     progress_cb: ProgressCallback | None = None,
 ) -> FullFlowResult:
+    raise FullFlowNeedsUserAction(
+        "Inventor report review is required before RADAN CSV import. "
+        "Run Inventor as a separate Full Flow phase, review the report on the UI thread, "
+        "then call run_full_flow_after_inventor_review()."
+    )
+
+
+def run_full_flow_after_inventor_review(
+    status: KitStatus,
+    settings: ExplorerSettings,
+    *,
+    inventor: InventorFlowResult,
+    runtime_dir: Path,
+    progress_cb: ProgressCallback | None = None,
+) -> FullFlowResult:
     if status.paths.rpd_path is None:
         raise FullFlowError("The L-side project file is not available for this kit.")
-    _emit(progress_cb, "Full flow 1/4: running Inventor tool")
-    inventor = run_inventor_inline_for_status(status, settings, progress_cb=progress_cb)
     _emit(progress_cb, "Full flow 2/4: pushing parts into the RPD")
     csv_import = run_csv_import_for_status(status, runtime_dir=runtime_dir, progress_cb=progress_cb)
-    _emit(progress_cb, "Full flow 3/4: running Kitter RF assignment")
-    rf_assignment = run_kitter_rf_assignment_for_project(status.paths.rpd_path, settings, progress_cb=progress_cb)
+    if should_run_kitter_rf_for_status(status):
+        _emit(progress_cb, "Full flow 3/4: running Kitter RF assignment for Paint Pack")
+        rf_assignment = run_kitter_rf_assignment_for_project(status.paths.rpd_path, settings, progress_cb=progress_cb)
+    else:
+        reason = f"Kitter RF only runs for PAINT PACK; selected kit is {status.kit_name}."
+        _emit(progress_cb, f"Full flow 3/4: skipping Kitter RF. {reason}")
+        rf_assignment = RfAssignmentResult(
+            predicted_count=0,
+            skipped_count=0,
+            model_source="skipped",
+            kit_count=0,
+            backup_path=None,
+            skipped_reason=reason,
+        )
     _emit(progress_cb, "Full flow 4/4: building print, assembly, and cut-list packets")
     packets = build_all_packets_for_status(status, settings, progress_cb=progress_cb)
     _emit(progress_cb, "Full flow: pre-nester work complete")
@@ -490,6 +686,26 @@ def run_full_flow_before_nester(
         rf_assignment=rf_assignment,
         packets=packets,
     )
+
+
+def _drg_signature(root: Path) -> dict[str, tuple[int, int]]:
+    signatures: dict[str, tuple[int, int]] = {}
+    for path in Path(root).rglob("*.drg"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signatures[os.path.normcase(str(path.resolve()))] = (int(stat.st_mtime_ns), int(stat.st_size))
+    return signatures
+
+
+def changed_drg_paths(before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]) -> tuple[Path, ...]:
+    changed = [
+        Path(path)
+        for path, signature in after.items()
+        if before.get(path) != signature
+    ]
+    return tuple(sorted(changed, key=lambda path: str(path).casefold()))
 
 
 def run_headless_nester(
@@ -507,6 +723,7 @@ def run_headless_nester(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = import_parts._Logger(log_path)
     preexisting_visible_pids = import_parts._visible_radan_process_ids()
+    before_drg_signature = _drg_signature(project.parent)
     before_snapshot = _project_snapshot(project)
     logger.write(f"Before nesting snapshot: {_snapshot_summary(before_snapshot)}")
     _emit(progress_cb, f"Nester precheck: {_snapshot_summary(before_snapshot)}")
@@ -567,10 +784,16 @@ def run_headless_nester(
             logger.write(f"RADAN quit after nesting failed: {type(exc).__name__}: {exc}")
 
         after_snapshot = _project_snapshot(project)
-        drg_count = len(tuple(project.parent.rglob("*.drg")))
-        ok = int(return_code) == 0 and drg_count > 0
+        after_drg_signature = _drg_signature(project.parent)
+        changed_drgs = changed_drg_paths(before_drg_signature, after_drg_signature)
+        drg_count = len(after_drg_signature)
+        ok = int(return_code) == 0 and len(changed_drgs) > 0
         logger.write(f"After nesting snapshot: {_snapshot_summary(after_snapshot)}")
-        _emit(progress_cb, f"Nester: returned {return_code} after {elapsed:.1f}s; found {drg_count} DRG(s)")
+        logger.write(f"New/updated DRGs from this run: {len(changed_drgs)}.")
+        _emit(
+            progress_cb,
+            f"Nester: returned {return_code} after {elapsed:.1f}s; new/updated {len(changed_drgs)} DRG(s), total {drg_count}",
+        )
         if not ok:
             _emit(
                 progress_cb,
@@ -581,6 +804,8 @@ def run_headless_nester(
             "return_code": return_code,
             "elapsed_seconds": elapsed,
             "drg_count": drg_count,
+            "changed_drg_count": len(changed_drgs),
+            "changed_drg_files": [str(path) for path in changed_drgs],
             "ok": ok,
             "before": before_snapshot,
             "after": after_snapshot,
@@ -592,6 +817,7 @@ def run_headless_nester(
             elapsed_seconds=float(elapsed),
             log_path=log_path,
             drg_count=drg_count,
+            changed_drg_paths=changed_drgs,
             before_snapshot=before_snapshot,
             after_snapshot=after_snapshot,
         )

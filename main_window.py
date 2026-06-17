@@ -67,8 +67,9 @@ from flow_bridge import (
 from full_flow_service import (
     FullFlowError,
     FullFlowNeedsUserAction,
-    run_full_flow_before_nester,
+    run_full_flow_after_inventor_review,
     run_headless_nester,
+    run_inventor_inline_for_status,
 )
 from models import (
     canonicalize_client_numbers_by_truck,
@@ -226,6 +227,10 @@ class MainWindow(QMainWindow):
         self._pending_inventor_job: PendingInventorJob | None = None
         self._radan_import_log_dialog: ImportLogDialog | None = None
         self._radan_import_log_dialogs: list[ImportLogDialog] = []
+        self._full_flow_running = False
+        self._full_flow_worker: PacketJobWorker | None = None
+        self._full_flow_disabled_widget_states: list[tuple[QWidget, bool]] = []
+        self._full_flow_table_edit_triggers = None
         self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
         self._flow_cache_by_truck: dict[str, tuple[str, FlowTruckInsight]] = {}
         self._flow_gantt_source_bytes: bytes | None = None
@@ -426,8 +431,12 @@ class MainWindow(QMainWindow):
             )
         )
 
-        save_button = QPushButton("Save Settings")
-        save_button.clicked.connect(self.save_settings_from_form)
+        self.settings_browse_release_button = browse_release
+        self.settings_browse_fabrication_button = browse_fabrication
+        self.settings_browse_kitter_button = browse_kitter
+        self.settings_browse_inventor_button = browse_inventor
+        self.settings_save_button = QPushButton("Save Settings")
+        self.settings_save_button.clicked.connect(self.save_settings_from_form)
 
         row = 0
         layout.addWidget(QLabel("Release Root"), row, 0)
@@ -448,7 +457,7 @@ class MainWindow(QMainWindow):
         row += 1
         layout.addWidget(self.create_support_folders_checkbox, row, 0, 1, 3)
         row += 1
-        layout.addWidget(save_button, row, 2)
+        layout.addWidget(self.settings_save_button, row, 2)
 
         return group
 
@@ -1738,6 +1747,8 @@ class MainWindow(QMainWindow):
             "Show Kits" if selected_hidden else "Hide Kits"
         )
         self._refresh_details_pane()
+        if self._full_flow_running:
+            self._reapply_full_flow_action_lock()
 
     def _refresh_show_hidden_trucks_button(self) -> None:
         hidden_count = len(normalize_hidden_truck_entries(self.settings.hidden_trucks))
@@ -2807,7 +2818,154 @@ class MainWindow(QMainWindow):
         append("Full flow started. Checking the selected kit and configured tools.")
         return append, finish
 
+    def _full_flow_mutating_widgets(self) -> tuple[QWidget, ...]:
+        names = (
+            "full_flow_button",
+            "new_truck_button",
+            "move_truck_up_button",
+            "move_truck_down_button",
+            "create_missing_button",
+            "create_selected_button",
+            "edit_truck_client_button",
+            "toggle_truck_hidden_button",
+            "toggle_selected_kits_hidden_button",
+            "build_print_packet_button",
+            "build_assembly_packet_button",
+            "build_cut_list_button",
+            "launch_kitter_button",
+            "launch_inventor_button",
+            "import_csv_button",
+            "radan_dxf_source_slider",
+            "radan_project_update_slider",
+            "release_root_edit",
+            "fabrication_root_edit",
+            "radan_kitter_edit",
+            "inventor_entry_edit",
+            "create_support_folders_checkbox",
+            "settings_browse_release_button",
+            "settings_browse_fabrication_button",
+            "settings_browse_kitter_button",
+            "settings_browse_inventor_button",
+            "settings_save_button",
+        )
+        widgets: list[QWidget] = []
+        for name in names:
+            widget = getattr(self, name, None)
+            if isinstance(widget, QWidget):
+                widgets.append(widget)
+        return tuple(widgets)
+
+    def _lock_full_flow_actions(self) -> None:
+        self._full_flow_disabled_widget_states = [
+            (widget, bool(widget.isEnabled()))
+            for widget in self._full_flow_mutating_widgets()
+        ]
+        self._reapply_full_flow_action_lock()
+        self._full_flow_table_edit_triggers = self.kit_table.editTriggers()
+        self.kit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.full_flow_button.setText("Running Full Flow...")
+
+    def _reapply_full_flow_action_lock(self) -> None:
+        for widget, _enabled in self._full_flow_disabled_widget_states:
+            widget.setEnabled(False)
+        if self._full_flow_running:
+            self.kit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+    def _unlock_full_flow_actions(self) -> None:
+        for widget, enabled in self._full_flow_disabled_widget_states:
+            try:
+                widget.setEnabled(enabled)
+            except RuntimeError:
+                pass
+        self._full_flow_disabled_widget_states = []
+        if self._full_flow_table_edit_triggers is not None:
+            self.kit_table.setEditTriggers(self._full_flow_table_edit_triggers)
+            self._full_flow_table_edit_triggers = None
+        self.full_flow_button.setText("Run Full Flow")
+
+    def _review_full_flow_inventor_report(
+        self,
+        status: KitStatus,
+        inventor,
+        progress_cb,
+    ) -> str:
+        report_path = getattr(inventor, "report_path", None)
+        if report_path is None or not Path(report_path).exists():
+            report_path = next(
+                (path for path in getattr(inventor, "moved_paths", ()) if Path(path).suffix.casefold() == ".txt"),
+                None,
+            )
+        if report_path is None or not Path(report_path).exists():
+            QMessageBox.critical(
+                self,
+                "Run Full Flow",
+                "Inventor-to-RADAN completed, but the generated report could not be found for review.",
+            )
+            progress_cb("Failed: Inventor report could not be found for review.")
+            return "error"
+
+        progress_cb(f"Inventor report ready for operator review: {Path(report_path).name}")
+        try:
+            review_dialog = InventorReportReviewDialog(Path(report_path), self)
+            review_result = review_dialog.exec()
+        except Exception as exc:
+            QMessageBox.critical(self, "Run Full Flow", f"Could not show report review:\n\n{exc}")
+            progress_cb(f"Failed: could not show Inventor report review ({exc})")
+            return "error"
+
+        if review_result == QDialog.Accepted:
+            progress_cb("Inventor report accepted. Continuing to RADAN CSV import.")
+            return "accepted"
+
+        discard_paths = tuple(
+            Path(path)
+            for path in getattr(inventor, "moved_paths", ())
+            if Path(path).suffix.casefold() in {".csv", ".txt"}
+        )
+        deleted_paths, failed_deletes = delete_paths(discard_paths)
+        self._queue_status_refresh_for_truck(status.paths.truck_number)
+        self.log(
+            "Discarded unacknowledged Inventor-to-RADAN outputs during Full Flow: "
+            + ", ".join(str(path) for path in deleted_paths)
+        )
+        progress_cb("Stopped by operator after Inventor report review.")
+        if failed_deletes:
+            QMessageBox.warning(
+                self,
+                "Run Full Flow",
+                "The Inventor-to-RADAN report was not acknowledged, but some generated files could not be deleted.\n\n"
+                + "\n".join(failed_deletes),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Run Full Flow",
+                "Full Flow stopped by operator after Inventor report review.\n\n"
+                "The generated CSV/report were deleted.\n\n"
+                + "\n".join(str(path) for path in deleted_paths),
+            )
+        return "stopped"
+
+    def _start_full_flow_worker(self, job_fn, on_done, on_error, progress_cb) -> None:
+        worker = PacketJobWorker(job_fn)
+        self._full_flow_worker = worker
+
+        def _on_progress(_done: int, _total: int, status_text: str) -> None:
+            progress_cb(str(status_text))
+
+        worker.signals.progress.connect(_on_progress)
+        worker.signals.done.connect(on_done)
+        worker.signals.error.connect(on_error)
+        QThreadPool.globalInstance().start(worker)
+
     def run_selected_full_flow(self) -> None:
+        if self._full_flow_running:
+            QMessageBox.information(
+                self,
+                "Run Full Flow",
+                "Full Flow is already running. Let it finish before starting another one.",
+            )
+            return
         status = self._current_status()
         if status is None:
             QMessageBox.information(self, "Run Full Flow", "Select a kit first.")
@@ -2835,35 +2993,56 @@ class MainWindow(QMainWindow):
         should_run_nester = bool(nester_checkbox.isChecked())
 
         _progress, _finish_progress = self._create_full_flow_progress_dialog(status)
-        self.full_flow_button.setEnabled(False)
+        self._full_flow_running = True
+        self._lock_full_flow_actions()
 
-        try:
-            _progress(f"Selected kit: {status.paths.display_name}")
-            if should_run_nester:
-                _progress("Headless nester option: ON. The project will still open afterward.")
-            else:
-                _progress("Headless nester option: OFF. RADAN will open for the manual Run Nester button.")
+        def _finish_and_unlock(message: str | None = None) -> None:
+            self._full_flow_worker = None
+            self._full_flow_running = False
+            self._unlock_full_flow_actions()
+            _finish_progress(message)
+
+        def _show_worker_error(tb: str) -> None:
+            _finish_and_unlock("Failed with an unexpected error. See the error dialog for details.")
+            QMessageBox.critical(self, "Run Full Flow", str(tb or "").strip() or "Full Flow failed.")
+
+        def _finalize(result, opened_packets: int, nester_message: str) -> None:
+            _progress(f"Opening RADAN project: {result.project_path}")
             try:
-                result = run_full_flow_before_nester(
-                    status,
-                    self.settings,
-                    runtime_dir=self._runtime_dir,
-                    progress_cb=_progress,
-                )
-            except FullFlowNeedsUserAction as exc:
-                _finish_progress(f"Stopped for user action: {exc}")
-                QMessageBox.information(self, "Run Full Flow", str(exc))
-                return
-            except FullFlowError as exc:
-                _finish_progress(f"Failed: {exc}")
-                QMessageBox.critical(self, "Run Full Flow", str(exc))
-                return
-            except Exception:
-                detail = traceback.format_exc()
-                _finish_progress("Failed with an unexpected error. See the error dialog for details.")
-                QMessageBox.critical(self, "Run Full Flow", detail)
-                return
+                open_path(result.project_path)
+                _progress("RADAN project open command sent. Click Run Nester manually if nests are not already created.")
+            except Exception as exc:
+                _progress(f"Could not open RADAN project: {exc}")
+                QMessageBox.warning(self, "Run Full Flow", f"Could not open RADAN project:\n{exc}")
 
+            rf_summary = (
+                f"Kitter RF skipped: {result.rf_assignment.skipped_reason}"
+                if result.rf_assignment.skipped_reason
+                else f"RF assignments: {result.rf_assignment.predicted_count}"
+            )
+            self._queue_status_refresh_for_truck(status.paths.truck_number)
+            self.log(
+                f"Full flow complete for {status.paths.display_name}: "
+                f"{rf_summary}, "
+                f"{opened_packets} packet(s) opened. {nester_message}"
+            )
+            _finish_and_unlock("Full flow complete. RADAN is open or opening for the manual Run Nester step.")
+            QMessageBox.information(
+                self,
+                "Run Full Flow",
+                (
+                    f"Inventor outputs moved: {len(result.inventor.moved_paths)}\n"
+                    f"{rf_summary}\n"
+                    f"Print packet pages: {result.packets.print_pages} "
+                    f"(missing PDFs: {result.packets.print_missing})\n"
+                    f"Assembly packet pages: {result.packets.assembly_pages}\n"
+                    f"Cut list pages: {result.packets.cut_list_pages}\n"
+                    f"Packets opened: {opened_packets}\n"
+                    f"{nester_message}"
+                ),
+            )
+
+        def _after_pre_nester(result) -> None:
             opened_packets = 0
             _progress(f"Opening {len(result.packets.packet_paths)} packet(s).")
             for packet_path in result.packets.packet_paths:
@@ -2877,77 +3056,132 @@ class MainWindow(QMainWindow):
                     _progress(message)
 
             nester_message = "Headless nester skipped; RADAN opened for manual Run Nester."
-            if should_run_nester:
-                _progress("Waiting for close-RADAN confirmation before the headless nester attempt.")
-                if self._confirm_close_radan_for_full_flow():
-                    try:
-                        nester_result = run_headless_nester(
-                            result.project_path,
-                            runtime_dir=self._runtime_dir,
-                            progress_cb=_progress,
-                        )
-                        nester_message = (
-                            f"Headless nester return: {nester_result.return_code}; "
-                            f"DRGs found: {nester_result.drg_count}; log: {nester_result.log_path}"
-                        )
-                        if nester_result.ok:
-                            _progress(f"Headless nester created {nester_result.drg_count} DRG(s).")
-                        else:
-                            _progress(
-                                "Headless nester did not create nests. RADAN will open next; click Run Nester manually."
-                            )
-                            QMessageBox.warning(
-                                self,
-                                "Run Full Flow",
-                                (
-                                    "RADAN did not create nests during the headless attempt.\n\n"
-                                    f"Return code: {nester_result.return_code}\n"
-                                    f"DRGs found: {nester_result.drg_count}\n"
-                                    f"Log: {nester_result.log_path}\n\n"
-                                    "This can happen when a part is larger than the available sheet or RADAN needs "
-                                    "an operator decision. The project will open now; click Run Nester manually in RADAN."
-                                ),
-                            )
-                    except Exception as exc:
-                        nester_message = f"Headless nester failed: {exc}"
-                        _progress(f"{nester_message}. RADAN will open for manual Run Nester.")
-                        QMessageBox.warning(self, "Run Full Flow", nester_message)
-                else:
-                    _progress("Headless nester skipped after the close-RADAN confirmation. RADAN will open normally.")
-            else:
+            if not should_run_nester:
                 _progress("Skipping headless nester. RADAN will open for manual Run Nester.")
+                _finalize(result, opened_packets, nester_message)
+                return
 
-            _progress(f"Opening RADAN project: {result.project_path}")
+            _progress("Waiting for close-RADAN confirmation before the headless nester attempt.")
+            if not self._confirm_close_radan_for_full_flow():
+                _progress("Headless nester skipped after the close-RADAN confirmation. RADAN will open normally.")
+                _finalize(result, opened_packets, nester_message)
+                return
+
+            def _nester_job(worker: PacketJobWorker) -> dict[str, object]:
+                try:
+                    nester_result = run_headless_nester(
+                        result.project_path,
+                        runtime_dir=self._runtime_dir,
+                        progress_cb=lambda message: worker.emit_progress(0, 0, message),
+                    )
+                    return {"state": "done", "result": nester_result}
+                except Exception as exc:
+                    return {"state": "error", "message": str(exc)}
+
+            def _on_nester_done(payload: object) -> None:
+                data = payload if isinstance(payload, dict) else {}
+                if data.get("state") == "error":
+                    nester_msg = f"Headless nester failed: {data.get('message')}"
+                    _progress(f"{nester_msg}. RADAN will open for manual Run Nester.")
+                    QMessageBox.warning(self, "Run Full Flow", nester_msg)
+                    _finalize(result, opened_packets, nester_msg)
+                    return
+                nester_result = data.get("result")
+                changed_count = len(getattr(nester_result, "changed_drg_paths", ()) or ())
+                nester_msg = (
+                    f"Headless nester return: {getattr(nester_result, 'return_code', None)}; "
+                    f"new/updated DRGs: {changed_count}; "
+                    f"total DRGs found: {getattr(nester_result, 'drg_count', 0)}; "
+                    f"log: {getattr(nester_result, 'log_path', '')}"
+                )
+                if bool(getattr(nester_result, "ok", False)):
+                    _progress(f"Headless nester created or updated {changed_count} DRG(s).")
+                else:
+                    _progress("Headless nester did not create new nests. RADAN will open next; click Run Nester manually.")
+                    QMessageBox.warning(
+                        self,
+                        "Run Full Flow",
+                        (
+                            "RADAN did not create new or updated nests during the headless attempt.\n\n"
+                            f"Return code: {getattr(nester_result, 'return_code', None)}\n"
+                            f"New/updated DRGs: {changed_count}\n"
+                            f"Total DRGs found: {getattr(nester_result, 'drg_count', 0)}\n"
+                            f"Log: {getattr(nester_result, 'log_path', '')}\n\n"
+                            "This can happen when old DRGs already exist, a part is larger than the available sheet, "
+                            "or RADAN needs an operator decision. The project will open now; click Run Nester manually in RADAN."
+                        ),
+                    )
+                _finalize(result, opened_packets, nester_msg)
+
+            self._start_full_flow_worker(_nester_job, _on_nester_done, _show_worker_error, _progress)
+
+        def _post_review_job(inventor):
+            def _job(worker: PacketJobWorker) -> dict[str, object]:
+                try:
+                    result = run_full_flow_after_inventor_review(
+                        status,
+                        self.settings,
+                        inventor=inventor,
+                        runtime_dir=self._runtime_dir,
+                        progress_cb=lambda message: worker.emit_progress(0, 0, message),
+                    )
+                    return {"state": "done", "result": result}
+                except FullFlowError as exc:
+                    return {"state": "error", "message": str(exc)}
+
+            def _on_done(payload: object) -> None:
+                data = payload if isinstance(payload, dict) else {}
+                if data.get("state") == "error":
+                    message = str(data.get("message") or "Full Flow failed.")
+                    _finish_and_unlock(f"Failed: {message}")
+                    QMessageBox.critical(self, "Run Full Flow", message)
+                    return
+                _after_pre_nester(data.get("result"))
+
+            self._start_full_flow_worker(_job, _on_done, _show_worker_error, _progress)
+
+        def _inventor_job(worker: PacketJobWorker) -> dict[str, object]:
             try:
-                open_path(result.project_path)
-                _progress("RADAN project open command sent. Click Run Nester manually if nests are not already created.")
-            except Exception as exc:
-                _progress(f"Could not open RADAN project: {exc}")
-                QMessageBox.warning(self, "Run Full Flow", f"Could not open RADAN project:\n{exc}")
+                inventor = run_inventor_inline_for_status(
+                    status,
+                    self.settings,
+                    progress_cb=lambda message: worker.emit_progress(0, 0, message),
+                )
+                return {"state": "done", "inventor": inventor}
+            except FullFlowNeedsUserAction as exc:
+                return {"state": "needs_user_action", "message": str(exc)}
+            except FullFlowError as exc:
+                return {"state": "error", "message": str(exc)}
 
-            self._queue_status_refresh_for_truck(status.paths.truck_number)
-            self.log(
-                f"Full flow complete for {status.paths.display_name}: "
-                f"{result.rf_assignment.predicted_count} RF assignment(s), "
-                f"{opened_packets} packet(s) opened. {nester_message}"
-            )
-            _finish_progress("Full flow complete. RADAN is open or opening for the manual Run Nester step.")
-            QMessageBox.information(
-                self,
-                "Run Full Flow",
-                (
-                    f"Inventor outputs moved: {len(result.inventor.moved_paths)}\n"
-                    f"RF assignments: {result.rf_assignment.predicted_count}\n"
-                    f"Print packet pages: {result.packets.print_pages} "
-                    f"(missing PDFs: {result.packets.print_missing})\n"
-                    f"Assembly packet pages: {result.packets.assembly_pages}\n"
-                    f"Cut list pages: {result.packets.cut_list_pages}\n"
-                    f"Packets opened: {opened_packets}\n"
-                    f"{nester_message}"
-                ),
-            )
-        finally:
-            self.full_flow_button.setEnabled(True)
+        def _on_inventor_done(payload: object) -> None:
+            data = payload if isinstance(payload, dict) else {}
+            state = str(data.get("state") or "")
+            if state == "needs_user_action":
+                message = str(data.get("message") or "Inventor-to-RADAN needs user action.")
+                _finish_and_unlock(f"Stopped for user action: {message}")
+                QMessageBox.information(self, "Run Full Flow", message)
+                return
+            if state == "error":
+                message = str(data.get("message") or "Inventor-to-RADAN failed.")
+                _finish_and_unlock(f"Failed: {message}")
+                QMessageBox.critical(self, "Run Full Flow", message)
+                return
+            inventor = data.get("inventor")
+            review_state = self._review_full_flow_inventor_report(status, inventor, _progress)
+            if review_state == "accepted":
+                _post_review_job(inventor)
+                return
+            if review_state == "stopped":
+                _finish_and_unlock("Stopped by operator after Inventor report review.")
+                return
+            _finish_and_unlock("Failed before RADAN CSV import.")
+
+        _progress(f"Selected kit: {status.paths.display_name}")
+        if should_run_nester:
+            _progress("Headless nester option: ON. The project will still open afterward.")
+        else:
+            _progress("Headless nester option: OFF. RADAN will open for the manual Run Nester button.")
+        self._start_full_flow_worker(_inventor_job, _on_inventor_done, _show_worker_error, _progress)
 
     def _confirm_close_radan_for_full_flow(self) -> bool:
         try:
@@ -3422,6 +3656,14 @@ class MainWindow(QMainWindow):
         self._clear_radan_import_marker(process_id=dialog.process_id)
 
     def closeEvent(self, event) -> None:
+        if self._full_flow_running:
+            QMessageBox.warning(
+                self,
+                "Full Flow Running",
+                "Full Flow is still running. The Explorer window will stay open until it finishes or stops.",
+            )
+            event.ignore()
+            return
         running_import_logs = [
             dialog
             for dialog in self._radan_import_log_dialogs

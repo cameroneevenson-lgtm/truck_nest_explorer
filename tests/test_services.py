@@ -6,13 +6,15 @@ import json
 import os
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import uuid
 from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import fitz
 
@@ -24,6 +26,7 @@ RADAN_DIR = PROJECT_DIR.parent / "radan_kitter"
 if str(RADAN_DIR) not in sys.path:
     sys.path.insert(0, str(RADAN_DIR))
 
+import full_flow_service
 import rpd_io  # type: ignore[import-not-found]
 from flow_bridge import (
     flow_kit_insight_for_explorer_kit,
@@ -2004,6 +2007,319 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             add_odd_job_to_truck(settings, "F55334", "PAINT PACK")
+
+    def test_full_flow_legacy_entrypoint_requires_report_review(self) -> None:
+        status = SimpleNamespace(kit_name="PAINT PACK", paths=SimpleNamespace(rpd_path=Path("paint.rpd")))
+
+        with self.assertRaises(full_flow_service.FullFlowNeedsUserAction):
+            full_flow_service.run_full_flow_before_nester(
+                status,
+                ExplorerSettings(),
+                runtime_dir=Path("."),
+            )
+
+    def test_full_flow_skips_kitter_rf_for_non_paint_pack(self) -> None:
+        status = SimpleNamespace(kit_name="PUMPHOUSE", paths=SimpleNamespace(rpd_path=Path("job.rpd")))
+        progress: list[str] = []
+        inventor = full_flow_service.InventorFlowResult(moved_paths=(), report_path=Path("report.txt"))
+        packet_result = full_flow_service.PacketFlowResult(
+            packet_paths=(),
+            print_pages=0,
+            print_missing=0,
+            assembly_pages=0,
+            cut_list_pages=0,
+        )
+
+        with (
+            patch(
+                "full_flow_service.run_csv_import_for_status",
+                return_value=full_flow_service.CsvImportResult(log_path=Path("import.log"), return_code=0),
+            ),
+            patch(
+                "full_flow_service.run_kitter_rf_assignment_for_project",
+                side_effect=AssertionError("RF should not run for non-Paint Pack"),
+            ) as rf_mock,
+            patch("full_flow_service.build_all_packets_for_status", return_value=packet_result),
+        ):
+            result = full_flow_service.run_full_flow_after_inventor_review(
+                status,
+                ExplorerSettings(),
+                inventor=inventor,
+                runtime_dir=Path("."),
+                progress_cb=progress.append,
+            )
+
+        self.assertFalse(rf_mock.called)
+        self.assertEqual(result.rf_assignment.model_source, "skipped")
+        self.assertIn("only runs for PAINT PACK", result.rf_assignment.skipped_reason or "")
+        self.assertTrue(any("skipping Kitter RF" in message for message in progress))
+
+    def test_full_flow_runs_kitter_rf_for_paint_pack(self) -> None:
+        status = SimpleNamespace(kit_name="PAINT PACK", paths=SimpleNamespace(rpd_path=Path("paint.rpd")))
+        inventor = full_flow_service.InventorFlowResult(moved_paths=(), report_path=Path("report.txt"))
+        packet_result = full_flow_service.PacketFlowResult(
+            packet_paths=(),
+            print_pages=0,
+            print_missing=0,
+            assembly_pages=0,
+            cut_list_pages=0,
+        )
+        rf_result = full_flow_service.RfAssignmentResult(
+            predicted_count=12,
+            skipped_count=0,
+            model_source="model",
+            kit_count=3,
+            backup_path=Path("paint.bak"),
+        )
+
+        with (
+            patch(
+                "full_flow_service.run_csv_import_for_status",
+                return_value=full_flow_service.CsvImportResult(log_path=Path("import.log"), return_code=0),
+            ),
+            patch("full_flow_service.run_kitter_rf_assignment_for_project", return_value=rf_result) as rf_mock,
+            patch("full_flow_service.build_all_packets_for_status", return_value=packet_result),
+        ):
+            result = full_flow_service.run_full_flow_after_inventor_review(
+                status,
+                ExplorerSettings(),
+                inventor=inventor,
+                runtime_dir=Path("."),
+            )
+
+        rf_mock.assert_called_once()
+        self.assertEqual(result.rf_assignment.predicted_count, 12)
+        self.assertIsNone(result.rf_assignment.skipped_reason)
+
+    def test_full_flow_rf_prepares_kits_without_attr109_labels(self) -> None:
+        with workspace_tempdir() as temp_root:
+            project_path = temp_root / "paint.rpd"
+            project_path.write_text("<RadanProject />", encoding="utf-8")
+            donor_path = temp_root / "donor.sym"
+            donor_path.write_text("donor", encoding="utf-8")
+            part = SimpleNamespace(
+                part="F55334-B-01",
+                sym=str(temp_root / "F55334-B-01.sym"),
+                kit_label="",
+                kit_text="",
+                priority="9",
+            )
+            progress: list[str] = []
+            built_kits: list[tuple[str, tuple[str, ...]]] = []
+
+            def apply_balance_and_update_kit_texts(parts, *, kits_dirname, kit_to_priority):
+                for row in parts:
+                    row.kit_label = str(row.kit_label).strip().upper()
+                    row.kit_text = f"{kits_dirname}/{row.kit_label}.sym"
+                    row.priority = kit_to_priority.get(row.kit_label, row.priority)
+
+            def group_parts_by_kit(*, parts, sanitize_kit_name, is_valid_kit_name):
+                grouped: dict[str, list[object]] = {}
+                for row in parts:
+                    grouped.setdefault(row.kit_label, []).append(row)
+                return grouped
+
+            def build_kit_sym_from_donor(*, donor_path, member_part_syms, out_kit_sym_path, backup_dir):
+                built_kits.append((out_kit_sym_path, tuple(member_part_syms)))
+
+            fake_sym_io = SimpleNamespace(
+                group_parts_by_kit=group_parts_by_kit,
+                build_kit_sym_from_donor=build_kit_sym_from_donor,
+            )
+            fake_kit_service = SimpleNamespace(
+                apply_balance_and_update_kit_texts=apply_balance_and_update_kit_texts,
+                prepare_kits=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("Full Flow must not call prepare_kits because it updates Attr109")
+                ),
+                write_rpd_with_backup=lambda tree, parts, *, rpd_path, bak_dirname: str(temp_root / "backup.rpd"),
+                ensure_dir=lambda path: Path(path).mkdir(parents=True, exist_ok=True),
+                sanitize_kit_name=lambda value: str(value or "").strip().upper(),
+                is_valid_kit_name=lambda value: bool(str(value or "").strip()),
+                force_l_drive_path=lambda value: str(value),
+                kit_file_path_for_part_sym=lambda sym, kit, kits_dirname: str(temp_root / kits_dirname / f"{kit}.sym"),
+                sym_io=fake_sym_io,
+            )
+            fake_modules = {
+                "assets": SimpleNamespace(
+                    configure_release_mapping=lambda *args, **kwargs: None,
+                    resolve_asset_fast=lambda sym, suffix: str(temp_root / f"{sym}{suffix}"),
+                ),
+                "config": SimpleNamespace(
+                    GLOBAL_DATASET_PATH="dataset",
+                    RF_MODEL_PATH="model",
+                    RF_META_PATH="meta",
+                    RF_FEATURES=("feature",),
+                    CANON_KITS=["BODY"],
+                    BALANCE_KIT="BALANCE",
+                    DONOR_TEMPLATE_PATH=str(donor_path),
+                    BAK_DIRNAME="_bak",
+                    KITS_DIRNAME="_kits",
+                    KIT_TO_PRIORITY={"BODY": "2"},
+                ),
+                "kit_service": fake_kit_service,
+                "rf_service": SimpleNamespace(
+                    run_rf_suggestions=lambda parts, **kwargs: ([("BODY", 0.91)], "fake-model")
+                ),
+                "rpd_io": SimpleNamespace(load_rpd=lambda path: (object(), [part], {})),
+                "packet_service": SimpleNamespace(),
+            }
+
+            with patch("full_flow_service._load_radan_kitter_modules", return_value=fake_modules):
+                result = full_flow_service.run_kitter_rf_assignment_for_project(
+                    project_path,
+                    ExplorerSettings(),
+                    progress_cb=progress.append,
+                )
+
+            self.assertEqual(result.predicted_count, 1)
+            self.assertEqual(result.kit_count, 1)
+            self.assertEqual(part.priority, "2")
+            self.assertEqual(part.kit_text, "_kits/BODY.sym")
+            self.assertEqual(len(built_kits), 1)
+            self.assertTrue(any("skipping RF kit-label Attr109 comments" in message for message in progress))
+            self.assertTrue(any("without updating RF kit-label Attr109 comments" in message for message in progress))
+
+    def test_full_flow_packet_build_still_inserts_assembly_context(self) -> None:
+        status = SimpleNamespace(
+            spreadsheet_match=SimpleNamespace(chosen_path=None),
+            paths=SimpleNamespace(
+                rpd_path=Path("paint.rpd"),
+                fabrication_kit_dir=Path("fab"),
+            ),
+        )
+        part = SimpleNamespace(sym="F55334-B-01", part="F55334-B-01")
+        context = SimpleNamespace(
+            parts=[part],
+            resolve_asset_fn=lambda sym, suffix: None,
+            assembly_source_pdfs=(),
+            cut_list_source_pdfs=(),
+        )
+        assembly_context = SimpleNamespace(references=(), read_errors=())
+        sym_result = SimpleNamespace(updated_count=1)
+        print_packet = (Path("print.pdf"), 3, 0)
+        assembly_result = SimpleNamespace(packet_path=Path("assembly.pdf"), output_pages=2)
+        cut_list_result = SimpleNamespace(packet_path=Path("cut.pdf"), output_pages=1)
+
+        with (
+            patch.object(Path, "exists", return_value=True),
+            patch("full_flow_service.prepare_packet_build_context", return_value=context),
+            patch("full_flow_service.validate_print_packet_readiness", return_value=""),
+            patch(
+                "full_flow_service._load_radan_kitter_modules",
+                return_value={"packet_service": SimpleNamespace(build_packet=lambda *args, **kwargs: print_packet)},
+            ),
+            patch("full_flow_service.scan_assembly_bom_context", return_value=assembly_context),
+            patch("full_flow_service.apply_assembly_context_to_sym_comments", return_value=sym_result) as sym_mock,
+            patch("full_flow_service.write_assembly_bom_context_csv", return_value=Path("assembly_context.csv")),
+            patch("full_flow_service.build_assembly_packet", return_value=assembly_result),
+            patch("full_flow_service.build_cut_list_packet", return_value=cut_list_result),
+        ):
+            result = full_flow_service.build_all_packets_for_status(status, ExplorerSettings())
+
+        sym_mock.assert_called_once()
+        self.assertEqual(result.sym_comment_updated_count, 1)
+
+    def test_full_flow_import_progress_prefers_log_detail(self) -> None:
+        with workspace_tempdir() as temp_root:
+            log_path = temp_root / "import.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "[10:00:00] helper started",
+                        "{",
+                        '  "part_count": 3,',
+                        "[10:00:01] Converted 2/3: F55334-B-02 (123 bytes, 1.2s)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                full_flow_service.latest_import_progress_message(log_path),
+                "Converted 2/3: F55334-B-02 (123 bytes, 1.2s)",
+            )
+
+    def test_headless_nester_drg_change_detection_ignores_old_files(self) -> None:
+        old_path = Path(r"C:\jobs\old.drg")
+        updated_path = Path(r"C:\jobs\updated.drg")
+        new_path = Path(r"C:\jobs\new.drg")
+        before = {
+            os.path.normcase(str(old_path.resolve())): (100, 10),
+            os.path.normcase(str(updated_path.resolve())): (100, 10),
+        }
+        after = {
+            os.path.normcase(str(old_path.resolve())): (100, 10),
+            os.path.normcase(str(updated_path.resolve())): (200, 10),
+            os.path.normcase(str(new_path.resolve())): (50, 5),
+        }
+
+        changed = full_flow_service.changed_drg_paths(before, after)
+
+        self.assertEqual(
+            [path.name for path in changed],
+            ["new.drg", "updated.drg"],
+        )
+
+    def test_radan_kitter_imports_ignore_preloaded_generic_modules(self) -> None:
+        fake_config = ModuleType("config")
+        fake_assets = ModuleType("assets")
+        original_config = sys.modules.get("config")
+        original_assets = sys.modules.get("assets")
+        sys.modules["config"] = fake_config
+        sys.modules["assets"] = fake_assets
+        try:
+            modules = full_flow_service._load_radan_kitter_modules(ExplorerSettings())
+        finally:
+            if original_config is None:
+                sys.modules.pop("config", None)
+            else:
+                sys.modules["config"] = original_config
+            if original_assets is None:
+                sys.modules.pop("assets", None)
+            else:
+                sys.modules["assets"] = original_assets
+
+        self.assertIsNot(modules["config"], fake_config)
+        self.assertIsNot(modules["assets"], fake_assets)
+        self.assertIn("radan_kitter", str(getattr(modules["config"], "__file__", "")))
+        self.assertIn("radan_kitter", str(getattr(modules["assets"], "__file__", "")))
+
+    def test_full_flow_double_run_guard_and_action_restore(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            try:
+                original_inventor_enabled = window.launch_inventor_button.isEnabled()
+                original_project_slider_enabled = window.radan_project_update_slider.isEnabled()
+
+                window._full_flow_running = True
+                window._lock_full_flow_actions()
+                self.assertFalse(window.launch_inventor_button.isEnabled())
+                self.assertFalse(window.import_csv_button.isEnabled())
+
+                window._full_flow_running = False
+                window._unlock_full_flow_actions()
+                self.assertEqual(window.launch_inventor_button.isEnabled(), original_inventor_enabled)
+                self.assertEqual(window.radan_project_update_slider.isEnabled(), original_project_slider_enabled)
+
+                window._full_flow_running = True
+                with patch.object(QMessageBox, "information") as info_mock:
+                    window.run_selected_full_flow()
+                info_mock.assert_called_once()
+            finally:
+                window._full_flow_running = False
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
 
 
 def detect_status_from_paths(paths):
