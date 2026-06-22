@@ -184,3 +184,4 @@ This phase is complete only when:
 - Required obsolete symbols are absent
 - Required measurements are recorded
 - No work from the next phase has been started
+- Update this Markdown file with the results above after running the phase.
