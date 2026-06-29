@@ -60,7 +60,6 @@ Record:
 8. Current query and filesystem-check counts for those scenarios.
 
 The planning response must propose:
-
 - Cache owners
 - Cache key structure
 - Cached value types
@@ -81,7 +80,6 @@ Do not modify files during this planning pass.
 ### 1. Add Lightweight Instrumentation
 
 Add testable instrumentation for:
-
 - Database query counts
 - Filesystem metadata/existence-check counts
 - Truck-switch start and completion
@@ -95,7 +93,6 @@ Instrumentation must be optional or low-overhead in normal use.
 Create a small cache module or focused service-owned caches.
 
 Cache only values demonstrated by the baseline to be worth caching, such as:
-
 - Kit status and current-truck data
 - Frequently repeated read-only database query results
 - File existence and metadata for mapped-drive paths
@@ -104,7 +101,6 @@ Cache only values demonstrated by the baseline to be worth caching, such as:
 Define explicit typed cache keys where practical.
 
 Each cache must define:
-
 - Owner
 - Key
 - Value
@@ -123,7 +119,6 @@ Invalidate relevant entries after successful writes.
 Prefer service-level signals or explicit invalidation calls at committed write boundaries.
 
 Cover:
-
 - Database updates
 - File creation
 - File replacement
@@ -136,7 +131,6 @@ Invalidation must occur only after the underlying operation succeeds.
 ### 4. Phase 4A Tests
 
 Add deterministic tests proving:
-
 - Repeated reads use the cache
 - Expired entries are refreshed
 - Negative results expire
@@ -157,7 +151,6 @@ Do not begin Phase 4B until Phase 4A tests pass.
 Use a monotonically increasing request or run identifier.
 
 The asynchronous workflow must track at least:
-
 - Requested truck identifier
 - Run identifier
 - Loading state
@@ -172,20 +165,17 @@ Results from older requests must be ignored safely.
 ### 2. Move Heavy Truck-Switch Work Off the UI Thread
 
 The UI should immediately:
-
 - Record the new selection
 - Enter a visible loading state
 - Disable only controls that cannot safely operate during the transition
 
 A background worker may perform:
-
 - Database reads
 - Network file checks
 - Cache population
 - Packet or preview metadata loading
 
 The UI thread must perform:
-
 - Widget updates
 - Dialog creation
 - Model replacement
@@ -196,7 +186,6 @@ The UI thread must perform:
 Add deterministic behavior for rapid A -> B -> C switching.
 
 Required behavior:
-
 - C becomes the visible final state
 - Results from A and B cannot overwrite C
 - Stale errors do not show dialogs for inactive selections
@@ -208,7 +197,6 @@ Required behavior:
 Replace frequent full SQLite polling with event-driven refreshes where writes are controlled by the application.
 
 For external changes:
-
 - Use focused folder or data-change watching where reliable
 - Debounce notifications
 - Invalidate affected cache entries
@@ -226,10 +214,11 @@ Document any polling that remains and justify its interval.
 - Handle unavailable mapped drives without blocking the UI thread
 - Avoid scanning unrelated folders
 
+**One-way release signals (W: drive and similar L: drive cases)**: Jobs/releases marked released on W: are never unreleased. This is a natural final/irreversible state that allows aggressive or final caching of related data (long or permanent positive TTL after release detection) with far less repeated W: probing. The same principle often applies to L: drive checks. This is a direct, high-value application of the existing explicit expiration + invalidation rules; treat release markers as strong promotion-to-final or invalidation events. Only add dedicated logic if measurements show clear extra benefit beyond the general cache design.
+
 ### 6. Phase 4B Tests
 
 Add tests proving:
-
 - Truck switching does not perform heavy work on the UI thread
 - Loading state appears before background completion
 - Only the newest request updates the UI
@@ -244,7 +233,6 @@ Add tests proving:
 ## Final Measurement
 
 Repeat the baseline scenarios and report:
-
 - Before and after truck-switch latency
 - Before and after database query counts
 - Before and after network filesystem-check counts
@@ -258,7 +246,6 @@ Do not claim a performance improvement unless measurements support it.
 ## Required Final Report
 
 Report:
-
 - Baseline measurements
 - Phase 4A measurements and test results
 - Phase 4B measurements and test results
@@ -272,7 +259,6 @@ Report:
 ## Completion Gate
 
 Phase 4 is complete only when:
-
 - Phase 4A and Phase 4B tests pass
 - Relevant full test suites pass
 - Rapid switching cannot display stale results
@@ -281,3 +267,5 @@ Phase 4 is complete only when:
 - Before-and-after measurements are recorded
 - No removed Inventor watcher workflow has been reintroduced
 - Update this Markdown file with the results above after running the phase.
+
+Last updated: 2026-06-29
