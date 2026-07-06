@@ -234,3 +234,79 @@ This phase is complete only when:
 - Required measurements are recorded
 - No work from the next phase has been started
 - Update this Markdown file with the results above after running the phase.
+
+## Phase 2 Results
+
+Completed on 2026-07-06.
+
+### Final Measurements
+
+- `main_window.py` original baseline physical line count: 3816 lines.
+- `main_window.py` post-Phase-1 physical line count: 3484 lines.
+- `main_window.py` post-Phase-2 physical line count: 3086 lines.
+- Reduction from original baseline: 730 lines, 19.1%.
+- Reduction during Phase 2: 398 lines.
+
+### Files Added
+
+- `controllers/full_flow_controller.py`
+
+### Files Changed
+
+- `main_window.py`
+- `tests/test_services.py`
+- `docs/refactor/phase_2_full_flow_controller.md`
+
+No files were removed.
+
+### Architecture And Ownership Changes
+
+- `FullFlowController` now owns the UI-level Full Flow orchestration: duplicate-run guard, selected-kit validation, confirmation prompt, progress dialog, action lock, worker phases, Inventor report review, post-review work, packet opening, optional nester, RADAN project opening, status refresh, logging, and final dialogs.
+- `MainWindow.run_selected_full_flow()` now only delegates to `self.full_flow_controller.start_selected()`.
+- `MainWindow.closeEvent()` consults `FullFlowController.can_close()`.
+- UI refreshes call `FullFlowController.reapply_action_lock()` to keep controls locked after refresh-driven enabled-state changes.
+- Full Flow worker orchestration uses `BackgroundJobWorker` from the Phase 1 generic worker.
+
+### Final Controller State Model
+
+- `FullFlowPhase`: `IDLE`, `INVENTOR`, `REPORT_REVIEW`, `POST_REVIEW`, `NESTER`, `FINALIZING`.
+- `FullFlowRunContext`: `run_id`, selected `KitStatus`, nester choice, phase, Inventor result, Full Flow result, opened packet count, and `finished`.
+- `_FullFlowProgressDialog` owns the non-modal progress window, timestamped progress log, disabled close while active, and Dismiss button after finish.
+- `_ActionLock` snapshots mutating widget enabled states, Full Flow button text, and table edit triggers; it reapplies the disabled state after refreshes and restores exact original state on release.
+
+### Cleanup And Signal Safety
+
+- Cleanup is idempotent through one `_finish_run()` path.
+- Stale worker progress, success, and error callbacks are ignored by `run_id`.
+- Duplicate terminal dialogs and duplicate completion refreshes are prevented by the `finished` flag and active-run checks.
+- Report discard stops before post-review work.
+- `InventorNeedsUserAction`, service errors, worker errors, and nester failures unlock the UI cleanly.
+- Nester failure still opens the RADAN project afterward.
+- Controls disabled before Full Flow remain disabled after unlock, and table edit triggers restore exactly.
+
+### Obsolete Symbols Removed From `MainWindow`
+
+- `_full_flow_running`
+- `_full_flow_worker`
+- `_full_flow_disabled_widget_states`
+- `_full_flow_table_edit_triggers`
+- `_full_flow_mutating_widgets`
+- `_lock_full_flow_actions`
+- `_reapply_full_flow_action_lock`
+- `_unlock_full_flow_actions`
+- `_start_full_flow_worker`
+- `_create_full_flow_progress_dialog`
+- `_confirm_close_radan_for_full_flow`
+
+### Validation Results
+
+- Focused suite: `python -m pytest tests/test_services.py -q` -> 105 passed in 1.43s.
+- Full suite: `python -m pytest -q` -> 105 passed in 1.36s.
+- Import/compile check: `python -m py_compile main_window.py controllers/full_flow_controller.py tests/test_services.py` -> passed.
+- Obsolete-symbol scan: no obsolete Full Flow `MainWindow` symbols found.
+
+### Remaining Risks And Follow-Up
+
+- The progress dialog remains non-modal and UI-thread owned; operator interaction during report review still depends on the shared review dialog staying on the Qt UI thread.
+- Full Flow workers are still non-cancelable, matching pre-Phase-2 behavior.
+- Phase 3 Kitter API cleanup was not started.

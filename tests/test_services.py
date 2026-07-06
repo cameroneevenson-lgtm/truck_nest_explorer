@@ -2477,8 +2477,83 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertIn("radan_kitter", str(getattr(modules["config"], "__file__", "")))
         self.assertIn("radan_kitter", str(getattr(modules["assets"], "__file__", "")))
 
-    def test_full_flow_double_run_guard_and_action_restore(self) -> None:
+    def test_full_flow_controller_action_lock_restores_exact_states(self) -> None:
+        from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QWidget
+        from PySide6.QtWidgets import QAbstractItemView
+        from controllers.full_flow_controller import _ActionLock
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        full_flow_button = QPushButton("Run Full Flow", window)
+        enabled_button = QPushButton("Enabled", window)
+        disabled_button = QPushButton("Disabled", window)
+        disabled_button.setEnabled(False)
+        table = QTableWidget(window)
+        original_triggers = QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked
+        table.setEditTriggers(original_triggers)
+        lock = _ActionLock(
+            widgets=(full_flow_button, enabled_button, disabled_button),
+            editable_table=table,
+            full_flow_button=full_flow_button,
+        )
+        try:
+            lock.acquire()
+            self.assertFalse(full_flow_button.isEnabled())
+            self.assertFalse(enabled_button.isEnabled())
+            self.assertFalse(disabled_button.isEnabled())
+            self.assertEqual(full_flow_button.text(), "Running Full Flow...")
+            self.assertEqual(table.editTriggers(), QAbstractItemView.NoEditTriggers)
+
+            enabled_button.setEnabled(True)
+            table.setEditTriggers(QAbstractItemView.EditKeyPressed)
+            lock.reapply()
+            self.assertFalse(enabled_button.isEnabled())
+            self.assertEqual(table.editTriggers(), QAbstractItemView.NoEditTriggers)
+
+            lock.release()
+            lock.release()
+            self.assertTrue(full_flow_button.isEnabled())
+            self.assertTrue(enabled_button.isEnabled())
+            self.assertFalse(disabled_button.isEnabled())
+            self.assertEqual(full_flow_button.text(), "Run Full Flow")
+            self.assertEqual(table.editTriggers(), original_triggers)
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_full_flow_controller_double_run_guard_cleanup_and_close_state(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        window.full_flow_button = QPushButton("Run Full Flow", window)
+        table = QTableWidget(window)
+        controller = FullFlowController(
+            window,
+            mutating_widgets=(window.full_flow_button,),
+            editable_table=table,
+        )
+        status = SimpleNamespace(
+            kit_name="PAINT PACK",
+            paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=Path("paint.rpd")),
+        )
+        controller._context = FullFlowRunContext(1, status, False, FullFlowPhase.INVENTOR)
+        try:
+            self.assertFalse(controller.can_close())
+            with patch.object(QMessageBox, "information") as info_mock:
+                controller.start_selected()
+            info_mock.assert_called_once()
+            self.assertTrue(controller._finish_run(1, "done"))
+            self.assertFalse(controller._finish_run(1, "done again"))
+            self.assertTrue(controller.can_close())
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_main_window_close_event_blocks_while_full_flow_active(self) -> None:
         from PySide6.QtWidgets import QApplication, QMessageBox
+        from controllers.full_flow_controller import FullFlowPhase, FullFlowRunContext
         import main_window
 
         app = QApplication.instance() or QApplication([])
@@ -2488,31 +2563,267 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
         ):
             window = main_window.MainWindow(runtime_dir=temp_root)
+            event = SimpleNamespace(ignored=False, ignore=lambda: setattr(event, "ignored", True))
+            status = SimpleNamespace(
+                kit_name="PAINT PACK",
+                paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=Path("paint.rpd")),
+            )
             try:
-                original_inventor_enabled = window.launch_inventor_button.isEnabled()
-                original_project_slider_enabled = window.radan_project_update_slider.isEnabled()
-
-                window._full_flow_running = True
-                window._lock_full_flow_actions()
-                self.assertFalse(window.launch_inventor_button.isEnabled())
-                self.assertFalse(window.import_csv_button.isEnabled())
-
-                window._full_flow_running = False
-                window._unlock_full_flow_actions()
-                self.assertEqual(window.launch_inventor_button.isEnabled(), original_inventor_enabled)
-                self.assertEqual(window.radan_project_update_slider.isEnabled(), original_project_slider_enabled)
-
-                window._full_flow_running = True
-                with patch.object(QMessageBox, "information") as info_mock:
-                    window.run_selected_full_flow()
-                info_mock.assert_called_once()
+                window.full_flow_controller._context = FullFlowRunContext(1, status, False, FullFlowPhase.INVENTOR)
+                with patch.object(QMessageBox, "warning") as warning_mock:
+                    window.closeEvent(event)
+                warning_mock.assert_called_once()
+                self.assertTrue(event.ignored)
             finally:
-                window._full_flow_running = False
+                window.full_flow_controller._context = None
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)
                 window._flow_executor.shutdown(wait=False, cancel_futures=True)
                 window.close()
                 app.processEvents()
+
+    def test_full_flow_controller_accepted_review_continues_to_post_review(self) -> None:
+        from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QWidget
+        from controllers import full_flow_controller
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext
+        from dialogs.inventor_report_review_dialog import InventorReviewOutcome
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        window.full_flow_button = QPushButton("Run Full Flow", window)
+        controller = FullFlowController(window, mutating_widgets=(window.full_flow_button,), editable_table=QTableWidget(window))
+        status = SimpleNamespace(
+            kit_name="PAINT PACK",
+            paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=Path("paint.rpd")),
+        )
+        inventor = inventor_service.InventorRunResult(
+            spreadsheet_path=Path("bom.xlsx"),
+            project_dir=Path("."),
+            entry_path=Path("inventor_to_radan.bat"),
+            moved_paths=(),
+            report_path=Path("report.txt"),
+            discard_paths=(),
+        )
+        context = FullFlowRunContext(1, status, False, FullFlowPhase.REPORT_REVIEW, inventor_result=inventor)
+        controller._context = context
+        try:
+            with (
+                patch(
+                    "controllers.full_flow_controller.review_inventor_result",
+                    return_value=InventorReviewOutcome(state=full_flow_controller.InventorReviewState.ACCEPTED),
+                ),
+                patch.object(controller, "_start_post_review") as start_mock,
+            ):
+                controller._review_report(context)
+            start_mock.assert_called_once_with(context)
+            self.assertTrue(controller.is_running)
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_full_flow_controller_discarded_and_cancelled_review_stop(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
+        from controllers import full_flow_controller
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext
+        from dialogs.inventor_report_review_dialog import InventorReviewOutcome
+
+        app = QApplication.instance() or QApplication([])
+
+        def make_controller():
+            window = QWidget()
+            window.full_flow_button = QPushButton("Run Full Flow", window)
+            window._queue_status_refresh_for_truck = lambda truck_number: True
+            window.log = lambda message: None
+            controller = FullFlowController(
+                window,
+                mutating_widgets=(window.full_flow_button,),
+                editable_table=QTableWidget(window),
+            )
+            status = SimpleNamespace(
+                kit_name="PAINT PACK",
+                paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=Path("paint.rpd")),
+            )
+            inventor = inventor_service.InventorRunResult(
+                spreadsheet_path=Path("bom.xlsx"),
+                project_dir=Path("."),
+                entry_path=Path("inventor_to_radan.bat"),
+                moved_paths=(),
+                report_path=Path("report.txt"),
+                discard_paths=(),
+            )
+            context = FullFlowRunContext(1, status, False, FullFlowPhase.REPORT_REVIEW, inventor_result=inventor)
+            controller._context = context
+            return window, controller, context
+
+        for outcome in (
+            InventorReviewOutcome(
+                state=full_flow_controller.InventorReviewState.DISCARDED,
+                discard_result=SimpleNamespace(deleted_paths=(Path("report.txt"),), failed_deletes=()),
+            ),
+            InventorReviewOutcome(
+                state=full_flow_controller.InventorReviewState.CANCELLED,
+                message="review cancelled",
+            ),
+        ):
+            window, controller, context = make_controller()
+            try:
+                with (
+                    patch("controllers.full_flow_controller.review_inventor_result", return_value=outcome),
+                    patch.object(controller, "_start_post_review", side_effect=AssertionError("must not continue")),
+                    patch.object(QMessageBox, "information"),
+                    patch.object(QMessageBox, "critical"),
+                    patch.object(QMessageBox, "warning"),
+                ):
+                    controller._review_report(context)
+                self.assertFalse(controller.is_running)
+            finally:
+                window.close()
+                app.processEvents()
+
+    def test_full_flow_controller_stale_signals_are_ignored(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        window.full_flow_button = QPushButton("Run Full Flow", window)
+        controller = FullFlowController(window, mutating_widgets=(window.full_flow_button,), editable_table=QTableWidget(window))
+        status = SimpleNamespace(
+            kit_name="PAINT PACK",
+            paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=Path("paint.rpd")),
+        )
+        controller._context = FullFlowRunContext(2, status, False, FullFlowPhase.INVENTOR)
+        try:
+            with patch.object(QMessageBox, "critical") as critical_mock:
+                controller._on_worker_error(1, "stale traceback")
+                controller._on_inventor_done(1, {"state": "error", "message": "stale error"})
+                controller._on_post_review_done(1, {"state": "error", "message": "stale error"})
+            critical_mock.assert_not_called()
+            self.assertTrue(controller.is_running)
+            self.assertEqual(controller._context.run_id, 2)
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_full_flow_controller_user_action_and_worker_errors_unlock_cleanly(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext, _ActionLock
+
+        app = QApplication.instance() or QApplication([])
+
+        def locked_controller(run_id: int):
+            window = QWidget()
+            window.full_flow_button = QPushButton("Run Full Flow", window)
+            other_button = QPushButton("Other", window)
+            table = QTableWidget(window)
+            controller = FullFlowController(
+                window,
+                mutating_widgets=(window.full_flow_button, other_button),
+                editable_table=table,
+            )
+            status = SimpleNamespace(
+                kit_name="PAINT PACK",
+                paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=Path("paint.rpd")),
+            )
+            controller._context = FullFlowRunContext(run_id, status, False, FullFlowPhase.INVENTOR)
+            lock = _ActionLock(
+                widgets=(window.full_flow_button, other_button),
+                editable_table=table,
+                full_flow_button=window.full_flow_button,
+            )
+            lock.acquire()
+            controller._action_lock = lock
+            return window, controller, other_button
+
+        window, controller, other_button = locked_controller(1)
+        try:
+            with patch.object(QMessageBox, "information") as info_mock:
+                controller._on_inventor_done(1, {"state": "needs_user_action", "message": "needs input"})
+            info_mock.assert_called_once()
+            self.assertFalse(controller.is_running)
+            self.assertTrue(window.full_flow_button.isEnabled())
+            self.assertTrue(other_button.isEnabled())
+            self.assertEqual(window.full_flow_button.text(), "Run Full Flow")
+        finally:
+            window.close()
+            app.processEvents()
+
+        window, controller, other_button = locked_controller(2)
+        try:
+            with patch.object(QMessageBox, "critical") as critical_mock:
+                controller._on_worker_error(2, "traceback")
+            critical_mock.assert_called_once()
+            self.assertFalse(controller.is_running)
+            self.assertTrue(window.full_flow_button.isEnabled())
+            self.assertTrue(other_button.isEnabled())
+            self.assertEqual(window.full_flow_button.text(), "Run Full Flow")
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_full_flow_controller_nester_failure_still_opens_project(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        window.full_flow_button = QPushButton("Run Full Flow", window)
+        window._queue_status_refresh_for_truck = lambda truck_number: True
+        window.log = lambda message: None
+        controller = FullFlowController(window, mutating_widgets=(window.full_flow_button,), editable_table=QTableWidget(window))
+        project_path = Path("paint.rpd")
+        status = SimpleNamespace(
+            kit_name="PAINT PACK",
+            paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=project_path),
+        )
+        inventor = inventor_service.InventorRunResult(
+            spreadsheet_path=Path("bom.xlsx"),
+            project_dir=Path("."),
+            entry_path=Path("inventor_to_radan.bat"),
+            moved_paths=(Path("paint.csv"),),
+            report_path=Path("report.txt"),
+            discard_paths=(),
+        )
+        result = full_flow_service.FullFlowResult(
+            project_path=project_path,
+            inventor=inventor,
+            csv_import=full_flow_service.CsvImportResult(log_path=Path("import.log"), return_code=0),
+            rf_assignment=full_flow_service.RfAssignmentResult(
+                predicted_count=4,
+                skipped_count=0,
+                model_source="model",
+                kit_count=1,
+                backup_path=None,
+            ),
+            packets=full_flow_service.PacketFlowResult(
+                packet_paths=(),
+                print_pages=1,
+                print_missing=0,
+                assembly_pages=2,
+                cut_list_pages=3,
+            ),
+        )
+        context = FullFlowRunContext(
+            1,
+            status,
+            True,
+            FullFlowPhase.NESTER,
+            inventor_result=inventor,
+            full_flow_result=result,
+        )
+        controller._context = context
+        try:
+            with (
+                patch("controllers.full_flow_controller.open_path") as open_mock,
+                patch.object(QMessageBox, "warning"),
+                patch.object(QMessageBox, "information"),
+            ):
+                controller._on_nester_done(1, {"state": "error", "message": "nester boom"})
+            open_mock.assert_called_once_with(project_path)
+            self.assertFalse(controller.is_running)
+        finally:
+            window.close()
+            app.processEvents()
 
     def test_inventor_controller_restores_button_state_after_user_action_stop(self) -> None:
         from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
@@ -2563,12 +2874,39 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertNotIn("run_inventor_to_radan_inline", text)
         self.assertNotIn("move_inventor_outputs_to_project", text)
 
+    def test_full_flow_main_window_symbols_are_absent(self) -> None:
+        text = (PROJECT_DIR / "main_window.py").read_text(encoding="utf-8")
+
+        for symbol in (
+            "_full_flow_running",
+            "_full_flow_worker",
+            "_full_flow_disabled_widget_states",
+            "_full_flow_table_edit_triggers",
+            "_full_flow_mutating_widgets",
+            "_lock_full_flow_actions",
+            "_reapply_full_flow_action_lock",
+            "_unlock_full_flow_actions",
+            "_start_full_flow_worker",
+            "_create_full_flow_progress_dialog",
+            "_confirm_close_radan_for_full_flow",
+            "run_full_flow_after_inventor_review",
+            "run_headless_nester",
+            "InventorNeedsUserAction",
+            "InventorServiceError",
+            "run_inventor_for_status",
+            "review_inventor_result",
+        ):
+            self.assertNotIn(symbol, text)
+
+        self.assertIn("self.full_flow_controller.start_selected()", text)
+
     def test_generic_background_worker_is_used(self) -> None:
         import main_window
-        from controllers import inventor_controller
+        from controllers import full_flow_controller, inventor_controller
 
         self.assertIs(main_window.BackgroundJobWorker, background_job.BackgroundJobWorker)
         self.assertIs(inventor_controller.BackgroundJobWorker, background_job.BackgroundJobWorker)
+        self.assertIs(full_flow_controller.BackgroundJobWorker, background_job.BackgroundJobWorker)
         text = (PROJECT_DIR / "main_window.py").read_text(encoding="utf-8")
         self.assertNotIn("PacketJobWorker", text)
         self.assertNotIn("PacketJobSignals", text)
