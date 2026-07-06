@@ -185,3 +185,93 @@ This phase is complete only when:
 - Required measurements are recorded
 - No work from the next phase has been started
 - Update this Markdown file with the results above after running the phase.
+
+## Phase 1 Results
+
+Completed on 2026-07-06.
+
+### Baseline Inspection Results
+
+- `main_window.py` baseline physical line count: 3816 lines.
+- Baseline `truck_nest_explorer` tests: `python -m pytest` -> 87 passed in 2.83s.
+- Baseline `radan_kitter` repo-root tests: `python -m pytest` -> collection failed with 10 pre-existing `PermissionError: [WinError 5] Access is denied` errors for inaccessible temp folders such as `_smoke_uzutih1v`, `tmp4ttlqq61`, and `tests/_tmp/...`.
+- Baseline `radan_kitter` checked-in test files: `$tests = Get-ChildItem -Path .\tests -Filter 'test_*.py' -File | ForEach-Object { $_.FullName }; python -m pytest @tests` -> 51 passed, 7 warnings in 2.19s.
+- Baseline Inventor paths identified:
+  - Standalone `MainWindow.run_selected_inventor_flow()` performed inline conversion, moved output, reviewed report, deleted CSV/report on discard, and fell back to launcher/watch mode when UI was needed.
+  - Full Flow used `full_flow_service.run_inventor_inline_for_status()` plus `MainWindow._review_full_flow_inventor_report()`.
+- Baseline MainWindow Inventor execution/watcher fields and helpers identified:
+  - `PendingInventorJob`
+  - `_pending_inventor_job`
+  - `_inventor_watch_timer`
+  - `_inventor_output_signature()`
+  - `_poll_pending_inventor_job()`
+  - `_finish_pending_inventor_job()`
+  - direct `run_inventor_to_radan_inline()` / `move_inventor_outputs_to_project()` calls
+  - duplicated standalone and Full Flow report-review deletion blocks
+- Baseline discard behavior required explicit operator confirmation through `InventorReportReviewDialog.reject()` / `closeEvent()` before CSV/report deletion.
+
+### Files Added
+
+- `background_job.py`
+- `inventor_service.py`
+- `controllers/inventor_controller.py`
+
+### Files Changed
+
+- `main_window.py`
+- `full_flow_service.py`
+- `dialogs/inventor_report_review_dialog.py`
+- `tests/test_services.py`
+- `docs/refactor/phase_1_shared_inventor.md`
+
+No source files were removed. No `radan_kitter` source code was modified for Phase 1.
+
+### Architecture And Ownership Changes
+
+- Generic background worker moved from `main_window.py` into `background_job.py` as `BackgroundJobSignals` and `BackgroundJobWorker`.
+- `inventor_service.py` is now the single non-UI Inventor-to-RADAN implementation. It owns BOM validation, L-side project/entry validation, inline conversion, `InventorToRadanInlineNeedsUi` translation to `InventorNeedsUserAction`, one-time output movement, report validation, discard eligibility, typed results, and typed service errors.
+- `InventorController` now owns the standalone Run Inventor Tool UI flow, including duplicate-run guard, button/progress state, background worker execution, shared report review, status refresh, logging, and typed outcome handling.
+- `MainWindow.run_selected_inventor_flow()` now only delegates to `self.inventor_controller.start_selected()`.
+- Full Flow now calls `run_inventor_for_status()` and `review_inventor_result()` instead of its old private Inventor helper and duplicated report-review block.
+- `review_inventor_result(parent, result)` is the shared report-review helper for standalone Inventor and Full Flow.
+
+### Obsolete Symbols Removed
+
+- `PacketJobSignals`
+- `PacketJobWorker`
+- `InventorFlowResult`
+- `run_inventor_inline_for_status`
+- `PendingInventorJob`
+- `_pending_inventor_job`
+- `_inventor_watch_timer`
+- `_inventor_output_signature`
+- `_poll_pending_inventor_job`
+- `_finish_pending_inventor_job`
+- MainWindow direct calls to `run_inventor_to_radan_inline()` and `move_inventor_outputs_to_project()`
+- MainWindow duplicated standalone and Full Flow report-review deletion blocks
+
+### Watcher And Discard Confirmation
+
+- The watcher-based Inventor path is gone from source code. `InventorNeedsUserAction` now stops cleanly and shows a user-action message; there is no launcher/watch fallback.
+- Generated Inventor CSV/report deletion now happens only through `review_inventor_result()` after `InventorReportReviewDialog` records explicit discard confirmation, and deletion is delegated to `discard_inventor_result()`.
+- Ordinary errors and user-action-required outcomes do not delete generated output.
+
+### Final Measurements
+
+- `main_window.py` final physical line count: 3484 lines.
+- Reduction: 332 lines.
+
+### Validation Results
+
+- Focused `truck_nest_explorer` tests after Phase 1 additions: `python -m pytest tests/test_services.py -q` -> 97 passed in 1.44s.
+- Full `truck_nest_explorer` suite: `python -m pytest` -> 97 passed in 1.57s.
+- `main_window.py` import check: `python -c "import main_window; print('main_window import ok')"` -> `main_window import ok`.
+- `radan_kitter` checked-in test files: `$tests = Get-ChildItem -Path .\tests -Filter 'test_*.py' -File | ForEach-Object { $_.FullName }; python -m pytest @tests` -> 51 passed, 7 warnings in 2.47s.
+- `radan_kitter` repo-root test command remains blocked by pre-existing inaccessible temp folders: `python -m pytest` -> 10 collection errors, all `PermissionError: [WinError 5] Access is denied` under `_smoke_uzutih1v`, `tmp4ttlqq61`, `tests/_tmp/...`, and `tests/_tmp_probe/...`.
+
+### Remaining Risks And Follow-Up
+
+- Qt report review still depends on the dialog being invoked on the UI thread; both current callers do that from worker completion callbacks on the Qt thread.
+- `radan_kitter` root test discovery remains noisy until inaccessible temp folders are excluded or cleaned by an explicit operator action.
+- Running `radan_kitter` tests touched `_runtime/runtime_trace.jsonl`; the log was left intact under the no-delete safety rule.
+- Phase 2 Full Flow controller extraction was not started.

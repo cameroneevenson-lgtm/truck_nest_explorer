@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
 import html
 from pathlib import Path
 
@@ -16,7 +18,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from inventor_service import InventorDiscardResult, InventorRunResult, discard_inventor_result
 from services import open_path
+
+
+class InventorReviewState(Enum):
+    ACCEPTED = "accepted"
+    DISCARDED = "discarded"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class InventorReviewOutcome:
+    state: InventorReviewState
+    discard_result: InventorDiscardResult | None = None
+    message: str = ""
 
 
 class InventorReportReviewDialog(QDialog):
@@ -226,15 +243,31 @@ class InventorReportReviewDialog(QDialog):
             return
         event.ignore()
 
+def review_inventor_result(parent: QWidget | None, result: InventorRunResult) -> InventorReviewOutcome:
+    report_path = Path(result.report_path)
+    if not report_path.exists():
+        return InventorReviewOutcome(
+            state=InventorReviewState.ERROR,
+            message="Inventor-to-RADAN completed, but the generated report could not be found for review.",
+        )
 
-def delete_paths(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], tuple[str, ...]]:
-    deleted: list[Path] = []
-    failed: list[str] = []
-    for path in paths:
-        try:
-            if path.exists():
-                path.unlink()
-                deleted.append(path)
-        except OSError as exc:
-            failed.append(f"{path}: {exc}")
-    return tuple(deleted), tuple(failed)
+    try:
+        review_dialog = InventorReportReviewDialog(report_path, parent)
+        review_result = review_dialog.exec()
+    except Exception as exc:
+        return InventorReviewOutcome(
+            state=InventorReviewState.ERROR,
+            message=f"Could not show report review:\n\n{exc}",
+        )
+
+    if review_result == QDialog.Accepted:
+        return InventorReviewOutcome(state=InventorReviewState.ACCEPTED)
+    if bool(getattr(review_dialog, "rejected_without_ack", False)):
+        return InventorReviewOutcome(
+            state=InventorReviewState.DISCARDED,
+            discard_result=discard_inventor_result(result),
+        )
+    return InventorReviewOutcome(
+        state=InventorReviewState.CANCELLED,
+        message="Inventor report review was closed without acknowledgement.",
+    )

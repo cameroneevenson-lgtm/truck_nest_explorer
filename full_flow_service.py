@@ -10,6 +10,7 @@ import sys
 import time
 from typing import Callable, Iterator
 
+from inventor_service import InventorRunResult
 from models import ExplorerSettings, KitStatus
 from packet_build_service import (
     apply_assembly_context_to_sym_comments,
@@ -21,12 +22,9 @@ from packet_build_service import (
     write_assembly_bom_context_csv,
 )
 from services import (
-    InventorToRadanInlineNeedsUi,
     launch_radan_csv_import,
-    move_inventor_outputs_to_project,
     radan_csv_import_lock_status,
     resolve_existing_inventor_csv,
-    run_inventor_to_radan_inline,
 )
 
 
@@ -39,13 +37,6 @@ class FullFlowError(RuntimeError):
 
 class FullFlowNeedsUserAction(FullFlowError):
     pass
-
-
-@dataclass(frozen=True)
-class InventorFlowResult:
-    moved_paths: tuple[Path, ...]
-    added_count: int | None = None
-    report_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -78,7 +69,7 @@ class PacketFlowResult:
 @dataclass(frozen=True)
 class FullFlowResult:
     project_path: Path
-    inventor: InventorFlowResult
+    inventor: InventorRunResult
     csv_import: CsvImportResult
     rf_assignment: RfAssignmentResult
     packets: PacketFlowResult
@@ -246,44 +237,6 @@ def _configure_kitter_assets(rk_assets, settings: ExplorerSettings) -> None:
         )
     except TypeError:
         rk_assets.configure_release_mapping(fabrication_root, mapping)
-
-
-def run_inventor_inline_for_status(
-    status: KitStatus,
-    settings: ExplorerSettings,
-    *,
-    progress_cb: ProgressCallback | None = None,
-) -> InventorFlowResult:
-    spreadsheet_path = status.spreadsheet_match.chosen_path
-    if spreadsheet_path is None:
-        raise FullFlowError("This kit does not have exactly one BOM candidate in the W folder.")
-    if status.paths.project_dir is None:
-        raise FullFlowError("The L-side project folder is not available for this kit.")
-
-    entry_text = str(getattr(settings, "inventor_to_radan_entry", "") or "").strip()
-    if not entry_text:
-        raise FullFlowError("Inventor launcher is not configured.")
-
-    _emit(progress_cb, f"Inventor: converting {spreadsheet_path.name}")
-    try:
-        result = run_inventor_to_radan_inline(Path(entry_text), spreadsheet_path)
-    except InventorToRadanInlineNeedsUi as exc:
-        raise FullFlowNeedsUserAction(
-            f"Inventor-to-RADAN needs user input before the full flow can continue: {exc}"
-        ) from exc
-
-    _emit(progress_cb, "Inventor: moving generated CSV/report to L")
-    outputs, moved_paths = move_inventor_outputs_to_project(spreadsheet_path, status.paths.project_dir)
-    added_count = getattr(result, "added_count", None)
-    try:
-        added_count = int(added_count) if added_count is not None else None
-    except (TypeError, ValueError):
-        added_count = None
-    report_path = outputs.target_report_path
-    moved = tuple(Path(path) for path in moved_paths)
-    if report_path is None or not report_path.exists():
-        report_path = next((path for path in moved if path.suffix.casefold() == ".txt"), None)
-    return InventorFlowResult(moved_paths=moved, added_count=added_count, report_path=report_path)
 
 
 def _clean_import_log_line(line: str) -> str:
@@ -654,7 +607,7 @@ def run_full_flow_after_inventor_review(
     status: KitStatus,
     settings: ExplorerSettings,
     *,
-    inventor: InventorFlowResult,
+    inventor: InventorRunResult,
     runtime_dir: Path,
     progress_cb: ProgressCallback | None = None,
 ) -> FullFlowResult:

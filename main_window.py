@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 import json
 import subprocess
 import time
-import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QTimer, QThreadPool, Signal
+from PySide6.QtCore import Qt, QTimer, QThreadPool
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -40,9 +38,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from background_job import BackgroundJobWorker
 from controllers.hot_reload_controller import HotReloadController
+from controllers.inventor_controller import InventorController
 from dialogs.import_log_dialog import ImportLogDialog
-from dialogs.inventor_report_review_dialog import InventorReportReviewDialog, delete_paths
+from dialogs.inventor_report_review_dialog import InventorReviewState, review_inventor_result
 from dialogs.multiline_editor_dialog import MultilineEditorDialog
 from packet_build_service import (
     PacketBuildReadinessError,
@@ -66,16 +66,14 @@ from flow_bridge import (
 )
 from full_flow_service import (
     FullFlowError,
-    FullFlowNeedsUserAction,
     run_full_flow_after_inventor_review,
     run_headless_nester,
-    run_inventor_inline_for_status,
 )
+from inventor_service import InventorNeedsUserAction, InventorServiceError, run_inventor_for_status
 from models import (
     canonicalize_client_numbers_by_truck,
     canonicalize_hidden_kit_entries,
     ExplorerSettings,
-    InventorOutputPaths,
     KitStatus,
     build_hidden_kit_key,
     materialize_legacy_punch_codes_for_kit,
@@ -96,14 +94,11 @@ from services import (
     filter_truck_numbers,
     find_fabrication_truck_dir,
     inventor_output_paths,
-    InventorToRadanInlineNeedsUi,
     is_hidden_kit,
     is_hidden_truck,
-    launch_inventor_to_radan,
     launch_launcher,
     launch_radan_csv_import,
     launch_tool,
-    move_inventor_outputs_to_project,
     open_external_target,
     open_path,
     radan_csv_missing_symbols,
@@ -111,56 +106,11 @@ from services import (
     release_text_for_status,
     resolve_existing_inventor_csv,
     restore_truck_visibility,
-    run_inventor_to_radan_inline,
     sort_truck_numbers_by_fabrication_order,
     visible_radan_sessions,
 )
 from settings_store import load_settings, save_settings
 from ui.main_window_styles import dashboard_stylesheet
-
-
-@dataclass
-class PendingInventorJob:
-    truck_number: str
-    kit_name: str
-    spreadsheet_path: Path
-    project_dir: Path
-    outputs: InventorOutputPaths
-    process: subprocess.Popen[object]
-    started_at_monotonic: float
-    first_output_seen_at_monotonic: float | None = None
-    last_output_signature: tuple[tuple[str, int, int], ...] | None = None
-    stable_polls: int = 0
-    launcher_exit_code: int | None = None
-
-
-class PacketJobSignals(QObject):
-    progress = Signal(int, int, str)
-    done = Signal(object)
-    error = Signal(str)
-
-
-class PacketJobWorker(QRunnable):
-    def __init__(self, job_fn):
-        super().__init__()
-        self.job_fn = job_fn
-        self.signals = PacketJobSignals()
-        self._stop = False
-
-    def request_stop(self) -> None:
-        self._stop = True
-
-    def should_cancel(self) -> bool:
-        return bool(self._stop)
-
-    def emit_progress(self, done: int, total: int, status_text: str) -> None:
-        self.signals.progress.emit(int(done), int(total), str(status_text))
-
-    def run(self) -> None:
-        try:
-            self.signals.done.emit(self.job_fn(self))
-        except Exception:
-            self.signals.error.emit(traceback.format_exc())
 
 
 class MainWindow(QMainWindow):
@@ -224,11 +174,10 @@ class MainWindow(QMainWindow):
         self._hot_reload_controller = HotReloadController(self, self._runtime_dir)
         self._updating_kit_table = False
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
-        self._pending_inventor_job: PendingInventorJob | None = None
         self._radan_import_log_dialog: ImportLogDialog | None = None
         self._radan_import_log_dialogs: list[ImportLogDialog] = []
         self._full_flow_running = False
-        self._full_flow_worker: PacketJobWorker | None = None
+        self._full_flow_worker: BackgroundJobWorker | None = None
         self._full_flow_disabled_widget_states: list[tuple[QWidget, bool]] = []
         self._full_flow_table_edit_triggers = None
         self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
@@ -246,9 +195,6 @@ class MainWindow(QMainWindow):
         self._pending_status_by_truck: dict[str, tuple[str, Future[list[KitStatus]]]] = {}
         self._flow_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_flow_by_truck: dict[str, tuple[str, str, Future[FlowTruckInsight]]] = {}
-        self._inventor_watch_timer = QTimer(self)
-        self._inventor_watch_timer.setInterval(1500)
-        self._inventor_watch_timer.timeout.connect(self._poll_pending_inventor_job)
         self._truck_watch_timer = QTimer(self)
         self._truck_watch_timer.setInterval(120)
         self._truck_watch_timer.timeout.connect(self._poll_pending_truck_future)
@@ -269,6 +215,7 @@ class MainWindow(QMainWindow):
         self._kitter_status_refresh_timer.timeout.connect(self._poll_kitter_status_refresh)
 
         self._build_ui()
+        self.inventor_controller = InventorController(self)
         self._apply_dashboard_style()
         self._load_settings_into_form()
         self._flow_cache_refresh_timer.start()
@@ -2458,7 +2405,7 @@ class MainWindow(QMainWindow):
         progress.setAutoClose(False)
         progress.setAutoReset(False)
 
-        def _job(worker: PacketJobWorker) -> dict[str, object]:
+        def _job(worker: BackgroundJobWorker) -> dict[str, object]:
             worker.emit_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
             discovered_context = prepare_packet_build_context(
                 rpd_path=status.paths.rpd_path,
@@ -2511,7 +2458,7 @@ class MainWindow(QMainWindow):
                 "sym_comment_result": sym_comment_result,
             }
 
-        worker = PacketJobWorker(_job)
+        worker = BackgroundJobWorker(_job)
         setattr(self, "_packet_build_running", True)
         setattr(self, "_packet_build_worker", worker)
 
@@ -2630,7 +2577,7 @@ class MainWindow(QMainWindow):
         progress.setAutoClose(False)
         progress.setAutoReset(False)
 
-        def _job(worker: PacketJobWorker) -> dict[str, object]:
+        def _job(worker: BackgroundJobWorker) -> dict[str, object]:
             worker.emit_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
             discovered_context = prepare_packet_build_context(
                 rpd_path=status.paths.rpd_path,
@@ -2651,7 +2598,7 @@ class MainWindow(QMainWindow):
             )
             return {"state": "done", "context": discovered_context, "result": result}
 
-        worker = PacketJobWorker(_job)
+        worker = BackgroundJobWorker(_job)
         setattr(self, "_packet_build_running", True)
         setattr(self, "_packet_build_worker", worker)
 
@@ -2883,71 +2830,8 @@ class MainWindow(QMainWindow):
             self._full_flow_table_edit_triggers = None
         self.full_flow_button.setText("Run Full Flow")
 
-    def _review_full_flow_inventor_report(
-        self,
-        status: KitStatus,
-        inventor,
-        progress_cb,
-    ) -> str:
-        report_path = getattr(inventor, "report_path", None)
-        if report_path is None or not Path(report_path).exists():
-            report_path = next(
-                (path for path in getattr(inventor, "moved_paths", ()) if Path(path).suffix.casefold() == ".txt"),
-                None,
-            )
-        if report_path is None or not Path(report_path).exists():
-            QMessageBox.critical(
-                self,
-                "Run Full Flow",
-                "Inventor-to-RADAN completed, but the generated report could not be found for review.",
-            )
-            progress_cb("Failed: Inventor report could not be found for review.")
-            return "error"
-
-        progress_cb(f"Inventor report ready for operator review: {Path(report_path).name}")
-        try:
-            review_dialog = InventorReportReviewDialog(Path(report_path), self)
-            review_result = review_dialog.exec()
-        except Exception as exc:
-            QMessageBox.critical(self, "Run Full Flow", f"Could not show report review:\n\n{exc}")
-            progress_cb(f"Failed: could not show Inventor report review ({exc})")
-            return "error"
-
-        if review_result == QDialog.Accepted:
-            progress_cb("Inventor report accepted. Continuing to RADAN CSV import.")
-            return "accepted"
-
-        discard_paths = tuple(
-            Path(path)
-            for path in getattr(inventor, "moved_paths", ())
-            if Path(path).suffix.casefold() in {".csv", ".txt"}
-        )
-        deleted_paths, failed_deletes = delete_paths(discard_paths)
-        self._queue_status_refresh_for_truck(status.paths.truck_number)
-        self.log(
-            "Discarded unacknowledged Inventor-to-RADAN outputs during Full Flow: "
-            + ", ".join(str(path) for path in deleted_paths)
-        )
-        progress_cb("Stopped by operator after Inventor report review.")
-        if failed_deletes:
-            QMessageBox.warning(
-                self,
-                "Run Full Flow",
-                "The Inventor-to-RADAN report was not acknowledged, but some generated files could not be deleted.\n\n"
-                + "\n".join(failed_deletes),
-            )
-        else:
-            QMessageBox.information(
-                self,
-                "Run Full Flow",
-                "Full Flow stopped by operator after Inventor report review.\n\n"
-                "The generated CSV/report were deleted.\n\n"
-                + "\n".join(str(path) for path in deleted_paths),
-            )
-        return "stopped"
-
     def _start_full_flow_worker(self, job_fn, on_done, on_error, progress_cb) -> None:
-        worker = PacketJobWorker(job_fn)
+        worker = BackgroundJobWorker(job_fn)
         self._full_flow_worker = worker
 
         def _on_progress(_done: int, _total: int, status_text: str) -> None:
@@ -3067,7 +2951,7 @@ class MainWindow(QMainWindow):
                 _finalize(result, opened_packets, nester_message)
                 return
 
-            def _nester_job(worker: PacketJobWorker) -> dict[str, object]:
+            def _nester_job(worker: BackgroundJobWorker) -> dict[str, object]:
                 try:
                     nester_result = run_headless_nester(
                         result.project_path,
@@ -3116,7 +3000,7 @@ class MainWindow(QMainWindow):
             self._start_full_flow_worker(_nester_job, _on_nester_done, _show_worker_error, _progress)
 
         def _post_review_job(inventor):
-            def _job(worker: PacketJobWorker) -> dict[str, object]:
+            def _job(worker: BackgroundJobWorker) -> dict[str, object]:
                 try:
                     result = run_full_flow_after_inventor_review(
                         status,
@@ -3140,17 +3024,17 @@ class MainWindow(QMainWindow):
 
             self._start_full_flow_worker(_job, _on_done, _show_worker_error, _progress)
 
-        def _inventor_job(worker: PacketJobWorker) -> dict[str, object]:
+        def _inventor_job(worker: BackgroundJobWorker) -> dict[str, object]:
             try:
-                inventor = run_inventor_inline_for_status(
+                inventor = run_inventor_for_status(
                     status,
                     self.settings,
                     progress_cb=lambda message: worker.emit_progress(0, 0, message),
                 )
                 return {"state": "done", "inventor": inventor}
-            except FullFlowNeedsUserAction as exc:
+            except InventorNeedsUserAction as exc:
                 return {"state": "needs_user_action", "message": str(exc)}
-            except FullFlowError as exc:
+            except InventorServiceError as exc:
                 return {"state": "error", "message": str(exc)}
 
         def _on_inventor_done(payload: object) -> None:
@@ -3167,13 +3051,45 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Run Full Flow", message)
                 return
             inventor = data.get("inventor")
-            review_state = self._review_full_flow_inventor_report(status, inventor, _progress)
-            if review_state == "accepted":
+            _progress(f"Inventor report ready for operator review: {getattr(inventor, 'report_path', '')}")
+            outcome = review_inventor_result(self, inventor)
+            if outcome.state == InventorReviewState.ACCEPTED:
+                _progress("Inventor report accepted. Continuing to RADAN CSV import.")
                 _post_review_job(inventor)
                 return
-            if review_state == "stopped":
+            if outcome.state == InventorReviewState.DISCARDED:
+                discard_result = outcome.discard_result
+                deleted_paths = tuple(getattr(discard_result, "deleted_paths", ()) or ())
+                failed_deletes = tuple(getattr(discard_result, "failed_deletes", ()) or ())
+                self._queue_status_refresh_for_truck(status.paths.truck_number)
+                self.log(
+                    "Discarded Inventor-to-RADAN outputs during Full Flow: "
+                    + ", ".join(str(path) for path in deleted_paths)
+                )
+                _progress("Stopped by operator after Inventor report review.")
+                if failed_deletes:
+                    QMessageBox.warning(
+                        self,
+                        "Run Full Flow",
+                        "The Inventor-to-RADAN report was not acknowledged, but some generated files could not be deleted.\n\n"
+                        + "\n".join(failed_deletes),
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Run Full Flow",
+                        "Full Flow stopped by operator after Inventor report review.\n\n"
+                        "The generated CSV/report were deleted.\n\n"
+                        + "\n".join(str(path) for path in deleted_paths),
+                    )
                 _finish_and_unlock("Stopped by operator after Inventor report review.")
                 return
+            _progress(outcome.message or "Failed before RADAN CSV import.")
+            QMessageBox.critical(
+                self,
+                "Run Full Flow",
+                outcome.message or "Inventor report review failed before RADAN CSV import.",
+            )
             _finish_and_unlock("Failed before RADAN CSV import.")
 
         _progress(f"Selected kit: {status.paths.display_name}")
@@ -3235,151 +3151,7 @@ class MainWindow(QMainWindow):
         self.open_flow_app()
 
     def run_selected_inventor_flow(self) -> None:
-        if self._pending_inventor_job is not None:
-            QMessageBox.information(
-                self,
-                "Run Inventor Tool",
-                "An Inventor output watch is already active. Let it finish before starting another one.",
-            )
-            return
-
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Run Inventor Tool", "Select a kit first.")
-            return
-        spreadsheet_path = status.spreadsheet_match.chosen_path
-        if spreadsheet_path is None:
-            QMessageBox.warning(
-                self,
-                "Run Inventor Tool",
-                "This kit does not have exactly one BOM candidate in the W folder.",
-            )
-            return
-        if status.paths.project_dir is None:
-            QMessageBox.warning(
-                self,
-                "Run Inventor Tool",
-                "The L-side project folder is not available for this kit.",
-            )
-            return
-
-        self._ensure_saved_settings()
-        entry_text = self.settings.inventor_to_radan_entry.strip()
-        if not entry_text:
-            QMessageBox.warning(self, "Run Inventor Tool", "Inventor launcher is not configured.")
-            return
-        entry_path = Path(entry_text)
-
-        self.launch_inventor_button.setEnabled(False)
-        self.launch_inventor_button.setText("Running Inventor...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            result = run_inventor_to_radan_inline(entry_path, spreadsheet_path)
-            outputs, moved_paths = move_inventor_outputs_to_project(
-                spreadsheet_path,
-                status.paths.project_dir,
-            )
-        except InventorToRadanInlineNeedsUi as exc:
-            QApplication.restoreOverrideCursor()
-            self.launch_inventor_button.setEnabled(True)
-            self.launch_inventor_button.setText("Run Inventor Tool")
-            result = None
-            moved_paths = ()
-            fallback_reason = str(exc)
-        except Exception as exc:
-            QApplication.restoreOverrideCursor()
-            self.launch_inventor_button.setEnabled(True)
-            self.launch_inventor_button.setText("Run Inventor Tool")
-            QMessageBox.critical(self, "Run Inventor Tool", str(exc))
-            return
-        else:
-            QApplication.restoreOverrideCursor()
-            self.launch_inventor_button.setEnabled(True)
-            self.launch_inventor_button.setText("Run Inventor Tool")
-            if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
-                self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
-            added_count = getattr(result, "added_count", None)
-            row_text = f" ({added_count} RADAN row{'s' if added_count != 1 else ''})" if added_count is not None else ""
-            self.log("Ran Inventor-to-RADAN inline and moved outputs to L: " + ", ".join(str(path) for path in moved_paths))
-            report_path = outputs.target_report_path
-            if report_path is None or not report_path.exists():
-                report_path = next((path for path in moved_paths if path.suffix.casefold() == ".txt"), None)
-            if report_path is not None and report_path.exists():
-                try:
-                    review_dialog = InventorReportReviewDialog(report_path, self)
-                    review_result = review_dialog.exec()
-                except Exception as exc:
-                    QMessageBox.critical(self, "Run Inventor Tool", f"Could not show report review:\n\n{exc}")
-                    return
-                if review_result != QDialog.Accepted:
-                    discard_paths = tuple(
-                        path
-                        for path in moved_paths
-                        if path.suffix.casefold() in {".csv", ".txt"}
-                    )
-                    deleted_paths, failed_deletes = delete_paths(discard_paths)
-                    if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
-                        self._set_current_statuses(collect_kit_statuses(status.paths.truck_number, self.settings))
-                    self.log("Discarded unacknowledged Inventor-to-RADAN outputs: " + ", ".join(str(path) for path in deleted_paths))
-                    if failed_deletes:
-                        QMessageBox.warning(
-                            self,
-                            "Run Inventor Tool",
-                            "The Inventor-to-RADAN report was not acknowledged, but some generated files could not be deleted.\n\n"
-                            + "\n".join(failed_deletes),
-                        )
-                    else:
-                        QMessageBox.information(
-                            self,
-                            "Run Inventor Tool",
-                            "The Inventor-to-RADAN report was not acknowledged, so the generated CSV/report were deleted.\n\n"
-                            + "\n".join(str(path) for path in deleted_paths),
-                        )
-                    return
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Run Inventor Tool",
-                    "Inventor-to-RADAN completed, but the generated report could not be found for review.",
-                )
-                return
-            QMessageBox.information(
-                self,
-                "Run Inventor Tool",
-                f"Inventor-to-RADAN ran inline{row_text} and the output was moved to L.\n\n"
-                + "\n".join(str(path) for path in moved_paths),
-            )
-            return
-
-        try:
-            process = launch_inventor_to_radan(entry_path, spreadsheet_path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Run Inventor Tool", str(exc))
-            return
-
-        self._pending_inventor_job = PendingInventorJob(
-            truck_number=status.paths.truck_number,
-            kit_name=status.kit_name,
-            spreadsheet_path=spreadsheet_path,
-            project_dir=status.paths.project_dir,
-            outputs=inventor_output_paths(spreadsheet_path, status.paths.project_dir),
-            process=process,
-            started_at_monotonic=time.monotonic(),
-        )
-        self.launch_inventor_button.setEnabled(False)
-        self.launch_inventor_button.setText("Watching Inventor...")
-        self._inventor_watch_timer.start()
-        self.log(
-            f"Launched Inventor tool for {spreadsheet_path.name} because {fallback_reason.lower()} "
-            "Finish the external prompts; output will be moved to L automatically when ready."
-        )
-        QMessageBox.information(
-            self,
-            "Run Inventor Tool",
-            f"{fallback_reason}\n\nInventor has been launched in its own window.\n\n"
-            "Complete its prompts there. This explorer will keep watching and move the generated output to L once the files exist and stop changing.",
-        )
+        self.inventor_controller.start_selected()
 
     def import_selected_csv_to_radan(self) -> None:
         use_cleaned_dxf = (
@@ -3681,110 +3453,6 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         super().closeEvent(event)
-
-    @staticmethod
-    def _inventor_output_signature(outputs: InventorOutputPaths) -> tuple[tuple[str, int, int], ...] | None:
-        if not outputs.source_csv_path.exists():
-            return None
-        signature: list[tuple[str, int, int]] = []
-        try:
-            csv_stat = outputs.source_csv_path.stat()
-        except OSError:
-            return
-        signature.append(
-            (
-                outputs.source_csv_path.name,
-                int(csv_stat.st_size),
-                int(csv_stat.st_mtime_ns),
-            )
-        )
-        if outputs.source_report_path.exists():
-            try:
-                report_stat = outputs.source_report_path.stat()
-            except OSError:
-                report_stat = None
-            if report_stat is not None:
-                signature.append(
-                    (
-                        outputs.source_report_path.name,
-                        int(report_stat.st_size),
-                        int(report_stat.st_mtime_ns),
-                    )
-                )
-        return tuple(signature)
-
-    def _finish_pending_inventor_job(self, *, reset_button: bool = True) -> None:
-        self._pending_inventor_job = None
-        self._inventor_watch_timer.stop()
-        if reset_button:
-            self.launch_inventor_button.setEnabled(True)
-            self.launch_inventor_button.setText("Run Inventor Tool")
-
-    def _poll_pending_inventor_job(self) -> None:
-        job = self._pending_inventor_job
-        if job is None:
-            self._inventor_watch_timer.stop()
-            return
-
-        if job.launcher_exit_code is None:
-            try:
-                job.launcher_exit_code = job.process.poll()
-            except Exception:
-                job.launcher_exit_code = None
-
-        signature = self._inventor_output_signature(job.outputs)
-        now = time.monotonic()
-        if signature is not None:
-            if job.first_output_seen_at_monotonic is None:
-                job.first_output_seen_at_monotonic = now
-                job.last_output_signature = signature
-                job.stable_polls = 0
-                self.log(f"Inventor output appeared for {job.spreadsheet_path.name}; waiting for it to settle.")
-                return
-            if signature == job.last_output_signature:
-                job.stable_polls += 1
-            else:
-                job.last_output_signature = signature
-                job.stable_polls = 0
-
-            if job.stable_polls < 2:
-                return
-
-            moved_paths: tuple[Path, ...] = ()
-            try:
-                _outputs, moved_paths = move_inventor_outputs_to_project(
-                    job.spreadsheet_path,
-                    job.project_dir,
-                )
-            except Exception as exc:
-                self._finish_pending_inventor_job()
-                QMessageBox.warning(
-                    self,
-                    "Run Inventor Tool",
-                    "The output appeared, but moving it to L failed.\n\n"
-                    f"{exc}",
-                )
-                return
-
-            if job.truck_number.casefold() == self.current_truck_number().casefold():
-                self._set_current_statuses(collect_kit_statuses(job.truck_number, self.settings))
-            self._finish_pending_inventor_job()
-            self.log("Moved inventor outputs from W to L: " + ", ".join(str(path) for path in moved_paths))
-            QMessageBox.information(
-                self,
-                "Run Inventor Tool",
-                "Inventor output was moved to L.\n\n" + "\n".join(str(path) for path in moved_paths),
-            )
-            return
-
-        if now - job.started_at_monotonic > 45 * 60:
-            self._finish_pending_inventor_job()
-            QMessageBox.warning(
-                self,
-                "Run Inventor Tool",
-                "Timed out waiting for Inventor output files to appear in W.\n\n"
-                "The launcher was started, but no settled output was found to move.",
-            )
 
     def _open_path_with_message(self, path: Path) -> None:
         try:

@@ -27,6 +27,8 @@ if str(RADAN_DIR) not in sys.path:
     sys.path.insert(0, str(RADAN_DIR))
 
 import full_flow_service
+import background_job
+import inventor_service
 import rpd_io  # type: ignore[import-not-found]
 from flow_bridge import (
     flow_kit_insight_for_explorer_kit,
@@ -1588,6 +1590,183 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(raised.exception.missing_dxf_count, 1)
             self.assertEqual(raised.exception.missing_rule_count, 1)
 
+    def test_inventor_service_requires_exactly_one_bom(self) -> None:
+        status = SimpleNamespace(
+            spreadsheet_match=SimpleNamespace(chosen_path=None, candidates=()),
+            paths=SimpleNamespace(project_dir=Path("project")),
+        )
+
+        with self.assertRaisesRegex(inventor_service.InventorValidationError, "exactly one BOM"):
+            inventor_service.run_inventor_for_status(status, ExplorerSettings())
+
+    def test_inventor_service_reports_ambiguous_bom(self) -> None:
+        status = SimpleNamespace(
+            spreadsheet_match=SimpleNamespace(
+                chosen_path=None,
+                candidates=(Path("one.xlsx"), Path("two.xlsx")),
+            ),
+            paths=SimpleNamespace(project_dir=Path("project")),
+        )
+
+        with self.assertRaisesRegex(inventor_service.InventorValidationError, "multiple BOM candidates"):
+            inventor_service.run_inventor_for_status(status, ExplorerSettings())
+
+    def test_inventor_service_validates_project_dir_and_entry(self) -> None:
+        with workspace_tempdir() as temp_root:
+            bom = temp_root / "BOM.xlsx"
+            bom.write_text("bom", encoding="utf-8")
+            status = SimpleNamespace(
+                spreadsheet_match=SimpleNamespace(chosen_path=bom, candidates=(bom,)),
+                paths=SimpleNamespace(project_dir=None),
+            )
+
+            with self.assertRaisesRegex(inventor_service.InventorValidationError, "L-side project folder"):
+                inventor_service.run_inventor_for_status(status, ExplorerSettings(inventor_to_radan_entry=""))
+
+            missing_project = temp_root / "missing_project"
+            status.paths.project_dir = missing_project
+            with self.assertRaisesRegex(inventor_service.InventorValidationError, "does not exist"):
+                inventor_service.run_inventor_for_status(status, ExplorerSettings(inventor_to_radan_entry=""))
+
+            project = temp_root / "project"
+            project.mkdir()
+            status.paths.project_dir = project
+            with self.assertRaisesRegex(inventor_service.InventorValidationError, "not configured"):
+                inventor_service.run_inventor_for_status(status, ExplorerSettings(inventor_to_radan_entry=""))
+
+            with self.assertRaisesRegex(inventor_service.InventorValidationError, "does not exist"):
+                inventor_service.run_inventor_for_status(
+                    status,
+                    ExplorerSettings(inventor_to_radan_entry=str(temp_root / "missing.bat")),
+                )
+
+    def test_inventor_service_moves_output_once_and_returns_typed_result(self) -> None:
+        with workspace_tempdir() as temp_root:
+            bom = temp_root / "W" / "BOM.xlsx"
+            bom.parent.mkdir()
+            bom.write_text("bom", encoding="utf-8")
+            project = temp_root / "L"
+            project.mkdir()
+            entry = temp_root / "inventor_to_radan.bat"
+            entry.write_text("@echo off\r\n", encoding="utf-8")
+            outputs = inventor_service.inventor_output_paths(bom, project)
+            target_csv = outputs.target_csv_path
+            target_report = outputs.target_report_path
+            self.assertIsNotNone(target_csv)
+            self.assertIsNotNone(target_report)
+            target_report.write_text("report", encoding="utf-8")
+            status = SimpleNamespace(
+                spreadsheet_match=SimpleNamespace(chosen_path=bom, candidates=(bom,)),
+                paths=SimpleNamespace(project_dir=project),
+            )
+
+            with (
+                patch(
+                    "inventor_service.run_inventor_to_radan_inline",
+                    return_value=SimpleNamespace(added_count="7"),
+                ) as run_mock,
+                patch(
+                    "inventor_service.move_inventor_outputs_to_project",
+                    return_value=(outputs, (target_csv, target_report)),
+                ) as move_mock,
+            ):
+                result = inventor_service.run_inventor_for_status(
+                    status,
+                    ExplorerSettings(inventor_to_radan_entry=str(entry)),
+                )
+
+            run_mock.assert_called_once_with(entry, bom)
+            move_mock.assert_called_once_with(bom, project)
+            self.assertEqual(result.added_count, 7)
+            self.assertEqual(result.report_path, target_report)
+            self.assertEqual(result.discard_paths, (target_csv, target_report))
+
+    def test_inventor_service_translates_inline_needs_ui(self) -> None:
+        with workspace_tempdir() as temp_root:
+            bom = temp_root / "BOM.xlsx"
+            bom.write_text("bom", encoding="utf-8")
+            project = temp_root / "project"
+            project.mkdir()
+            entry = temp_root / "inventor_to_radan.bat"
+            entry.write_text("@echo off\r\n", encoding="utf-8")
+            status = SimpleNamespace(
+                spreadsheet_match=SimpleNamespace(chosen_path=bom, candidates=(bom,)),
+                paths=SimpleNamespace(project_dir=project),
+            )
+
+            with (
+                patch(
+                    "inventor_service.run_inventor_to_radan_inline",
+                    side_effect=InventorToRadanInlineNeedsUi("needs ui"),
+                ),
+                patch("inventor_service.move_inventor_outputs_to_project") as move_mock,
+            ):
+                with self.assertRaises(inventor_service.InventorNeedsUserAction):
+                    inventor_service.run_inventor_for_status(
+                        status,
+                        ExplorerSettings(inventor_to_radan_entry=str(entry)),
+                    )
+
+            move_mock.assert_not_called()
+
+    def test_inventor_review_accept_does_not_delete_output(self) -> None:
+        from PySide6.QtWidgets import QDialog
+        import dialogs.inventor_report_review_dialog as review_module
+
+        with workspace_tempdir() as temp_root:
+            report = temp_root / "BOM_report.txt"
+            report.write_text("ok", encoding="utf-8")
+            result = inventor_service.InventorRunResult(
+                spreadsheet_path=temp_root / "BOM.xlsx",
+                project_dir=temp_root,
+                entry_path=temp_root / "inventor_to_radan.bat",
+                moved_paths=(report,),
+                report_path=report,
+                discard_paths=(report,),
+            )
+
+            class FakeDialog:
+                rejected_without_ack = False
+
+                def __init__(self, *_args, **_kwargs) -> None:
+                    pass
+
+                def exec(self) -> int:
+                    return int(QDialog.Accepted)
+
+            with (
+                patch.object(review_module, "InventorReportReviewDialog", FakeDialog),
+                patch.object(review_module, "discard_inventor_result") as discard_mock,
+            ):
+                outcome = review_module.review_inventor_result(None, result)
+
+            self.assertEqual(outcome.state, review_module.InventorReviewState.ACCEPTED)
+            discard_mock.assert_not_called()
+
+    def test_inventor_discard_deletes_only_eligible_generated_files(self) -> None:
+        with workspace_tempdir() as temp_root:
+            csv_path = temp_root / "BOM_Radan.csv"
+            report_path = temp_root / "BOM_report.txt"
+            pdf_path = temp_root / "BOM.pdf"
+            for path in (csv_path, report_path, pdf_path):
+                path.write_text("data", encoding="utf-8")
+            result = inventor_service.InventorRunResult(
+                spreadsheet_path=temp_root / "BOM.xlsx",
+                project_dir=temp_root,
+                entry_path=temp_root / "inventor_to_radan.bat",
+                moved_paths=(csv_path, report_path, pdf_path),
+                report_path=report_path,
+                discard_paths=(csv_path, report_path, pdf_path),
+            )
+
+            discard_result = inventor_service.discard_inventor_result(result)
+
+            self.assertEqual(discard_result.failed_deletes, ())
+            self.assertEqual(set(discard_result.deleted_paths), {csv_path, report_path})
+            self.assertFalse(csv_path.exists())
+            self.assertFalse(report_path.exists())
+            self.assertTrue(pdf_path.exists())
+
     def test_radan_csv_missing_symbols_reports_missing_sym_files(self) -> None:
         with workspace_tempdir() as temp_root:
             output_folder = temp_root / "symbols"
@@ -2021,7 +2200,14 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
     def test_full_flow_skips_kitter_rf_for_non_paint_pack(self) -> None:
         status = SimpleNamespace(kit_name="PUMPHOUSE", paths=SimpleNamespace(rpd_path=Path("job.rpd")))
         progress: list[str] = []
-        inventor = full_flow_service.InventorFlowResult(moved_paths=(), report_path=Path("report.txt"))
+        inventor = inventor_service.InventorRunResult(
+            spreadsheet_path=Path("bom.xlsx"),
+            project_dir=Path("."),
+            entry_path=Path("inventor_to_radan.bat"),
+            moved_paths=(),
+            report_path=Path("report.txt"),
+            discard_paths=(),
+        )
         packet_result = full_flow_service.PacketFlowResult(
             packet_paths=(),
             print_pages=0,
@@ -2056,7 +2242,14 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
     def test_full_flow_runs_kitter_rf_for_paint_pack(self) -> None:
         status = SimpleNamespace(kit_name="PAINT PACK", paths=SimpleNamespace(rpd_path=Path("paint.rpd")))
-        inventor = full_flow_service.InventorFlowResult(moved_paths=(), report_path=Path("report.txt"))
+        inventor = inventor_service.InventorRunResult(
+            spreadsheet_path=Path("bom.xlsx"),
+            project_dir=Path("."),
+            entry_path=Path("inventor_to_radan.bat"),
+            moved_paths=(),
+            report_path=Path("report.txt"),
+            discard_paths=(),
+        )
         packet_result = full_flow_service.PacketFlowResult(
             packet_paths=(),
             print_pages=0,
@@ -2320,6 +2513,65 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 window._flow_executor.shutdown(wait=False, cancel_futures=True)
                 window.close()
                 app.processEvents()
+
+    def test_inventor_controller_restores_button_state_after_user_action_stop(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
+        from controllers.inventor_controller import InventorController
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        window.launch_inventor_button = QPushButton("Run Inventor Tool", window)
+        window.settings = ExplorerSettings()
+        window._current_status = lambda: SimpleNamespace(paths=SimpleNamespace(truck_number="F55334"))
+        window._ensure_saved_settings = lambda: None
+        window.current_truck_number = lambda: "F55334"
+        window._set_current_statuses = lambda statuses: None
+        window.log = lambda message: None
+        controller = InventorController(window)
+        try:
+            with (
+                patch.object(InventorController, "_start_worker", lambda self, worker: None),
+                patch.object(QMessageBox, "information") as info_mock,
+            ):
+                controller.start_selected()
+                self.assertFalse(window.launch_inventor_button.isEnabled())
+                self.assertEqual(window.launch_inventor_button.text(), "Running Inventor...")
+
+                controller._on_worker_done({"state": "needs_user_action", "message": "needs operator input"})
+
+            self.assertTrue(window.launch_inventor_button.isEnabled())
+            self.assertEqual(window.launch_inventor_button.text(), "Run Inventor Tool")
+            info_mock.assert_called_once()
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_inventor_watcher_path_symbols_are_absent(self) -> None:
+        text = (PROJECT_DIR / "main_window.py").read_text(encoding="utf-8")
+
+        for symbol in (
+            "PendingInventorJob",
+            "_pending_inventor_job",
+            "_inventor_watch_timer",
+            "_inventor_output_signature",
+            "_poll_pending_inventor_job",
+            "_finish_pending_inventor_job",
+            "Watching Inventor",
+            "output watch",
+        ):
+            self.assertNotIn(symbol, text)
+        self.assertNotIn("run_inventor_to_radan_inline", text)
+        self.assertNotIn("move_inventor_outputs_to_project", text)
+
+    def test_generic_background_worker_is_used(self) -> None:
+        import main_window
+        from controllers import inventor_controller
+
+        self.assertIs(main_window.BackgroundJobWorker, background_job.BackgroundJobWorker)
+        self.assertIs(inventor_controller.BackgroundJobWorker, background_job.BackgroundJobWorker)
+        text = (PROJECT_DIR / "main_window.py").read_text(encoding="utf-8")
+        self.assertNotIn("PacketJobWorker", text)
+        self.assertNotIn("PacketJobSignals", text)
 
 
 def detect_status_from_paths(paths):
