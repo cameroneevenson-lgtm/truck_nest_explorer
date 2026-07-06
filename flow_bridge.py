@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field, replace
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -97,6 +98,26 @@ def _python_executable() -> str:
     if DEFAULT_VENV_PYTHON.exists():
         return str(DEFAULT_VENV_PYTHON)
     return sys.executable
+
+
+def _hidden_startupinfo() -> subprocess.STARTUPINFO | None:
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return startupinfo
+
+
+def _hidden_process_kwargs() -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    startupinfo = _hidden_startupinfo()
+    if startupinfo is not None:
+        kwargs["startupinfo"] = startupinfo
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    return kwargs
 
 
 def _file_cache_token(path: Path) -> str:
@@ -264,6 +285,7 @@ def load_flow_truck_insight(
             capture_output=True,
             text=True,
             timeout=15,
+            **_hidden_process_kwargs(),
         )
     except Exception as exc:
         return FlowTruckInsight(

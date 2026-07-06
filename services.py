@@ -1037,20 +1037,31 @@ def _detect_named_packet_pdf(
     matches_fn,
     fs_cache: BoundedTTLCache[object] | None = None,
 ) -> PdfMatch:
+    cache_obj = fs_cache
     if paths.project_dir is None:
         return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
-    if not cached_path_exists(paths.project_dir, cache=fs_cache):
+    if not cached_path_exists(paths.project_dir, cache=cache_obj):
         return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
 
     search_root = paths.release_kit_dir or paths.project_dir
-    if search_root is None or not cached_path_exists(search_root, cache=fs_cache):
+    if search_root is None or not cached_path_exists(search_root, cache=cache_obj):
         return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
+    cache_key = (
+        "named_packet_pdf",
+        getattr(matches_fn, "__name__", repr(matches_fn)),
+        normalize_cache_path(paths.project_dir),
+        normalize_cache_path(search_root),
+    )
+    if cache_obj is not None:
+        hit, value = cache_obj.get(cache_key)
+        if hit and isinstance(value, PdfMatch):
+            return value
 
     candidates: list[tuple[int, Path]] = []
     for child, depth in _shallow_descendant_files(
         search_root,
         max_depth=MAX_NEST_SUMMARY_DEPTH,
-        fs_cache=fs_cache,
+        fs_cache=cache_obj,
     ):
         if child.suffix.casefold() not in SUPPORTED_PREVIEW_SUFFIXES:
             continue
@@ -1061,8 +1072,14 @@ def _detect_named_packet_pdf(
     candidates.sort(key=lambda item: (item[0], natural_sort_key(str(item[1].relative_to(search_root)))))
     paths_only = tuple(path for _depth, path in candidates)
     if not paths_only:
-        return PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
-    return PdfMatch(chosen_path=paths_only[-1], candidates=paths_only)
+        result = PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
+        if cache_obj is not None:
+            cache_obj.set(cache_key, result, negative=True)
+        return result
+    result = PdfMatch(chosen_path=paths_only[-1], candidates=paths_only)
+    if cache_obj is not None:
+        cache_obj.set(cache_key, result, negative=False)
+    return result
 
 
 def detect_preview_pdf(
@@ -1081,16 +1098,28 @@ def detect_preview_pdf(
     return PdfMatch(chosen_path=candidates[0], candidates=candidates)
 
 
-def detect_print_packet_pdf(paths: KitPaths) -> PdfMatch:
-    return _detect_named_packet_pdf(paths, matches_fn=_is_print_packet_pdf)
+def detect_print_packet_pdf(
+    paths: KitPaths,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> PdfMatch:
+    return _detect_named_packet_pdf(paths, matches_fn=_is_print_packet_pdf, fs_cache=fs_cache)
 
 
-def detect_assembly_packet_pdf(paths: KitPaths) -> PdfMatch:
-    return _detect_named_packet_pdf(paths, matches_fn=_is_assembly_packet_pdf)
+def detect_assembly_packet_pdf(
+    paths: KitPaths,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> PdfMatch:
+    return _detect_named_packet_pdf(paths, matches_fn=_is_assembly_packet_pdf, fs_cache=fs_cache)
 
 
-def detect_cut_list_packet_pdf(paths: KitPaths) -> PdfMatch:
-    return _detect_named_packet_pdf(paths, matches_fn=_is_cut_list_packet_pdf)
+def detect_cut_list_packet_pdf(
+    paths: KitPaths,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> PdfMatch:
+    return _detect_named_packet_pdf(paths, matches_fn=_is_cut_list_packet_pdf, fs_cache=fs_cache)
 
 
 def fabrication_folder_has_files(

@@ -32,8 +32,10 @@ import background_job
 import inventor_service
 import rpd_io  # type: ignore[import-not-found]
 from flow_bridge import (
+    FlowKitInsight,
     FlowTruckInsight,
     flow_kit_insight_for_explorer_kit,
+    flow_probe_cache_token,
     load_flow_truck_insight,
     map_explorer_kit_to_flow_kit,
     normalize_flow_insight_for_local_release,
@@ -44,6 +46,10 @@ from models import (
     canonicalize_client_numbers_by_truck,
     canonicalize_notes_by_kit,
     ExplorerSettings,
+    KitPaths,
+    KitStatus,
+    PdfMatch,
+    SpreadsheetMatch,
     build_hidden_kit_key,
     canonicalize_hidden_kit_entries,
     canonicalize_punch_codes_by_kit,
@@ -391,6 +397,39 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             insight.kit_insights_by_flow_name["body"].display_text,
             "Complete",
         )
+
+    def test_load_flow_truck_insight_hides_probe_console_on_windows(self) -> None:
+        captured_kwargs: dict[str, object] = {}
+        with workspace_tempdir() as temp_root:
+            flow_dir = temp_root / "flow"
+            flow_dir.mkdir()
+            probe_path = temp_root / "flow_schedule_probe.py"
+            probe_path.write_text("# probe placeholder\n", encoding="utf-8")
+
+            def runner(command, **kwargs):
+                captured_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "available": True,
+                            "truck_number": "F55334",
+                            "summary_text": "Flow plan 2026-02-09",
+                            "kits": [],
+                        }
+                    ),
+                    stderr="",
+                )
+
+            with patch("flow_bridge.FLOW_APP_DIR", flow_dir), patch("flow_bridge.FLOW_PROBE_PATH", probe_path):
+                insight = load_flow_truck_insight("F55334", runner=runner)
+
+        self.assertTrue(insight.available)
+        if os.name == "nt":
+            self.assertIn("startupinfo", captured_kwargs)
+            self.assertIn("creationflags", captured_kwargs)
+        else:
+            self.assertNotIn("startupinfo", captured_kwargs)
 
     def test_normalize_flow_insight_for_local_release_prefers_local_unreleased_signal(self) -> None:
         truck_insight = parse_flow_probe_payload(
@@ -936,6 +975,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(match.chosen_path, packet_pdf)
             self.assertEqual(tuple(path.name for path in match.candidates), (packet_pdf.name,))
+
+    def test_detect_print_packet_pdf_reuses_filesystem_cache(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            packet_pdf = paths.project_dir / "PrintPacket_QTY_20260319.pdf"
+            packet_pdf.write_text("pdf", encoding="utf-8")
+            cache: BoundedTTLCache[object] = BoundedTTLCache(
+                "packet_pdf_test",
+                max_size=32,
+                positive_ttl_seconds=30.0,
+                negative_ttl_seconds=2.0,
+            )
+
+            reset_performance_metrics()
+            first = detect_print_packet_pdf(paths, fs_cache=cache)
+            first_snapshot = performance_snapshot()
+            second = detect_print_packet_pdf(paths, fs_cache=cache)
+            second_snapshot = performance_snapshot()
+
+            self.assertEqual(first.chosen_path, packet_pdf)
+            self.assertEqual(second.chosen_path, packet_pdf)
+            self.assertEqual(first_snapshot.filesystem_checks, second_snapshot.filesystem_checks)
+            self.assertGreater(
+                second_snapshot.cache_hits.get("packet_pdf_test", 0),
+                first_snapshot.cache_hits.get("packet_pdf_test", 0),
+            )
 
     def test_detect_assembly_packet_pdf_finds_generated_assembly_packet(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -2727,6 +2798,311 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 self.assertEqual(window._all_statuses, sentinel_statuses)
                 self.assertEqual(window._current_flow_truck_insight.truck_number, "F22222")
                 self.assertEqual(performance_snapshot().stale_results_ignored, 2)
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_flow_completion_updates_status_cells_without_repopulating_table(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        settings = ExplorerSettings(kit_templates=["PAINT PACK"])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=settings),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            status = KitStatus(
+                kit_name="PAINT PACK",
+                paths=KitPaths(
+                    truck_number="F55334",
+                    display_name="F55334 PAINT PACK",
+                    kit_name="PAINT PACK",
+                    fabrication_relative_path="PAINT PACK",
+                    project_name="F55334 PAINT PACK",
+                    release_truck_dir=None,
+                    release_kit_dir=None,
+                    project_dir=None,
+                    rpd_path=None,
+                    support_dirs=(),
+                    fabrication_truck_dir=None,
+                    fabrication_kit_dir=None,
+                ),
+                release_folder_exists=True,
+                project_folder_exists=False,
+                rpd_exists=False,
+                rpd_size_bytes=0,
+                fabrication_folder_exists=True,
+                fabrication_has_files=True,
+                spreadsheet_match=SpreadsheetMatch(chosen_path=None, candidates=()),
+                preview_pdf_match=PdfMatch(chosen_path=None, candidates=()),
+                inventor_outputs=None,
+                status_summary="Released",
+            )
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F55334")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+                window._current_flow_truck_insight = FlowTruckInsight(
+                    available=False,
+                    truck_number="F55334",
+                    summary_text="Flow: loading...",
+                )
+                window._set_current_statuses([status], cache=False)
+                self.assertEqual(window.kit_table.rowCount(), 1)
+                self.assertEqual(window.kit_table.item(0, window.RELEASE_COLUMN).text(), "Released")
+
+                flow_future: Future[FlowTruckInsight] = Future()
+                flow_future.set_result(
+                    FlowTruckInsight(
+                        available=True,
+                        truck_number="F55334",
+                        summary_text="Flow: ready",
+                        kit_insights_by_flow_name={
+                            "body": FlowKitInsight(
+                                flow_kit_name="Body",
+                                display_text="Complete",
+                                status_key="green",
+                            )
+                        },
+                    )
+                )
+                window._active_truck_switch = main_window.TruckSwitchRunContext("F55334", 1)
+                window._truck_switch_run_id = 1
+                window._pending_flow_by_truck["f55334"] = ("F55334", flow_probe_cache_token(), 1, flow_future)
+
+                with patch.object(window, "_populate_status_row", wraps=window._populate_status_row) as populate_mock:
+                    window._poll_pending_flow_future()
+
+                populate_mock.assert_not_called()
+                self.assertEqual(window.kit_table.rowCount(), 1)
+                self.assertEqual(window.kit_table.item(0, window.RELEASE_COLUMN).text(), "Complete")
+                self.assertEqual(window.kit_table.item(0, window.FLOW_COLUMN).text(), "Complete")
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_same_truck_reselection_keeps_existing_table_rows(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        settings = ExplorerSettings(kit_templates=["PAINT PACK"])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=settings),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            status = KitStatus(
+                kit_name="PAINT PACK",
+                paths=KitPaths(
+                    truck_number="F55334",
+                    display_name="F55334 PAINT PACK",
+                    kit_name="PAINT PACK",
+                    fabrication_relative_path="PAINT PACK",
+                    project_name="F55334 PAINT PACK",
+                    release_truck_dir=None,
+                    release_kit_dir=None,
+                    project_dir=None,
+                    rpd_path=None,
+                    support_dirs=(),
+                    fabrication_truck_dir=None,
+                    fabrication_kit_dir=None,
+                ),
+                release_folder_exists=True,
+                project_folder_exists=False,
+                rpd_exists=False,
+                rpd_size_bytes=0,
+                fabrication_folder_exists=True,
+                fabrication_has_files=True,
+                spreadsheet_match=SpreadsheetMatch(chosen_path=None, candidates=()),
+                preview_pdf_match=PdfMatch(chosen_path=None, candidates=()),
+                inventor_outputs=None,
+                status_summary="Released",
+            )
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F55334")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+                window._current_flow_truck_insight = FlowTruckInsight(
+                    available=False,
+                    truck_number="F55334",
+                    summary_text="Flow: loading...",
+                )
+                window._set_current_statuses([status], cache=False)
+                window._status_cache_by_truck.set(window._status_cache_key("F55334"), [status])
+
+                with (
+                    patch.object(window, "_load_flow_for_truck", return_value=True),
+                    patch.object(window, "_populate_status_row", wraps=window._populate_status_row) as populate_mock,
+                ):
+                    window._on_truck_changed()
+
+                populate_mock.assert_not_called()
+                self.assertEqual(window.kit_table.rowCount(), 1)
+                self.assertEqual(window.kit_table.item(0, 0).text(), "F55334 PAINT PACK")
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def _make_packet_button_status(self, temp_root: Path, *, create_packets: bool = False) -> KitStatus:
+        project_dir = temp_root / "release" / "F55334" / "PAINT PACK"
+        fabrication_dir = temp_root / "fab" / "F55334" / "PAINT PACK"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        fabrication_dir.mkdir(parents=True, exist_ok=True)
+        rpd_path = project_dir / "F55334 PAINT PACK.rpd"
+        rpd_path.write_text("<rpd />", encoding="utf-8")
+        if create_packets:
+            (project_dir / "PrintPacket_QTY_20260417_101500.pdf").write_text("pdf", encoding="utf-8")
+            (project_dir / "AssemblyPacket_TABLOID_20260417_101500.pdf").write_text("pdf", encoding="utf-8")
+            (project_dir / "CutList_20260417_101500.pdf").write_text("pdf", encoding="utf-8")
+        return KitStatus(
+            kit_name="PAINT PACK",
+            paths=KitPaths(
+                truck_number="F55334",
+                display_name="F55334 PAINT PACK",
+                kit_name="PAINT PACK",
+                fabrication_relative_path="PAINT PACK",
+                project_name="F55334 PAINT PACK",
+                release_truck_dir=project_dir.parent,
+                release_kit_dir=project_dir,
+                project_dir=project_dir,
+                rpd_path=rpd_path,
+                support_dirs=(),
+                fabrication_truck_dir=fabrication_dir.parent,
+                fabrication_kit_dir=fabrication_dir,
+            ),
+            release_folder_exists=True,
+            project_folder_exists=True,
+            rpd_exists=True,
+            rpd_size_bytes=rpd_path.stat().st_size,
+            fabrication_folder_exists=True,
+            fabrication_has_files=True,
+            spreadsheet_match=SpreadsheetMatch(chosen_path=None, candidates=()),
+            preview_pdf_match=PdfMatch(chosen_path=None, candidates=()),
+            inventor_outputs=None,
+            status_summary="Released",
+        )
+
+    def test_packet_build_buttons_disable_when_packets_already_exist(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        settings = ExplorerSettings(kit_templates=["PAINT PACK"])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=settings),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            status = self._make_packet_button_status(temp_root, create_packets=True)
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F55334")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+                window._set_current_statuses([status], cache=False)
+
+                self.assertFalse(window.build_print_packet_button.isEnabled())
+                self.assertFalse(window.build_assembly_packet_button.isEnabled())
+                self.assertFalse(window.build_cut_list_button.isEnabled())
+                self.assertEqual(window.build_print_packet_button.text(), "Print Packet Ready")
+                self.assertEqual(window.build_assembly_packet_button.text(), "Assembly Packet Ready")
+                self.assertEqual(window.build_cut_list_button.text(), "Cut List Ready")
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_packet_build_handlers_skip_existing_packets_before_prepare(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        settings = ExplorerSettings(kit_templates=["PAINT PACK"])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=settings),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            status = self._make_packet_button_status(temp_root, create_packets=True)
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F55334")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+                window._set_current_statuses([status], cache=False)
+
+                with (
+                    patch("main_window.prepare_packet_build_context") as prepare_mock,
+                    patch.object(QMessageBox, "information") as information_mock,
+                ):
+                    window.build_selected_print_packet()
+                    window.build_selected_assembly_packet()
+                    window.build_selected_cut_list_packet()
+
+                prepare_mock.assert_not_called()
+                self.assertEqual(information_mock.call_count, 3)
+                self.assertFalse(window._packet_build_running)
+                self.assertFalse(window._active_packet_build_keys)
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_packet_build_guard_blocks_second_click_until_released(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        settings = ExplorerSettings(kit_templates=["PAINT PACK"])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=settings),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            status = self._make_packet_button_status(temp_root, create_packets=False)
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F55334")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+                window._set_current_statuses([status], cache=False)
+
+                guard = window._begin_packet_build_guard("Build Print Packet", status, "print")
+                self.assertIsNotNone(guard)
+                self.assertTrue(window._packet_build_running)
+                self.assertFalse(window.build_print_packet_button.isEnabled())
+
+                with patch.object(QMessageBox, "information") as information_mock:
+                    blocked_guard = window._begin_packet_build_guard("Build Print Packet", status, "print")
+
+                self.assertIsNone(blocked_guard)
+                information_mock.assert_called_once()
+                window._finish_packet_build_guard(guard)
+                self.assertFalse(window._packet_build_running)
+                self.assertTrue(window.build_print_packet_button.isEnabled())
             finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)

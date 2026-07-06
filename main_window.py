@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -78,8 +79,9 @@ from models import (
     normalize_truck_order_entries,
     resolve_punch_code_text,
 )
-from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, settings_cache_signature
+from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, normalize_cache_path, settings_cache_signature
 from services import (
+    FILE_METADATA_CACHE,
     clear_performance_caches,
     collect_kit_statuses,
     configured_kit_mappings,
@@ -126,6 +128,14 @@ class TruckSwitchRunContext:
     completed: bool = False
 
 
+@dataclass(frozen=True)
+class PacketBuildGuard:
+    title: str
+    action_key: str
+    status: KitStatus
+    lock_key: tuple[str, str]
+
+
 class MainWindow(QMainWindow):
     FLOW_GANTT_HEIGHT = 176
     ASSEMBLY_PACKET_BUILD_ENABLED = True
@@ -154,6 +164,7 @@ class MainWindow(QMainWindow):
     PRINT_PACKET_COLUMN = 3
     ASSEMBLY_PACKET_COLUMN = 4
     CUT_LIST_COLUMN = 5
+    RELEASE_COLUMN = 6
     FLOW_COLUMN = 7
     PUNCH_CODE_COLUMN = 8
     NOTES_COLUMN = 9
@@ -186,9 +197,14 @@ class MainWindow(QMainWindow):
         self._hot_reload_end_time: float | None = None
         self._hot_reload_controller = HotReloadController(self, self._runtime_dir)
         self._updating_kit_table = False
+        self._kit_table_render_signature: tuple[object, ...] | None = None
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
         self._radan_import_log_dialog: ImportLogDialog | None = None
         self._radan_import_log_dialogs: list[ImportLogDialog] = []
+        self._packet_build_lock = threading.RLock()
+        self._active_packet_build_keys: set[tuple[str, str]] = set()
+        self._packet_build_running = False
+        self._packet_build_worker = None
         self._status_cache_by_truck: BoundedTTLCache[list[KitStatus]] = BoundedTTLCache(
             "ui_status",
             max_size=128,
@@ -206,6 +222,7 @@ class MainWindow(QMainWindow):
         self._kitter_refresh_truck_number = ""
         self._kitter_refresh_remaining = 0
         self._pending_truck_selection = ""
+        self._prewarm_truck_keys: set[str] = set()
         self._truck_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_truck_future: Future[list[str]] | None = None
         self._truck_request_serial = 0
@@ -752,10 +769,19 @@ class MainWindow(QMainWindow):
             return "Ready"
         return missing_label
 
+    def _print_packet_match_for_status(self, status: KitStatus):
+        return detect_print_packet_pdf(status.paths, fs_cache=FILE_METADATA_CACHE)
+
+    def _assembly_packet_match_for_status(self, status: KitStatus):
+        return detect_assembly_packet_pdf(status.paths, fs_cache=FILE_METADATA_CACHE)
+
+    def _cut_list_match_for_status(self, status: KitStatus):
+        return detect_cut_list_packet_pdf(status.paths, fs_cache=FILE_METADATA_CACHE)
+
     def _recommended_action_for_status(self, status: KitStatus) -> str:
-        print_packet_match = detect_print_packet_pdf(status.paths)
-        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
-        cut_list_match = detect_cut_list_packet_pdf(status.paths)
+        print_packet_match = self._print_packet_match_for_status(status)
+        assembly_packet_match = self._assembly_packet_match_for_status(status)
+        cut_list_match = self._cut_list_match_for_status(status)
         if not status.project_folder_exists or not status.rpd_exists:
             return "Repair Selected: the L-side project setup is incomplete."
         if status.spreadsheet_match.issue == "multiple_spreadsheets":
@@ -803,9 +829,9 @@ class MainWindow(QMainWindow):
 
     def _available_actions_for_status(self, status: KitStatus) -> str:
         flow_insight = self._flow_insight_for_status(status)
-        packet_match = detect_print_packet_pdf(status.paths)
-        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
-        cut_list_match = detect_cut_list_packet_pdf(status.paths)
+        packet_match = self._print_packet_match_for_status(status)
+        assembly_packet_match = self._assembly_packet_match_for_status(status)
+        cut_list_match = self._cut_list_match_for_status(status)
         actions: list[str] = []
         if not status.project_folder_exists or not status.rpd_exists:
             actions.append("Repair Selected")
@@ -865,12 +891,12 @@ class MainWindow(QMainWindow):
             if status.spreadsheet_match.chosen_path is None and status.spreadsheet_match.issue != "multiple_spreadsheets"
         )
         nest_ready = sum(1 for status in self._all_statuses if status.preview_pdf_match.chosen_path is not None)
-        print_packet_ready = sum(1 for status in self._all_statuses if detect_print_packet_pdf(status.paths).chosen_path is not None)
+        print_packet_ready = sum(1 for status in self._all_statuses if self._print_packet_match_for_status(status).chosen_path is not None)
         assembly_packet_ready = sum(
-            1 for status in self._all_statuses if detect_assembly_packet_pdf(status.paths).chosen_path is not None
+            1 for status in self._all_statuses if self._assembly_packet_match_for_status(status).chosen_path is not None
         )
         cut_list_ready = sum(
-            1 for status in self._all_statuses if detect_cut_list_packet_pdf(status.paths).chosen_path is not None
+            1 for status in self._all_statuses if self._cut_list_match_for_status(status).chosen_path is not None
         )
         hidden_filtered = max(0, total_kits - visible_kits)
         lines = [
@@ -917,9 +943,9 @@ class MainWindow(QMainWindow):
 
     def _kit_details_lines(self, status: KitStatus) -> list[str]:
         flow_insight = self._flow_insight_for_status(status)
-        packet_match = detect_print_packet_pdf(status.paths)
-        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
-        cut_list_match = detect_cut_list_packet_pdf(status.paths)
+        packet_match = self._print_packet_match_for_status(status)
+        assembly_packet_match = self._assembly_packet_match_for_status(status)
+        cut_list_match = self._cut_list_match_for_status(status)
         lines = [
             f"Kit: {status.paths.display_name}",
             f"RADAN name: {status.kit_name}",
@@ -1092,6 +1118,7 @@ class MainWindow(QMainWindow):
         truck_key = str(truck_number or "").strip().casefold()
         if not truck_key:
             return
+        self._prewarm_truck_keys.discard(truck_key)
         self._status_cache_by_truck.invalidate_where(
             lambda key, _value: isinstance(key, tuple)
             and len(key) == 3
@@ -1128,6 +1155,14 @@ class MainWindow(QMainWindow):
             and context.truck_number.casefold() == self.current_truck_number().casefold()
         )
 
+    def _displayed_statuses_match_truck(self, truck_number: str) -> bool:
+        truck_key = str(truck_number or "").strip().casefold()
+        return bool(
+            truck_key
+            and self._all_statuses
+            and all(status.paths.truck_number.casefold() == truck_key for status in self._all_statuses)
+        )
+
     def _mark_status_done(self, run_id: int, truck_number: str) -> None:
         context = self._active_truck_switch
         if context is None or context.run_id != run_id or context.truck_number.casefold() != truck_number.casefold():
@@ -1156,6 +1191,7 @@ class MainWindow(QMainWindow):
         invalidate_flow_insight_cache()
         self._pending_status_by_truck.clear()
         self._pending_flow_by_truck.clear()
+        self._prewarm_truck_keys.clear()
         self._active_truck_switch = None
         previous_future = self._pending_truck_future
         if previous_future is not None and not previous_future.done():
@@ -1208,6 +1244,8 @@ class MainWindow(QMainWindow):
         if not self.truck_list.count():
             self._current_flow_truck_insight = empty_flow_truck_insight()
             self._set_current_statuses([], cache=False)
+        else:
+            self._prewarm_visible_truck_caches()
 
         truck_count = len(self._all_trucks)
         noun = "truck" if truck_count == 1 else "trucks"
@@ -1274,6 +1312,14 @@ class MainWindow(QMainWindow):
         status_cache_key = self._status_cache_key(truck_number)
         hit, cached_statuses = self._status_cache_by_truck.get(status_cache_key)
         if hit and cached_statuses is not None:
+            if self._displayed_statuses_match_truck(truck_number) and list(cached_statuses) == self._all_statuses:
+                context.status_done = True
+                if not context.flow_done:
+                    self._refresh_flow_dependent_status_cells()
+                else:
+                    self._refresh_hidden_action_labels()
+                self._maybe_complete_truck_switch(context)
+                return
             self._set_current_statuses(list(cached_statuses), cache=False)
             context.status_done = True
         else:
@@ -1399,6 +1445,8 @@ class MainWindow(QMainWindow):
                 list(statuses),
                 negative=not statuses,
             )
+            if run_id <= 0:
+                continue
             if truck_key != current_key or not self._is_active_truck_switch(run_id, truck_number):
                 GLOBAL_METRICS.record_stale_result_ignored()
                 continue
@@ -1442,6 +1490,8 @@ class MainWindow(QMainWindow):
                 (cache_token, insight),
                 negative=not insight.available,
             )
+            if run_id <= 0:
+                continue
             if (
                 truck_key != current_key
                 or cache_token != current_token
@@ -1451,7 +1501,7 @@ class MainWindow(QMainWindow):
                 continue
             self._current_flow_truck_insight = insight
             self._refresh_current_truck_heading()
-            self._render_current_statuses()
+            self._refresh_flow_dependent_status_cells()
             self._mark_flow_done(run_id, truck_number)
 
     def _check_current_flow_cache(self) -> None:
@@ -1468,7 +1518,35 @@ class MainWindow(QMainWindow):
         context = self._active_truck_switch
         run_id = context.run_id if context is not None and context.truck_number.casefold() == truck_key else self._truck_switch_run_id
         self._load_flow_for_truck(truck_number, run_id=run_id)
-        self._render_current_statuses()
+        self._refresh_flow_dependent_status_cells()
+
+    def _kit_table_signature(self, visible_statuses: list[KitStatus]) -> tuple[object, ...]:
+        return (
+            self.current_truck_number().casefold(),
+            bool(self.show_hidden_kits_checkbox.isChecked()),
+            tuple(
+                (
+                    status.kit_name,
+                    status.paths.display_name,
+                    status.paths.truck_number,
+                    status.rpd_exists,
+                    status.rpd_size_bytes,
+                    status.fabrication_folder_exists,
+                    status.fabrication_has_files,
+                    status.spreadsheet_match,
+                    status.preview_pdf_match,
+                    self._print_packet_match_for_status(status),
+                    self._assembly_packet_match_for_status(status),
+                    self._cut_list_match_for_status(status),
+                    status.inventor_outputs,
+                    status.status_summary,
+                    self._punch_code_text_for_status(status),
+                    self._note_text_for_status(status),
+                    is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings),
+                )
+                for status in visible_statuses
+            ),
+        )
 
     def _render_current_statuses(self) -> None:
         previous_kit_name = self._current_status().kit_name if self._current_status() is not None else ""
@@ -1478,12 +1556,19 @@ class MainWindow(QMainWindow):
             show_hidden=self.show_hidden_kits_checkbox.isChecked(),
         )
         self._current_statuses = visible_statuses
+        signature = self._kit_table_signature(visible_statuses)
+        if signature == self._kit_table_render_signature and self.kit_table.rowCount() == len(visible_statuses):
+            self._refresh_flow_dependent_status_cells()
+            return
+        self._kit_table_render_signature = signature
         self._updating_kit_table = True
-        self.kit_table.setRowCount(len(visible_statuses))
+        self.kit_table.setUpdatesEnabled(False)
         try:
+            self.kit_table.setRowCount(len(visible_statuses))
             for row, status in enumerate(visible_statuses):
                 self._populate_status_row(row, status)
         finally:
+            self.kit_table.setUpdatesEnabled(True)
             self._updating_kit_table = False
 
         selected_row = -1
@@ -1501,6 +1586,80 @@ class MainWindow(QMainWindow):
         for row in range(len(visible_statuses)):
             self.kit_table.setRowHeight(row, 26)
         self._refresh_hidden_action_labels()
+
+    def _hidden_foreground_for_status(self, status: KitStatus) -> QColor | None:
+        return QColor("#6C757D") if is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings) else None
+
+    def _make_release_item_for_status(
+        self,
+        status: KitStatus,
+        *,
+        hidden_foreground: QColor | None,
+    ) -> QTableWidgetItem:
+        green = QColor("#D8F3DC")
+        yellow = QColor("#FFF3BF")
+        red = QColor("#F8D7DA")
+        release_text = self._release_text_for_status(status)
+        release_color = red
+        if release_text in {"Complete", "Released"}:
+            release_color = green
+        elif release_text == "Not released":
+            release_color = yellow
+        return self._make_item(release_text, background=release_color, foreground=hidden_foreground)
+
+    def _make_flow_item_for_status(
+        self,
+        status: KitStatus,
+        *,
+        hidden_foreground: QColor | None,
+    ) -> QTableWidgetItem:
+        green = QColor("#D8F3DC")
+        yellow = QColor("#FFF3BF")
+        red = QColor("#F8D7DA")
+        blue = QColor("#D6E4FF")
+        neutral = QColor("#E9ECEF")
+        flow_insight = self._flow_insight_for_status(status)
+        flow_background = neutral
+        if flow_insight.status_key == "red":
+            flow_background = red
+        elif flow_insight.status_key == "yellow":
+            flow_background = yellow
+        elif flow_insight.status_key == "green":
+            flow_background = green
+        elif flow_insight.status_key == "blue":
+            flow_background = blue
+        flow_item = self._make_item(
+            flow_insight.display_text,
+            background=flow_background,
+            foreground=hidden_foreground,
+        )
+        if flow_insight.tooltip_text:
+            flow_item.setToolTip(flow_insight.tooltip_text)
+        return flow_item
+
+    def _refresh_flow_dependent_status_cells(self) -> None:
+        if self.kit_table.rowCount() != len(self._current_statuses):
+            self._render_current_statuses()
+            return
+        self._updating_kit_table = True
+        self.kit_table.setUpdatesEnabled(False)
+        try:
+            for row, status in enumerate(self._current_statuses):
+                hidden_foreground = self._hidden_foreground_for_status(status)
+                self.kit_table.setItem(
+                    row,
+                    self.RELEASE_COLUMN,
+                    self._make_release_item_for_status(status, hidden_foreground=hidden_foreground),
+                )
+                self.kit_table.setItem(
+                    row,
+                    self.FLOW_COLUMN,
+                    self._make_flow_item_for_status(status, hidden_foreground=hidden_foreground),
+                )
+        finally:
+            self.kit_table.setUpdatesEnabled(True)
+            self._updating_kit_table = False
+        self._refresh_details_pane()
 
     def _on_kit_selection_changed(self) -> None:
         self._refresh_hidden_action_labels()
@@ -1601,15 +1760,15 @@ class MainWindow(QMainWindow):
                 self._open_nest_summary_for_status(status)
             return
         if item.column() == self.PRINT_PACKET_COLUMN:
-            if detect_print_packet_pdf(status.paths).chosen_path is not None:
+            if self._print_packet_match_for_status(status).chosen_path is not None:
                 self._open_print_packet_for_status(status)
             return
         if item.column() == self.ASSEMBLY_PACKET_COLUMN:
-            if detect_assembly_packet_pdf(status.paths).chosen_path is not None:
+            if self._assembly_packet_match_for_status(status).chosen_path is not None:
                 self._open_assembly_packet_for_status(status)
             return
         if item.column() == self.CUT_LIST_COLUMN:
-            if detect_cut_list_packet_pdf(status.paths).chosen_path is not None:
+            if self._cut_list_match_for_status(status).chosen_path is not None:
                 self._open_cut_list_for_status(status)
 
     def _on_kit_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
@@ -1626,42 +1785,32 @@ class MainWindow(QMainWindow):
                 self._open_nest_summary_for_status(status)
             return
         if item.column() == self.PRINT_PACKET_COLUMN:
-            if detect_print_packet_pdf(status.paths).chosen_path is not None:
+            if self._print_packet_match_for_status(status).chosen_path is not None:
                 self._open_print_packet_for_status(status)
             return
         if item.column() == self.ASSEMBLY_PACKET_COLUMN:
-            if detect_assembly_packet_pdf(status.paths).chosen_path is not None:
+            if self._assembly_packet_match_for_status(status).chosen_path is not None:
                 self._open_assembly_packet_for_status(status)
             return
         if item.column() == self.CUT_LIST_COLUMN:
-            if detect_cut_list_packet_pdf(status.paths).chosen_path is not None:
+            if self._cut_list_match_for_status(status).chosen_path is not None:
                 self._open_cut_list_for_status(status)
 
     def _populate_status_row(self, row: int, status: KitStatus) -> None:
         green = QColor("#D8F3DC")
         yellow = QColor("#FFF3BF")
         red = QColor("#F8D7DA")
-        blue = QColor("#D6E4FF")
-        neutral = QColor("#E9ECEF")
-        muted = QColor("#6C757D")
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
-        hidden_foreground = muted if hidden else None
-
-        release_text = self._release_text_for_status(status)
-        release_color = red
-        if release_text in {"Complete", "Released"}:
-            release_color = green
-        elif release_text == "Not released":
-            release_color = yellow
+        hidden_foreground = self._hidden_foreground_for_status(status)
 
         nest_summary_color = red
         if status.preview_pdf_match.chosen_path is not None:
             nest_summary_color = green if len(status.preview_pdf_match.candidates) == 1 else yellow
         elif status.preview_pdf_match.candidates:
             nest_summary_color = yellow
-        packet_match = detect_print_packet_pdf(status.paths)
-        assembly_packet_match = detect_assembly_packet_pdf(status.paths)
-        cut_list_match = detect_cut_list_packet_pdf(status.paths)
+        packet_match = self._print_packet_match_for_status(status)
+        assembly_packet_match = self._assembly_packet_match_for_status(status)
+        cut_list_match = self._cut_list_match_for_status(status)
         print_packet_color = red
         if packet_match.chosen_path is not None:
             print_packet_color = green if len(packet_match.candidates) == 1 else yellow
@@ -1744,24 +1893,6 @@ class MainWindow(QMainWindow):
             hidden_foreground=hidden_foreground,
         )
 
-        flow_insight = self._flow_insight_for_status(status)
-        flow_background = neutral
-        if flow_insight.status_key == "red":
-            flow_background = red
-        elif flow_insight.status_key == "yellow":
-            flow_background = yellow
-        elif flow_insight.status_key == "green":
-            flow_background = green
-        elif flow_insight.status_key == "blue":
-            flow_background = blue
-        flow_item = self._make_item(
-            flow_insight.display_text,
-            background=flow_background,
-            foreground=hidden_foreground,
-        )
-        if flow_insight.tooltip_text:
-            flow_item.setToolTip(flow_insight.tooltip_text)
-
         items = (
             self._make_item(
                 f"{status.paths.display_name} [hidden]" if hidden else status.paths.display_name,
@@ -1772,8 +1903,8 @@ class MainWindow(QMainWindow):
             print_packet_item,
             assembly_packet_item,
             cut_list_item,
-            self._make_item(release_text, background=release_color, foreground=hidden_foreground),
-            flow_item,
+            self._make_release_item_for_status(status, hidden_foreground=hidden_foreground),
+            self._make_flow_item_for_status(status, hidden_foreground=hidden_foreground),
             punch_code_item,
             notes_item,
         )
@@ -1889,6 +2020,7 @@ class MainWindow(QMainWindow):
             "Show Kits" if selected_hidden else "Hide Kits"
         )
         self._refresh_details_pane()
+        self._refresh_packet_build_button_states()
         full_flow_controller = getattr(self, "full_flow_controller", None)
         if full_flow_controller is not None:
             full_flow_controller.reapply_action_lock()
@@ -1928,6 +2060,42 @@ class MainWindow(QMainWindow):
             for row in range(self.truck_list.count())
             if self.truck_list.item(row) is not None
         ]
+
+    def _prewarm_visible_truck_caches(self) -> None:
+        current_key = self.current_truck_number().casefold()
+        settings_signature = self._settings_signature()
+        flow_token = flow_probe_cache_token()
+        started_status = False
+        started_flow = False
+        for truck_number in self._visible_truck_numbers():
+            truck_key = truck_number.casefold()
+            if not truck_key or truck_key == current_key or truck_key in self._prewarm_truck_keys:
+                continue
+            status_key = self._status_cache_key(truck_number)
+            status_hit, _cached_statuses = self._status_cache_by_truck.get(status_key)
+            if not status_hit and truck_key not in self._pending_status_by_truck:
+                self._pending_status_by_truck[truck_key] = (
+                    truck_number,
+                    settings_signature,
+                    0,
+                    self._status_executor.submit(collect_kit_statuses, truck_number, self.settings),
+                )
+                started_status = True
+            flow_key = self._flow_cache_key(truck_number, flow_token)
+            flow_hit, _cached_flow = self._flow_cache_by_truck.get(flow_key)
+            if not flow_hit and truck_key not in self._pending_flow_by_truck:
+                self._pending_flow_by_truck[truck_key] = (
+                    truck_number,
+                    flow_token,
+                    0,
+                    self._flow_executor.submit(load_cached_flow_truck_insight, truck_number),
+                )
+                started_flow = True
+            self._prewarm_truck_keys.add(truck_key)
+        if started_status:
+            self._status_watch_timer.start()
+        if started_flow:
+            self._flow_watch_timer.start()
 
     def _persist_truck_order(self) -> None:
         self.settings.truck_order = normalize_truck_order_entries(self._all_trucks)
@@ -2300,7 +2468,7 @@ class MainWindow(QMainWindow):
         self._open_path_with_message(summary_path)
 
     def _open_print_packet_for_status(self, status: KitStatus) -> None:
-        packet_match = detect_print_packet_pdf(status.paths)
+        packet_match = self._print_packet_match_for_status(status)
         packet_path = packet_match.chosen_path
         if packet_path is None:
             QMessageBox.warning(
@@ -2312,7 +2480,7 @@ class MainWindow(QMainWindow):
         self._open_path_with_message(packet_path)
 
     def _open_assembly_packet_for_status(self, status: KitStatus) -> None:
-        packet_match = detect_assembly_packet_pdf(status.paths)
+        packet_match = self._assembly_packet_match_for_status(status)
         packet_path = packet_match.chosen_path
         if packet_path is None:
             QMessageBox.warning(
@@ -2324,7 +2492,7 @@ class MainWindow(QMainWindow):
         self._open_path_with_message(packet_path)
 
     def _open_cut_list_for_status(self, status: KitStatus) -> None:
-        packet_match = detect_cut_list_packet_pdf(status.paths)
+        packet_match = self._cut_list_match_for_status(status)
         packet_path = packet_match.chosen_path
         if packet_path is None:
             QMessageBox.warning(
@@ -2363,32 +2531,181 @@ class MainWindow(QMainWindow):
             return
         self._open_cut_list_for_status(status)
 
+    def _packet_build_guard_key(self, status: KitStatus, action_key: str) -> tuple[str, str]:
+        path_source = status.paths.rpd_path or status.paths.project_dir or status.paths.display_name
+        return (str(action_key or "").strip().casefold(), normalize_cache_path(path_source))
+
+    def _packet_build_is_running(self) -> bool:
+        with self._packet_build_lock:
+            return bool(self._packet_build_running or self._active_packet_build_keys)
+
+    def _begin_packet_build_guard(
+        self,
+        title: str,
+        status: KitStatus,
+        action_key: str,
+    ) -> PacketBuildGuard | None:
+        guard = PacketBuildGuard(
+            title=title,
+            action_key=str(action_key or "").strip().casefold(),
+            status=status,
+            lock_key=self._packet_build_guard_key(status, action_key),
+        )
+        with self._packet_build_lock:
+            if self._packet_build_running or self._active_packet_build_keys:
+                QMessageBox.information(
+                    self,
+                    title,
+                    "A packet build is already running. Let it finish before starting another one.",
+                )
+                return None
+            self._active_packet_build_keys.add(guard.lock_key)
+            self._packet_build_running = True
+        self._refresh_packet_build_button_states()
+        return guard
+
+    def _finish_packet_build_guard(self, guard: PacketBuildGuard | None) -> None:
+        if guard is None:
+            return
+        with self._packet_build_lock:
+            self._active_packet_build_keys.discard(guard.lock_key)
+            self._packet_build_running = bool(self._active_packet_build_keys)
+            if not self._packet_build_running:
+                self._packet_build_worker = None
+        self._refresh_packet_build_button_states()
+
+    def _packet_match_for_action(self, status: KitStatus, action_key: str, *, use_cache: bool) -> object:
+        cache = FILE_METADATA_CACHE if use_cache else None
+        normalized = str(action_key or "").strip().casefold()
+        if normalized in {"print", "part"}:
+            return detect_print_packet_pdf(status.paths, fs_cache=cache)
+        if normalized == "assembly":
+            return detect_assembly_packet_pdf(status.paths, fs_cache=cache)
+        if normalized == "cut_list":
+            return detect_cut_list_packet_pdf(status.paths, fs_cache=cache)
+        raise ValueError(f"Unknown packet build action: {action_key!r}")
+
+    def _packet_build_button_configs(self):
+        return (
+            (
+                "print",
+                self.build_print_packet_button,
+                "Build Print Packet",
+                "Print Packet Ready",
+                "Build the QTY print packet from the selected kit's saved RPD.",
+                "Print packet",
+                "",
+            ),
+            (
+                "assembly",
+                self.build_assembly_packet_button,
+                "Build Assembly Packet",
+                "Assembly Packet Ready",
+                "Build the .iam-backed assembly drawing packet from the selected kit's saved RPD.",
+                "Assembly packet",
+                self.ASSEMBLY_PACKET_DISABLED_REASON if not self.ASSEMBLY_PACKET_BUILD_ENABLED else "",
+            ),
+            (
+                "cut_list",
+                self.build_cut_list_button,
+                "Build Cut List",
+                "Cut List Ready",
+                "Build the non-laser cut list packet from the selected kit's saved RPD.",
+                "Cut list",
+                self.CUT_LIST_DISABLED_REASON if not self.CUT_LIST_BUILD_ENABLED else "",
+            ),
+        )
+
+    def _refresh_packet_build_button_states(self) -> None:
+        if not all(
+            hasattr(self, name)
+            for name in (
+                "build_print_packet_button",
+                "build_assembly_packet_button",
+                "build_cut_list_button",
+            )
+        ):
+            return
+        status = self._current_status()
+        with self._packet_build_lock:
+            active = bool(self._packet_build_running or self._active_packet_build_keys)
+            active_actions = {key[0] for key in self._active_packet_build_keys}
+        for action_key, button, default_text, ready_text, default_tooltip, packet_label, disabled_reason in (
+            self._packet_build_button_configs()
+        ):
+            button.setText(default_text)
+            button.setToolTip(default_tooltip)
+            button.setEnabled(status is not None)
+            if disabled_reason:
+                button.setEnabled(False)
+                button.setToolTip(disabled_reason)
+                continue
+            if status is None:
+                button.setEnabled(False)
+                button.setToolTip("Select a kit first.")
+                continue
+            if active:
+                button.setEnabled(False)
+                if action_key in active_actions:
+                    button.setText("Building...")
+                button.setToolTip("A packet build is already running.")
+                continue
+            match = self._packet_match_for_action(status, action_key, use_cache=True)
+            packet_path = getattr(match, "chosen_path", None)
+            if packet_path is not None:
+                button.setText(ready_text)
+                button.setEnabled(False)
+                button.setToolTip(
+                    f"{packet_label} already exists:\n{packet_path}\n\n"
+                    "Use the packet cell in the table to open it, or delete the packet file before rebuilding."
+                )
+
+    def _show_existing_packet_feedback(
+        self,
+        *,
+        title: str,
+        status: KitStatus,
+        action_key: str,
+        match: object,
+    ) -> None:
+        packet_path = getattr(match, "chosen_path", None)
+        packet_label = {
+            "print": "Print packet",
+            "part": "Print packet",
+            "assembly": "Assembly packet",
+            "cut_list": "Cut list",
+        }.get(str(action_key or "").strip().casefold(), "Packet")
+        QMessageBox.information(
+            self,
+            title,
+            (
+                f"{packet_label} already exists for {status.paths.display_name}:\n"
+                f"{packet_path}\n\n"
+                "No new packet was generated."
+            ),
+        )
+        self.log(f"Skipped {title.lower()} for {status.paths.display_name}; existing packet: {packet_path}")
+        self._refresh_packet_statuses(status)
+
     def _prepare_packet_build_context(
         self,
         title: str,
         *,
+        action_key: str,
         include_assembly_sources: bool = False,
         include_cut_list_sources: bool = False,
     ):
-        if bool(getattr(self, "_packet_build_running", False)):
-            QMessageBox.information(
-                self,
-                title,
-                "A packet build is already running. Let it finish before starting another one.",
-            )
-            return None, None
-
         status = self._current_status()
         if status is None:
             QMessageBox.information(self, title, "Select a kit first.")
-            return None, None
+            return None, None, None
         if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
             QMessageBox.warning(
                 self,
                 title,
                 "The L-side project file is missing for this kit.",
             )
-            return None, None
+            return None, None, None
         running_import, _lock_path, lock_pid = radan_csv_import_lock_status(status.paths.rpd_path)
         if running_import:
             pid_text = f" PID {lock_pid}" if lock_pid is not None else ""
@@ -2398,14 +2715,33 @@ class MainWindow(QMainWindow):
                 "A RADAN CSV import is still running for this project.\n\n"
                 f"Let the import helper{pid_text} finish before building packets.",
             )
-            return None, None
+            return None, None, None
         if status.paths.fabrication_kit_dir is None or not status.paths.fabrication_kit_dir.exists():
             QMessageBox.warning(
                 self,
                 title,
                 "The W-side kit folder is missing for this kit.",
             )
-            return None, None
+            return None, None, None
+
+        guard = self._begin_packet_build_guard(title, status, action_key)
+        if guard is None:
+            return None, None, None
+
+        # Idempotency check: packet builds create timestamped artifacts. Before
+        # doing any RPD/PDF work, look for an existing generated packet with a
+        # fresh filesystem read so repeated clicks, restarts, or externally
+        # generated packets do not produce duplicate packet files.
+        existing_match = self._packet_match_for_action(status, action_key, use_cache=False)
+        if getattr(existing_match, "chosen_path", None) is not None:
+            self._show_existing_packet_feedback(
+                title=title,
+                status=status,
+                action_key=action_key,
+                match=existing_match,
+            )
+            self._finish_packet_build_guard(guard)
+            return None, None, None
 
         try:
             context = prepare_packet_build_context(
@@ -2416,14 +2752,16 @@ class MainWindow(QMainWindow):
                 include_cut_list_sources=include_cut_list_sources,
             )
         except Exception as exc:
+            self._finish_packet_build_guard(guard)
             QMessageBox.critical(self, title, str(exc))
-            return None, None
+            return None, None, None
 
-        return status, context
+        return status, context, guard
 
     def _refresh_packet_statuses(self, status: KitStatus) -> None:
         if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
             self._queue_status_refresh_for_truck(status.paths.truck_number)
+            self._refresh_packet_build_button_states()
 
     def _queue_status_refresh_for_truck(self, truck_number: str) -> bool:
         truck_text = str(truck_number or "").strip()
@@ -2470,141 +2808,146 @@ class MainWindow(QMainWindow):
         self._queue_status_refresh_for_truck(self.current_truck_number())
 
     def build_selected_print_packet(self) -> None:
-        status, context = self._prepare_packet_build_context("Build Print Packet")
-        if status is None or context is None:
+        status, context, guard = self._prepare_packet_build_context("Build Print Packet", action_key="print")
+        if status is None or context is None or guard is None:
             return
-        if not context.parts:
-            QMessageBox.information(
-                self,
-                "Build Print Packet",
-                "No parts were found in the selected RPD.",
-            )
-            return
-
-        expected_csv_path = None
-        if status.spreadsheet_match.chosen_path is not None:
-            try:
-                expected_csv_path = resolve_existing_inventor_csv(
-                    status.spreadsheet_match.chosen_path,
-                    status.paths.project_dir,
-                )
-            except Exception:
-                expected_csv_path = None
+        worker_started = False
         try:
-            readiness_warning = validate_print_packet_readiness(
-                rpd_path=status.paths.rpd_path,
-                parts=context.parts,
-                expected_csv_path=expected_csv_path,
-            )
-        except PacketBuildReadinessError as exc:
-            QMessageBox.warning(self, "Build Print Packet", str(exc))
-            return
-        if readiness_warning:
-            choice = QMessageBox.question(
-                self,
-                "Build Print Packet",
-                f"{readiness_warning}\n\nBuild the print packet from the current saved RPD anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if choice != QMessageBox.Yes:
+            if not context.parts:
+                QMessageBox.information(
+                    self,
+                    "Build Print Packet",
+                    "No parts were found in the selected RPD.",
+                )
                 return
 
-        if not review_pdf_assets_for_action(
-            parent=self,
-            action_name="Build Print Packet",
-            context=context,
-            rpd_path=status.paths.rpd_path,
-        ):
-            self.log("Print packet build canceled during PDF asset review.")
-            return
-
-        total_steps = max(1, len(context.parts))
-        progress = QProgressDialog("Building print packet...", "Cancel", 0, total_steps, self)
-        progress.setWindowTitle("Build Print Packet")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-
-        worker = create_main_packet_worker(
-            context=context,
-            rpd_path=status.paths.rpd_path,
-        )
-        setattr(self, "_packet_build_running", True)
-        setattr(self, "_packet_build_worker", worker)
-
-        def _set_progress(done: int, status_text: str) -> None:
-            progress.setMaximum(total_steps)
-            progress.setValue(max(0, min(total_steps, int(done))))
-            progress.setLabelText(f"Building print packet...\n{status_text}")
-            QApplication.processEvents()
-
-        def _cleanup() -> None:
+            expected_csv_path = None
+            if status.spreadsheet_match.chosen_path is not None:
+                try:
+                    expected_csv_path = resolve_existing_inventor_csv(
+                        status.spreadsheet_match.chosen_path,
+                        status.paths.project_dir,
+                    )
+                except Exception:
+                    expected_csv_path = None
             try:
-                progress.close()
-            except Exception:
-                pass
-            setattr(self, "_packet_build_worker", None)
-            setattr(self, "_packet_build_running", False)
+                readiness_warning = validate_print_packet_readiness(
+                    rpd_path=status.paths.rpd_path,
+                    parts=context.parts,
+                    expected_csv_path=expected_csv_path,
+                )
+            except PacketBuildReadinessError as exc:
+                QMessageBox.warning(self, "Build Print Packet", str(exc))
+                return
+            if readiness_warning:
+                choice = QMessageBox.question(
+                    self,
+                    "Build Print Packet",
+                    f"{readiness_warning}\n\nBuild the print packet from the current saved RPD anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if choice != QMessageBox.Yes:
+                    return
 
-        def _on_progress(done: int, total: int, status_text: str) -> None:
-            _set_progress(int(done), status_text)
+            if not review_pdf_assets_for_action(
+                parent=self,
+                action_name="Build Print Packet",
+                context=context,
+                rpd_path=status.paths.rpd_path,
+            ):
+                self.log("Print packet build canceled during PDF asset review.")
+                return
 
-        def _on_done(packet_path: str, pages: int, missing: int) -> None:
-            _cleanup()
-            self._refresh_packet_statuses(status)
-            try:
-                open_path(Path(packet_path))
-            except Exception:
-                pass
-            QMessageBox.information(
-                self,
-                "Build Print Packet",
-                (
-                    f"Print packet pages: {int(pages)}\n"
-                    f"Missing part PDFs: {int(missing)}\n"
-                    f"Print packet: {packet_path}"
-                ),
+            total_steps = max(1, len(context.parts))
+            progress = QProgressDialog("Building print packet...", "Cancel", 0, total_steps, self)
+            progress.setWindowTitle("Build Print Packet")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+
+            worker = create_main_packet_worker(
+                context=context,
+                rpd_path=status.paths.rpd_path,
             )
-            self.log(f"Built print packet for {status.paths.display_name}.")
+            self._packet_build_worker = worker
 
-        def _on_canceled(pages: int, missing: int) -> None:
-            _cleanup()
-            self.log("Print packet build canceled.")
+            def _set_progress(done: int, status_text: str) -> None:
+                progress.setMaximum(total_steps)
+                progress.setValue(max(0, min(total_steps, int(done))))
+                progress.setLabelText(f"Building print packet...\n{status_text}")
+                QApplication.processEvents()
 
-        def _on_empty(message: str, pages: int, missing: int) -> None:
-            _cleanup()
-            QMessageBox.information(
-                self,
-                "Build Print Packet",
-                f"{message}\n\nMissing part PDFs: {int(missing)}",
-            )
+            def _cleanup() -> None:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
+                self._finish_packet_build_guard(guard)
 
-        def _on_error(tb: str) -> None:
-            _cleanup()
-            QMessageBox.critical(
-                self,
-                "Build Print Packet",
-                str(tb or "").strip() or "Packet build failed.",
-            )
+            def _on_progress(done: int, total: int, status_text: str) -> None:
+                _set_progress(int(done), status_text)
 
-        worker.signals.progress.connect(_on_progress)
-        worker.signals.done.connect(_on_done)
-        worker.signals.canceled.connect(_on_canceled)
-        worker.signals.empty.connect(_on_empty)
-        worker.signals.error.connect(_on_error)
-        progress.canceled.connect(worker.request_stop)
-        _set_progress(0, "Starting")
-        QThreadPool.globalInstance().start(worker)
+            def _on_done(packet_path: str, pages: int, missing: int) -> None:
+                _cleanup()
+                self._refresh_packet_statuses(status)
+                try:
+                    open_path(Path(packet_path))
+                except Exception:
+                    pass
+                QMessageBox.information(
+                    self,
+                    "Build Print Packet",
+                    (
+                        f"Print packet pages: {int(pages)}\n"
+                        f"Missing part PDFs: {int(missing)}\n"
+                        f"Print packet: {packet_path}"
+                    ),
+                )
+                self.log(f"Built print packet for {status.paths.display_name}.")
+
+            def _on_canceled(pages: int, missing: int) -> None:
+                _cleanup()
+                self.log("Print packet build canceled.")
+
+            def _on_empty(message: str, pages: int, missing: int) -> None:
+                _cleanup()
+                QMessageBox.information(
+                    self,
+                    "Build Print Packet",
+                    f"{message}\n\nMissing part PDFs: {int(missing)}",
+                )
+
+            def _on_error(tb: str) -> None:
+                _cleanup()
+                QMessageBox.critical(
+                    self,
+                    "Build Print Packet",
+                    str(tb or "").strip() or "Packet build failed.",
+                )
+
+            worker.signals.progress.connect(_on_progress)
+            worker.signals.done.connect(_on_done)
+            worker.signals.canceled.connect(_on_canceled)
+            worker.signals.empty.connect(_on_empty)
+            worker.signals.error.connect(_on_error)
+            progress.canceled.connect(worker.request_stop)
+            _set_progress(0, "Starting")
+            QThreadPool.globalInstance().start(worker)
+            worker_started = True
+        finally:
+            if not worker_started:
+                self._finish_packet_build_guard(guard)
 
     def build_selected_assembly_packet(self) -> None:
         if not self.ASSEMBLY_PACKET_BUILD_ENABLED:
             QMessageBox.information(self, "Build Assembly Packet", self.ASSEMBLY_PACKET_DISABLED_REASON)
             return
-        status, context = self._prepare_packet_build_context("Build Assembly Packet")
-        if status is None or context is None:
+        status, context, guard = self._prepare_packet_build_context("Build Assembly Packet", action_key="assembly")
+        if status is None or context is None or guard is None:
             return
+        worker_started = False
 
         progress = QProgressDialog("Searching for assembly drawing PDFs...", "Cancel", 0, 0, self)
         progress.setWindowTitle("Build Assembly Packet")
@@ -2667,8 +3010,7 @@ class MainWindow(QMainWindow):
             }
 
         worker = BackgroundJobWorker(_job)
-        setattr(self, "_packet_build_running", True)
-        setattr(self, "_packet_build_worker", worker)
+        self._packet_build_worker = worker
 
         def _set_progress(done: int, total: int, status_text: str) -> None:
             if int(total) <= 0:
@@ -2683,8 +3025,7 @@ class MainWindow(QMainWindow):
                 progress.close()
             except Exception:
                 pass
-            setattr(self, "_packet_build_worker", None)
-            setattr(self, "_packet_build_running", False)
+            self._finish_packet_build_guard(guard)
 
         def _on_progress(done: int, total: int, status_text: str) -> None:
             _set_progress(int(done), int(total), status_text)
@@ -2768,15 +3109,21 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(_on_error)
         progress.canceled.connect(worker.request_stop)
         _set_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
-        QThreadPool.globalInstance().start(worker)
+        try:
+            QThreadPool.globalInstance().start(worker)
+            worker_started = True
+        finally:
+            if not worker_started:
+                self._finish_packet_build_guard(guard)
 
     def build_selected_cut_list_packet(self) -> None:
         if not self.CUT_LIST_BUILD_ENABLED:
             QMessageBox.information(self, "Build Cut List", self.CUT_LIST_DISABLED_REASON)
             return
-        status, context = self._prepare_packet_build_context("Build Cut List")
-        if status is None or context is None:
+        status, context, guard = self._prepare_packet_build_context("Build Cut List", action_key="cut_list")
+        if status is None or context is None or guard is None:
             return
+        worker_started = False
 
         progress = QProgressDialog("Searching for non-laser cut list PDFs...", "Cancel", 0, 0, self)
         progress.setWindowTitle("Build Cut List")
@@ -2807,8 +3154,7 @@ class MainWindow(QMainWindow):
             return {"state": "done", "context": discovered_context, "result": result}
 
         worker = BackgroundJobWorker(_job)
-        setattr(self, "_packet_build_running", True)
-        setattr(self, "_packet_build_worker", worker)
+        self._packet_build_worker = worker
 
         def _set_progress(done: int, total: int, status_text: str) -> None:
             if int(total) <= 0:
@@ -2823,8 +3169,7 @@ class MainWindow(QMainWindow):
                 progress.close()
             except Exception:
                 pass
-            setattr(self, "_packet_build_worker", None)
-            setattr(self, "_packet_build_running", False)
+            self._finish_packet_build_guard(guard)
 
         def _on_progress(done: int, total: int, status_text: str) -> None:
             _set_progress(int(done), int(total), status_text)
@@ -2894,7 +3239,12 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(_on_error)
         progress.canceled.connect(worker.request_stop)
         _set_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
-        QThreadPool.globalInstance().start(worker)
+        try:
+            QThreadPool.globalInstance().start(worker)
+            worker_started = True
+        finally:
+            if not worker_started:
+                self._finish_packet_build_guard(guard)
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()

@@ -4,6 +4,7 @@ from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -182,10 +183,11 @@ def normalize_cache_path(path: Path | str | None) -> str:
     if path is None:
         return ""
     try:
-        candidate = Path(str(path))
-        if candidate.exists():
-            return str(candidate.resolve()).casefold()
-        return str(candidate.absolute()).casefold()
+        candidate = Path(str(path)).expanduser()
+        # Cache-key normalization must not touch mapped drives. Calling
+        # exists()/resolve(strict=True) here turns a cache lookup into a
+        # filesystem probe and makes network-drive caches feel ineffective.
+        return os.path.normcase(os.path.normpath(str(candidate.absolute()))).casefold()
     except OSError:
         return str(path).casefold()
 
