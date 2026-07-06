@@ -7,6 +7,7 @@ from typing import Callable
 from models import ExplorerSettings, KitStatus
 from services import (
     InventorToRadanInlineNeedsUi,
+    invalidate_filesystem_cache_for_paths,
     inventor_output_paths,
     move_inventor_outputs_to_project,
     run_inventor_to_radan_inline,
@@ -204,4 +205,6 @@ def discard_inventor_result(result: InventorRunResult) -> InventorDiscardResult:
                 deleted.append(candidate)
         except OSError as exc:
             failed.append(f"{candidate}: {exc}")
+    if deleted:
+        invalidate_filesystem_cache_for_paths(tuple(deleted))
     return InventorDiscardResult(deleted_paths=tuple(deleted), failed_deletes=tuple(failed))

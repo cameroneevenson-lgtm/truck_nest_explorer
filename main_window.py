@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 import subprocess
 import time
@@ -61,7 +62,8 @@ from flow_bridge import (
     empty_flow_truck_insight,
     flow_kit_insight_for_explorer_kit,
     flow_probe_cache_token,
-    load_flow_truck_insight,
+    invalidate_flow_insight_cache,
+    load_cached_flow_truck_insight,
     normalize_flow_insight_for_local_release,
 )
 from models import (
@@ -76,7 +78,9 @@ from models import (
     normalize_truck_order_entries,
     resolve_punch_code_text,
 )
+from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, settings_cache_signature
 from services import (
+    clear_performance_caches,
     collect_kit_statuses,
     configured_kit_mappings,
     create_kit_scaffold,
@@ -87,6 +91,8 @@ from services import (
     filter_kit_statuses,
     filter_truck_numbers,
     find_fabrication_truck_dir,
+    invalidate_filesystem_cache_for_path,
+    invalidate_status_cache_for_truck,
     inventor_output_paths,
     is_hidden_kit,
     is_hidden_truck,
@@ -107,6 +113,19 @@ from settings_store import load_settings, save_settings
 from ui.main_window_styles import dashboard_stylesheet
 
 
+@dataclass
+class TruckSwitchRunContext:
+    truck_number: str
+    run_id: int
+    loading: bool = True
+    status_future: Future[list[KitStatus]] | None = None
+    flow_future: Future[FlowTruckInsight] | None = None
+    status_done: bool = False
+    flow_done: bool = False
+    error: str = ""
+    completed: bool = False
+
+
 class MainWindow(QMainWindow):
     FLOW_GANTT_HEIGHT = 176
     ASSEMBLY_PACKET_BUILD_ENABLED = True
@@ -115,7 +134,7 @@ class MainWindow(QMainWindow):
         "Assembly packet generation is paused because it is known to hang and is not production-ready yet."
     )
     CUT_LIST_DISABLED_REASON = "Cut list packet generation is paused until the flow has been tested."
-    EXTERNAL_STATUS_REFRESH_INTERVAL_MS = 10000
+    EXTERNAL_STATUS_REFRESH_INTERVAL_MS = 30000
     KITTER_STATUS_REFRESH_INTERVAL_MS = 5000
     KITTER_STATUS_REFRESH_ATTEMPTS = 360
     TABLE_COLUMNS = (
@@ -170,8 +189,18 @@ class MainWindow(QMainWindow):
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
         self._radan_import_log_dialog: ImportLogDialog | None = None
         self._radan_import_log_dialogs: list[ImportLogDialog] = []
-        self._status_cache_by_truck: dict[str, list[KitStatus]] = {}
-        self._flow_cache_by_truck: dict[str, tuple[str, FlowTruckInsight]] = {}
+        self._status_cache_by_truck: BoundedTTLCache[list[KitStatus]] = BoundedTTLCache(
+            "ui_status",
+            max_size=128,
+            positive_ttl_seconds=30.0,
+            negative_ttl_seconds=2.0,
+        )
+        self._flow_cache_by_truck: BoundedTTLCache[tuple[str, FlowTruckInsight]] = BoundedTTLCache(
+            "ui_flow",
+            max_size=128,
+            positive_ttl_seconds=3600.0,
+            negative_ttl_seconds=2.0,
+        )
         self._flow_gantt_source_bytes: bytes | None = None
         self._flow_gantt_source_pixmap: QPixmap | None = None
         self._kitter_refresh_truck_number = ""
@@ -182,9 +211,11 @@ class MainWindow(QMainWindow):
         self._truck_request_serial = 0
         self._pending_truck_request_serial = 0
         self._status_executor = ThreadPoolExecutor(max_workers=1)
-        self._pending_status_by_truck: dict[str, tuple[str, Future[list[KitStatus]]]] = {}
+        self._pending_status_by_truck: dict[str, tuple[str, str, int, Future[list[KitStatus]]]] = {}
         self._flow_executor = ThreadPoolExecutor(max_workers=1)
-        self._pending_flow_by_truck: dict[str, tuple[str, str, Future[FlowTruckInsight]]] = {}
+        self._pending_flow_by_truck: dict[str, tuple[str, str, int, Future[FlowTruckInsight]]] = {}
+        self._truck_switch_run_id = 0
+        self._active_truck_switch: TruckSwitchRunContext | None = None
         self._truck_watch_timer = QTimer(self)
         self._truck_watch_timer.setInterval(120)
         self._truck_watch_timer.timeout.connect(self._poll_pending_truck_future)
@@ -1048,11 +1079,84 @@ class MainWindow(QMainWindow):
         if path:
             line_edit.setText(path)
 
+    def _settings_signature(self) -> str:
+        return settings_cache_signature(self.settings)
+
+    def _status_cache_key(self, truck_number: str) -> tuple[str, str, str]:
+        return ("ui_status", self._settings_signature(), str(truck_number or "").strip().casefold())
+
+    def _flow_cache_key(self, truck_number: str, cache_token: str) -> tuple[str, str, str]:
+        return ("ui_flow", str(truck_number or "").strip().casefold(), str(cache_token or ""))
+
+    def _invalidate_status_for_truck(self, truck_number: str) -> None:
+        truck_key = str(truck_number or "").strip().casefold()
+        if not truck_key:
+            return
+        self._status_cache_by_truck.invalidate_where(
+            lambda key, _value: isinstance(key, tuple)
+            and len(key) == 3
+            and key[0] == "ui_status"
+            and str(key[2]).casefold() == truck_key
+        )
+        invalidate_status_cache_for_truck(truck_number)
+        for status in self._all_statuses:
+            if status.paths.truck_number.casefold() != truck_key:
+                continue
+            for path in (
+                status.paths.release_truck_dir,
+                status.paths.release_kit_dir,
+                status.paths.project_dir,
+                status.paths.rpd_path,
+                status.paths.fabrication_truck_dir,
+                status.paths.fabrication_kit_dir,
+            ):
+                invalidate_filesystem_cache_for_path(path)
+
+    def _start_truck_switch_run(self, truck_number: str) -> TruckSwitchRunContext:
+        self._truck_switch_run_id += 1
+        context = TruckSwitchRunContext(truck_number=str(truck_number or "").strip(), run_id=self._truck_switch_run_id)
+        self._active_truck_switch = context
+        GLOBAL_METRICS.record_truck_switch_started()
+        return context
+
+    def _is_active_truck_switch(self, run_id: int, truck_number: str) -> bool:
+        context = self._active_truck_switch
+        return (
+            context is not None
+            and context.run_id == run_id
+            and context.truck_number.casefold() == str(truck_number or "").strip().casefold()
+            and context.truck_number.casefold() == self.current_truck_number().casefold()
+        )
+
+    def _mark_status_done(self, run_id: int, truck_number: str) -> None:
+        context = self._active_truck_switch
+        if context is None or context.run_id != run_id or context.truck_number.casefold() != truck_number.casefold():
+            return
+        context.status_done = True
+        self._maybe_complete_truck_switch(context)
+
+    def _mark_flow_done(self, run_id: int, truck_number: str) -> None:
+        context = self._active_truck_switch
+        if context is None or context.run_id != run_id or context.truck_number.casefold() != truck_number.casefold():
+            return
+        context.flow_done = True
+        self._maybe_complete_truck_switch(context)
+
+    def _maybe_complete_truck_switch(self, context: TruckSwitchRunContext) -> None:
+        if context.completed or not context.status_done or not context.flow_done:
+            return
+        context.loading = False
+        context.completed = True
+        GLOBAL_METRICS.record_truck_switch_completed()
+
     def refresh_trucks(self) -> None:
         self._status_cache_by_truck.clear()
         self._flow_cache_by_truck.clear()
+        clear_performance_caches()
+        invalidate_flow_insight_cache()
         self._pending_status_by_truck.clear()
         self._pending_flow_by_truck.clear()
+        self._active_truck_switch = None
         previous_future = self._pending_truck_future
         if previous_future is not None and not previous_future.done():
             previous_future.cancel()
@@ -1162,22 +1266,45 @@ class MainWindow(QMainWindow):
         if not truck_number:
             self._current_flow_truck_insight = empty_flow_truck_insight()
             self._set_current_statuses([])
+            self._active_truck_switch = None
             return
-        self._load_flow_for_truck(truck_number)
+        context = self._start_truck_switch_run(truck_number)
+        context.flow_done = self._load_flow_for_truck(truck_number, run_id=context.run_id)
 
-        cached_statuses = self._status_cache_by_truck.get(truck_key)
-        if cached_statuses is not None:
-            self._set_current_statuses(list(cached_statuses))
+        status_cache_key = self._status_cache_key(truck_number)
+        hit, cached_statuses = self._status_cache_by_truck.get(status_cache_key)
+        if hit and cached_statuses is not None:
+            self._set_current_statuses(list(cached_statuses), cache=False)
+            context.status_done = True
         else:
             self._set_current_statuses([], cache=False)
             pending_status = self._pending_status_by_truck.get(truck_key)
+            settings_signature = self._settings_signature()
+            if pending_status is not None:
+                pending_truck_number, pending_signature, _pending_run_id, future = pending_status
+                if pending_signature == settings_signature:
+                    self._pending_status_by_truck[truck_key] = (
+                        pending_truck_number,
+                        pending_signature,
+                        context.run_id,
+                        future,
+                    )
+                    context.status_future = future
+                else:
+                    self._pending_status_by_truck.pop(truck_key, None)
+                    pending_status = None
             if pending_status is None:
                 self.log(f"Loading kit statuses for {truck_number}...")
+                future = self._status_executor.submit(collect_kit_statuses, truck_number, self.settings)
                 self._pending_status_by_truck[truck_key] = (
                     truck_number,
-                    self._status_executor.submit(collect_kit_statuses, truck_number, self.settings),
+                    settings_signature,
+                    context.run_id,
+                    future,
                 )
+                context.status_future = future
                 self._status_watch_timer.start()
+        self._maybe_complete_truck_switch(context)
 
     def _loading_flow_insight(self, truck_number: str) -> FlowTruckInsight:
         return FlowTruckInsight(
@@ -1188,52 +1315,68 @@ class MainWindow(QMainWindow):
             tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
         )
 
-    def _load_flow_for_truck(self, truck_number: str) -> None:
+    def _load_flow_for_truck(self, truck_number: str, *, run_id: int) -> bool:
         truck_key = truck_number.casefold()
         current_flow_token = flow_probe_cache_token()
-        cached_flow = self._flow_cache_by_truck.get(truck_key)
-        if cached_flow is not None:
+        flow_cache_key = self._flow_cache_key(truck_number, current_flow_token)
+        hit, cached_flow = self._flow_cache_by_truck.get(flow_cache_key)
+        if hit and cached_flow is not None:
             cached_token, cached_insight = cached_flow
             if cached_token == current_flow_token:
                 self._current_flow_truck_insight = cached_insight
                 self._refresh_current_truck_heading()
-                return
-            self._flow_cache_by_truck.pop(truck_key, None)
+                return True
+            self._flow_cache_by_truck.invalidate(flow_cache_key)
 
         pending_flow = self._pending_flow_by_truck.get(truck_key)
         if pending_flow is not None:
-            _pending_truck_number, pending_token, _future = pending_flow
+            pending_truck_number, pending_token, _pending_run_id, future = pending_flow
             if pending_token == current_flow_token:
+                self._pending_flow_by_truck[truck_key] = (
+                    pending_truck_number,
+                    pending_token,
+                    run_id,
+                    future,
+                )
+                context = self._active_truck_switch
+                if context is not None and context.run_id == run_id:
+                    context.flow_future = future
                 self._current_flow_truck_insight = self._loading_flow_insight(truck_number)
                 self._refresh_current_truck_heading()
-                return
+                return False
             self._pending_flow_by_truck.pop(truck_key, None)
 
         self._current_flow_truck_insight = self._loading_flow_insight(truck_number)
         self._refresh_current_truck_heading()
+        future = self._flow_executor.submit(load_cached_flow_truck_insight, truck_number)
         self._pending_flow_by_truck[truck_key] = (
             truck_number,
             current_flow_token,
-            self._flow_executor.submit(load_flow_truck_insight, truck_number),
+            run_id,
+            future,
         )
+        context = self._active_truck_switch
+        if context is not None and context.run_id == run_id:
+            context.flow_future = future
         self._flow_watch_timer.start()
+        return False
 
     def _set_current_statuses(self, statuses: list[KitStatus], *, cache: bool = True) -> None:
         self._all_statuses = list(statuses)
         truck_number = self.current_truck_number()
         if cache and truck_number:
-            self._status_cache_by_truck[truck_number.casefold()] = list(statuses)
+            self._status_cache_by_truck.set(self._status_cache_key(truck_number), list(statuses), negative=not statuses)
         self._render_current_statuses()
 
     def _poll_pending_status_future(self) -> None:
         if not self._pending_status_by_truck:
             self._status_watch_timer.stop()
             return
-        completed: list[tuple[str, str, Future[list[KitStatus]]]] = []
-        for truck_key, (truck_number, future) in list(self._pending_status_by_truck.items()):
+        completed: list[tuple[str, str, str, int, Future[list[KitStatus]]]] = []
+        for truck_key, (truck_number, settings_signature, run_id, future) in list(self._pending_status_by_truck.items()):
             if not future.done():
                 continue
-            completed.append((truck_key, truck_number, future))
+            completed.append((truck_key, truck_number, settings_signature, run_id, future))
             self._pending_status_by_truck.pop(truck_key, None)
         if not self._pending_status_by_truck:
             self._status_watch_timer.stop()
@@ -1241,27 +1384,36 @@ class MainWindow(QMainWindow):
             return
 
         current_key = self.current_truck_number().casefold()
-        for truck_key, truck_number, future in completed:
+        for truck_key, truck_number, settings_signature, run_id, future in completed:
             try:
                 statuses = future.result()
             except Exception as exc:
+                if not self._is_active_truck_switch(run_id, truck_number):
+                    GLOBAL_METRICS.record_stale_result_ignored()
+                    continue
                 self.log(f"Could not load kit statuses for {truck_number}: {exc}")
                 statuses = []
 
-            self._status_cache_by_truck[truck_key] = list(statuses)
-            if truck_key != current_key:
+            self._status_cache_by_truck.set(
+                ("ui_status", settings_signature, truck_key),
+                list(statuses),
+                negative=not statuses,
+            )
+            if truck_key != current_key or not self._is_active_truck_switch(run_id, truck_number):
+                GLOBAL_METRICS.record_stale_result_ignored()
                 continue
-            self._set_current_statuses(list(statuses))
+            self._set_current_statuses(list(statuses), cache=False)
+            self._mark_status_done(run_id, truck_number)
 
     def _poll_pending_flow_future(self) -> None:
         if not self._pending_flow_by_truck:
             self._flow_watch_timer.stop()
             return
-        completed: list[tuple[str, str, str, Future[FlowTruckInsight]]] = []
-        for truck_key, (truck_number, cache_token, future) in list(self._pending_flow_by_truck.items()):
+        completed: list[tuple[str, str, str, int, Future[FlowTruckInsight]]] = []
+        for truck_key, (truck_number, cache_token, run_id, future) in list(self._pending_flow_by_truck.items()):
             if not future.done():
                 continue
-            completed.append((truck_key, truck_number, cache_token, future))
+            completed.append((truck_key, truck_number, cache_token, run_id, future))
             self._pending_flow_by_truck.pop(truck_key, None)
         if not self._pending_flow_by_truck:
             self._flow_watch_timer.stop()
@@ -1270,10 +1422,13 @@ class MainWindow(QMainWindow):
 
         current_key = self.current_truck_number().casefold()
         current_token = flow_probe_cache_token()
-        for truck_key, truck_number, cache_token, future in completed:
+        for truck_key, truck_number, cache_token, run_id, future in completed:
             try:
                 insight = future.result()
             except Exception as exc:
+                if not self._is_active_truck_switch(run_id, truck_number):
+                    GLOBAL_METRICS.record_stale_result_ignored()
+                    continue
                 insight = FlowTruckInsight(
                     available=False,
                     truck_number=truck_number,
@@ -1282,12 +1437,22 @@ class MainWindow(QMainWindow):
                     tooltip_text=str(exc),
                 )
 
-            self._flow_cache_by_truck[truck_key] = (cache_token, insight)
-            if truck_key != current_key or cache_token != current_token:
+            self._flow_cache_by_truck.set(
+                self._flow_cache_key(truck_number, cache_token),
+                (cache_token, insight),
+                negative=not insight.available,
+            )
+            if (
+                truck_key != current_key
+                or cache_token != current_token
+                or not self._is_active_truck_switch(run_id, truck_number)
+            ):
+                GLOBAL_METRICS.record_stale_result_ignored()
                 continue
             self._current_flow_truck_insight = insight
             self._refresh_current_truck_heading()
             self._render_current_statuses()
+            self._mark_flow_done(run_id, truck_number)
 
     def _check_current_flow_cache(self) -> None:
         truck_number = self.current_truck_number().strip()
@@ -1297,10 +1462,12 @@ class MainWindow(QMainWindow):
         if truck_key in self._pending_flow_by_truck:
             return
         current_token = flow_probe_cache_token()
-        cached_flow = self._flow_cache_by_truck.get(truck_key)
-        if cached_flow is not None and cached_flow[0] == current_token:
+        hit, cached_flow = self._flow_cache_by_truck.get(self._flow_cache_key(truck_number, current_token))
+        if hit and cached_flow is not None and cached_flow[0] == current_token:
             return
-        self._load_flow_for_truck(truck_number)
+        context = self._active_truck_switch
+        run_id = context.run_id if context is not None and context.truck_number.casefold() == truck_key else self._truck_switch_run_id
+        self._load_flow_for_truck(truck_number, run_id=run_id)
         self._render_current_statuses()
 
     def _render_current_statuses(self) -> None:
@@ -1986,7 +2153,8 @@ class MainWindow(QMainWindow):
                 errors.append(f"{status.paths.display_name}: {exc}")
                 continue
             created += len(result.created_paths)
-        self._set_current_statuses(collect_kit_statuses(truck_number, self.settings))
+        self._set_current_statuses([], cache=False)
+        self._queue_status_refresh_for_truck(truck_number)
         if errors:
             QMessageBox.warning(self, "Create Missing Kits", "\n".join(errors))
         self.log(f"Ensured all kit scaffolds for {truck_number}. Paths touched: {created}")
@@ -2013,7 +2181,8 @@ class MainWindow(QMainWindow):
                 continue
             created += len(result.created_paths)
             notes.extend(result.notes)
-        self._set_current_statuses(collect_kit_statuses(truck_number, self.settings))
+        self._set_current_statuses([], cache=False)
+        self._queue_status_refresh_for_truck(truck_number)
         if errors:
             QMessageBox.warning(self, "Create / Repair Selected", "\n".join(errors))
         if notes:
@@ -2261,11 +2430,21 @@ class MainWindow(QMainWindow):
         if not truck_text:
             return False
         truck_key = truck_text.casefold()
+        self._invalidate_status_for_truck(truck_text)
         if truck_key in self._pending_status_by_truck:
             return False
+        context = self._active_truck_switch
+        run_id = (
+            context.run_id
+            if context is not None and context.truck_number.casefold() == truck_key
+            else self._truck_switch_run_id
+        )
+        settings_signature = self._settings_signature()
         self._pending_status_by_truck[truck_key] = (
             truck_text,
-            self._status_executor.submit(collect_kit_statuses, truck_text, self.settings),
+            settings_signature,
+            run_id,
+            self._status_executor.submit(collect_kit_statuses, truck_text, self.settings, use_cache=False),
         )
         self._status_watch_timer.start()
         return True

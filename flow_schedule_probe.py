@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import json
 import math
 from pathlib import Path
+import sqlite3
 import sys
 
 APP_DIR = Path(__file__).resolve().parent
@@ -19,6 +20,7 @@ EMBEDDED_GANTT_SMALL_KIT_KEYS = frozenset(
         "operational panels",
     }
 )
+QUERY_COUNTER = {"database_queries": 0}
 
 
 def _normalize_embedded_gantt_kit_key(kit_name: object) -> str:
@@ -55,8 +57,31 @@ def split_overlay_rows_for_embedded_gantt(rows: list[object]) -> tuple[list[obje
 
 
 def _emit(payload: dict[str, object]) -> int:
+    payload = dict(payload)
+    payload["metrics"] = {"database_queries": int(QUERY_COUNTER["database_queries"])}
     print(json.dumps(payload, separators=(",", ":")))
     return 0
+
+
+def _count_sql_statement(statement: str) -> None:
+    text = str(statement or "").strip().split(None, 1)
+    if not text:
+        return
+    verb = text[0].upper()
+    if verb in {"SELECT", "INSERT", "UPDATE", "DELETE", "PRAGMA", "CREATE", "ALTER", "DROP"}:
+        QUERY_COUNTER["database_queries"] += 1
+
+
+def _install_sqlite_query_counter() -> object:
+    original_connect = sqlite3.connect
+
+    def _connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(_count_sql_statement)
+        return connection
+
+    sqlite3.connect = _connect
+    return original_connect
 
 
 def _status_display_text(*, released: bool, stage_label: str, status_key: str, hold_weeks: float, is_not_due: bool, blocked: bool) -> str:
@@ -144,25 +169,29 @@ def main(argv: list[str]) -> int:
         )
 
     sys.path.insert(0, str(FLOW_APP_DIR))
-    from database import FabricationDatabase
-    from gantt_overlay import (
-        LASER_START_POSITION,
-        STATUS_COLORS,
-        WELD_NEAR_POSITION,
-        OverlayRow,
-        Stage,
-        build_overlay_rows,
-        compute_overlay_viewport,
-        normalize_overlay_row_labels,
-        render_overlay_png,
-    )
-    from models import pdf_link
-    from schedule import build_schedule_insights
-    from stages import stage_from_id, stage_label
+    original_connect = _install_sqlite_query_counter()
+    try:
+        from database import FabricationDatabase
+        from gantt_overlay import (
+            LASER_START_POSITION,
+            STATUS_COLORS,
+            WELD_NEAR_POSITION,
+            OverlayRow,
+            Stage,
+            build_overlay_rows,
+            compute_overlay_viewport,
+            normalize_overlay_row_labels,
+            render_overlay_png,
+        )
+        from models import pdf_link
+        from schedule import build_schedule_insights
+        from stages import stage_from_id, stage_label
 
-    database = FabricationDatabase(db_path)
-    database.initialize()
-    trucks = database.load_trucks_with_kits(active_only=False)
+        database = FabricationDatabase(db_path)
+        database.initialize()
+        trucks = database.load_trucks_with_kits(active_only=False)
+    finally:
+        sqlite3.connect = original_connect
     target_truck = next(
         (
             truck

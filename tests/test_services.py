@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import Future
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ import background_job
 import inventor_service
 import rpd_io  # type: ignore[import-not-found]
 from flow_bridge import (
+    FlowTruckInsight,
     flow_kit_insight_for_explorer_kit,
     load_flow_truck_insight,
     map_explorer_kit_to_flow_kit,
@@ -48,6 +50,7 @@ from models import (
     materialize_legacy_punch_codes_for_kit,
     resolve_punch_code_text,
 )
+from performance_metrics import BoundedTTLCache, performance_snapshot, reset_performance_metrics
 from packet_build_service import (
     PacketBuildReadinessError,
     apply_assembly_context_to_sym_comments,
@@ -68,6 +71,8 @@ from services import (
     build_kit_paths,
     build_launch_command,
     build_kit_status,
+    cached_path_exists,
+    clear_performance_caches,
     collect_kit_statuses,
     create_kit_scaffold,
     detect_assembly_packet_pdf,
@@ -79,6 +84,7 @@ from services import (
     filter_kit_statuses,
     filter_truck_numbers,
     find_fabrication_truck_dir,
+    invalidate_status_cache_for_truck,
     is_hidden_kit,
     is_hidden_truck,
     is_owned_inventor_output,
@@ -630,6 +636,118 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             [status.kit_name for status in statuses],
             ["PAINT PACK", "PUMP HOUSE", "PUMP MOUNTS", "STEP PACK"],
         )
+
+    def test_bounded_ttl_cache_tracks_hits_misses_expiration_and_size(self) -> None:
+        clock = [100.0]
+        reset_performance_metrics()
+        cache: BoundedTTLCache[str] = BoundedTTLCache(
+            "unit_cache",
+            max_size=2,
+            positive_ttl_seconds=10.0,
+            negative_ttl_seconds=1.0,
+            clock=lambda: clock[0],
+        )
+
+        hit, _value = cache.get("a")
+        self.assertFalse(hit)
+        cache.set("a", "alpha")
+        hit, value = cache.get("a")
+        self.assertTrue(hit)
+        self.assertEqual(value, "alpha")
+
+        cache.set("missing", "nope", negative=True)
+        clock[0] += 1.1
+        hit, _value = cache.get("missing")
+        self.assertFalse(hit)
+
+        cache.set("b", "bravo")
+        cache.set("c", "charlie")
+        self.assertEqual(len(cache), 2)
+        self.assertFalse(cache.get("a")[0])
+        self.assertTrue(cache.invalidate("b"))
+
+        snapshot = performance_snapshot()
+        self.assertGreaterEqual(snapshot.cache_hits.get("unit_cache", 0), 1)
+        self.assertGreaterEqual(snapshot.cache_misses.get("unit_cache", 0), 3)
+        self.assertGreaterEqual(snapshot.cache_invalidations.get("unit_cache", 0), 1)
+
+    def test_negative_filesystem_cache_expires_and_detects_recovery(self) -> None:
+        clock = [50.0]
+        reset_performance_metrics()
+        cache: BoundedTTLCache[object] = BoundedTTLCache(
+            "fs_test",
+            max_size=8,
+            positive_ttl_seconds=10.0,
+            negative_ttl_seconds=1.0,
+            clock=lambda: clock[0],
+        )
+        with workspace_tempdir() as temp_root:
+            path = temp_root / "recover.txt"
+
+            self.assertFalse(cached_path_exists(path, cache=cache))
+            path.write_text("ready", encoding="utf-8")
+            self.assertFalse(cached_path_exists(path, cache=cache))
+
+            clock[0] += 1.1
+            self.assertTrue(cached_path_exists(path, cache=cache))
+
+    def test_collect_kit_statuses_uses_cache_and_truck_invalidation(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            w_folder = fabrication_root / "F55334" / "PAINT PACK"
+            w_folder.mkdir(parents=True)
+            (w_folder / "TruckBom.xlsx").write_text("bom", encoding="utf-8")
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+                kit_templates=["PAINT PACK"],
+            )
+
+            clear_performance_caches()
+            reset_performance_metrics()
+            first = collect_kit_statuses("F55334", settings)
+            first_snapshot = performance_snapshot()
+            second = collect_kit_statuses("F55334", settings)
+            second_snapshot = performance_snapshot()
+
+            self.assertEqual([status.kit_name for status in first], ["PAINT PACK"])
+            self.assertEqual([status.kit_name for status in second], ["PAINT PACK"])
+            self.assertEqual(first_snapshot.filesystem_checks, second_snapshot.filesystem_checks)
+            self.assertGreaterEqual(second_snapshot.cache_hits.get("kit_status", 0), 1)
+
+            invalidate_status_cache_for_truck("F55334", settings)
+            collect_kit_statuses("F55334", settings)
+            invalidated_snapshot = performance_snapshot()
+            self.assertGreater(
+                invalidated_snapshot.cache_misses.get("kit_status", 0),
+                second_snapshot.cache_misses.get("kit_status", 0),
+            )
+
+    def test_flow_probe_payload_reports_database_query_count(self) -> None:
+        reset_performance_metrics()
+        with workspace_tempdir() as temp_root:
+            flow_dir = temp_root / "flow"
+            flow_dir.mkdir()
+            probe_path = temp_root / "flow_schedule_probe.py"
+            probe_path.write_text("# probe placeholder\n", encoding="utf-8")
+
+            payload = {
+                "available": True,
+                "truck_number": "F55334",
+                "summary_text": "Flow ready",
+                "metrics": {"database_queries": 7},
+                "kits": [],
+            }
+
+            def runner(*_args, **_kwargs):
+                return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            with patch("flow_bridge.FLOW_APP_DIR", flow_dir), patch("flow_bridge.FLOW_PROBE_PATH", probe_path):
+                insight = load_flow_truck_insight("F55334", runner=runner)
+
+        self.assertEqual(insight.database_query_count, 7)
+        self.assertEqual(performance_snapshot().database_queries, 7)
 
     def test_create_kit_scaffold_clones_template_and_replaces_tokens(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -2551,6 +2669,65 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 self.assertTrue(event.ignored)
             finally:
                 window.full_flow_controller._context = None
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_truck_switch_stale_status_and_flow_results_are_ignored(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F11111")
+                window.truck_list.addItem("F22222")
+                window.truck_list.setCurrentRow(1)
+                window.truck_list.blockSignals(False)
+                window._active_truck_switch = main_window.TruckSwitchRunContext("F22222", 2)
+                window._truck_switch_run_id = 2
+                sentinel_statuses = [object()]
+                window._all_statuses = list(sentinel_statuses)
+                window._current_flow_truck_insight = FlowTruckInsight(
+                    available=True,
+                    truck_number="F22222",
+                    summary_text="current",
+                )
+
+                reset_performance_metrics()
+                status_future: Future[list[object]] = Future()
+                status_future.set_result([])
+                window._pending_status_by_truck["f11111"] = (
+                    "F11111",
+                    window._settings_signature(),
+                    1,
+                    status_future,
+                )
+                window._poll_pending_status_future()
+
+                flow_future: Future[FlowTruckInsight] = Future()
+                flow_future.set_result(
+                    FlowTruckInsight(
+                        available=True,
+                        truck_number="F11111",
+                        summary_text="stale",
+                    )
+                )
+                window._pending_flow_by_truck["f11111"] = ("F11111", "old-token", 1, flow_future)
+                window._poll_pending_flow_future()
+
+                self.assertEqual(window._all_statuses, sentinel_statuses)
+                self.assertEqual(window._current_flow_truck_insight.truck_number, "F22222")
+                self.assertEqual(performance_snapshot().stale_results_ignored, 2)
+            finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)
                 window._flow_executor.shutdown(wait=False, cancel_futures=True)

@@ -6,7 +6,6 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 from background_job import BackgroundJobWorker
 from dialogs.inventor_report_review_dialog import InventorReviewState, review_inventor_result
 from inventor_service import InventorNeedsUserAction, InventorRunResult, InventorServiceError, run_inventor_for_status
-from services import collect_kit_statuses
 
 
 class InventorController:
@@ -179,7 +178,7 @@ class InventorController:
         try:
             truck_number = status.paths.truck_number
             if truck_number.casefold() == self.window.current_truck_number().casefold():
-                self.window._set_current_statuses(collect_kit_statuses(truck_number, self.window.settings))
+                self.window._queue_status_refresh_for_truck(truck_number)
         except Exception as exc:
             self._log(f"Could not refresh status after Inventor-to-RADAN: {exc}")
 

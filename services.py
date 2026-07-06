@@ -32,6 +32,12 @@ from models import (
     normalize_hidden_truck_entries,
     normalize_truck_order_entries,
 )
+from performance_metrics import (
+    BoundedTTLCache,
+    GLOBAL_METRICS,
+    normalize_cache_path,
+    settings_cache_signature,
+)
 
 SUPPORTED_SPREADSHEET_SUFFIXES = {".xlsx", ".xls", ".csv"}
 IGNORED_SPREADSHEET_PATTERNS = ("_radan.csv",)
@@ -48,6 +54,22 @@ DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_c
 FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
+FILESYSTEM_CACHE_POSITIVE_TTL_SECONDS = 5.0
+FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS = 2.0
+KIT_STATUS_CACHE_TTL_SECONDS = 30.0
+
+FILE_METADATA_CACHE: BoundedTTLCache[object] = BoundedTTLCache(
+    "filesystem_metadata",
+    max_size=4096,
+    positive_ttl_seconds=FILESYSTEM_CACHE_POSITIVE_TTL_SECONDS,
+    negative_ttl_seconds=FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS,
+)
+KIT_STATUS_CACHE: BoundedTTLCache[tuple[KitStatus, ...]] = BoundedTTLCache(
+    "kit_status",
+    max_size=128,
+    positive_ttl_seconds=KIT_STATUS_CACHE_TTL_SECONDS,
+    negative_ttl_seconds=FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS,
+)
 
 
 class InventorToRadanInlineNeedsUi(RuntimeError):
@@ -103,6 +125,104 @@ def clean_text(value: object) -> str:
 
 def natural_sort_key(value: str) -> list[object]:
     return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value)]
+
+
+def _status_cache_key(truck_number: str, settings: ExplorerSettings) -> tuple[str, str, str]:
+    return ("kit_status", settings_cache_signature(settings), clean_text(truck_number).casefold())
+
+
+def _filesystem_cache() -> BoundedTTLCache[object]:
+    return FILE_METADATA_CACHE
+
+
+def _cache_negative(value: object) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (SpreadsheetMatch, PdfMatch)):
+        return value.chosen_path is None
+    return value is None
+
+
+def cached_path_exists(path: Path | None, *, cache: BoundedTTLCache[object] | None = None) -> bool:
+    if path is None:
+        return False
+    if cache is None:
+        GLOBAL_METRICS.record_filesystem_check()
+        return path.exists()
+    cache_obj = cache
+    key = ("exists", normalize_cache_path(path))
+    hit, value = cache_obj.get(key)
+    if hit:
+        return bool(value)
+    GLOBAL_METRICS.record_filesystem_check()
+    exists = path.exists()
+    cache_obj.set(key, exists, negative=not exists)
+    return exists
+
+
+def cached_path_size(path: Path | None, *, cache: BoundedTTLCache[object] | None = None) -> int:
+    if path is None:
+        return 0
+    if cache is None:
+        GLOBAL_METRICS.record_filesystem_check()
+        try:
+            return int(path.stat().st_size)
+        except OSError:
+            return 0
+    cache_obj = cache
+    key = ("stat_size", normalize_cache_path(path))
+    hit, value = cache_obj.get(key)
+    if hit:
+        return int(value or 0)
+    GLOBAL_METRICS.record_filesystem_check()
+    try:
+        size = int(path.stat().st_size)
+    except OSError:
+        size = 0
+    cache_obj.set(key, size, negative=size == 0)
+    return size
+
+
+def invalidate_filesystem_cache_for_path(path: Path | str | None) -> None:
+    if path is None:
+        return
+    target_key = normalize_cache_path(path)
+    FILE_METADATA_CACHE.invalidate_where(
+        lambda key, _value: isinstance(key, tuple)
+        and any(isinstance(part, str) and (part == target_key or part.startswith(f"{target_key}\\")) for part in key)
+    )
+
+
+def invalidate_filesystem_cache_for_paths(paths: tuple[Path, ...] | list[Path]) -> None:
+    seen: set[str] = set()
+    for path in paths:
+        current = Path(path)
+        for candidate in (current, current.parent):
+            key = normalize_cache_path(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            invalidate_filesystem_cache_for_path(candidate)
+
+
+def invalidate_status_cache_for_truck(truck_number: str, settings: ExplorerSettings | None = None) -> None:
+    truck_key = clean_text(truck_number).casefold()
+    if not truck_key:
+        return
+    if settings is not None:
+        KIT_STATUS_CACHE.invalidate(_status_cache_key(truck_key, settings))
+        return
+    KIT_STATUS_CACHE.invalidate_where(
+        lambda key, _value: isinstance(key, tuple)
+        and len(key) == 3
+        and key[0] == "kit_status"
+        and str(key[2]).casefold() == truck_key
+    )
+
+
+def clear_performance_caches() -> None:
+    FILE_METADATA_CACHE.clear()
+    KIT_STATUS_CACHE.clear()
 
 
 def normalize_kit_templates(values: list[str]) -> list[str]:
@@ -321,8 +441,14 @@ def _path_from_setting(value: str) -> Path | None:
     return Path(text)
 
 
-def _existing_named_child(parent: Path | None, candidate_names: tuple[str, ...], *, want_dir: bool) -> Path | None:
-    if parent is None or not parent.exists() or not candidate_names:
+def _existing_named_child(
+    parent: Path | None,
+    candidate_names: tuple[str, ...],
+    *,
+    want_dir: bool,
+    cache: BoundedTTLCache[object] | None = None,
+) -> Path | None:
+    if parent is None or not cached_path_exists(parent, cache=cache) or not candidate_names:
         return None
 
     wanted_by_key = {
@@ -333,7 +459,20 @@ def _existing_named_child(parent: Path | None, candidate_names: tuple[str, ...],
     if not wanted_by_key:
         return None
 
+    key = (
+        "existing_named_child",
+        normalize_cache_path(parent),
+        tuple(sorted(wanted_by_key)),
+        bool(want_dir),
+    )
+    cache_obj = cache
+    if cache_obj is not None:
+        hit, value = cache_obj.get(key)
+        if hit:
+            return Path(str(value)) if value else None
+
     try:
+        GLOBAL_METRICS.record_filesystem_check()
         with os.scandir(parent) as entries:
             for entry in entries:
                 if entry.name.casefold() not in wanted_by_key:
@@ -345,13 +484,26 @@ def _existing_named_child(parent: Path | None, candidate_names: tuple[str, ...],
                         continue
                 except OSError:
                     continue
-                return Path(entry.path)
+                result = Path(entry.path)
+                if cache_obj is not None:
+                    cache_obj.set(key, result, negative=False)
+                return result
     except OSError:
+        if cache_obj is not None:
+            cache_obj.set(key, None, negative=True)
         return None
+    if cache_obj is not None:
+        cache_obj.set(key, None, negative=True)
     return None
 
 
-def build_kit_paths(truck_number: str, kit_name: str, settings: ExplorerSettings) -> KitPaths:
+def build_kit_paths(
+    truck_number: str,
+    kit_name: str,
+    settings: ExplorerSettings,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> KitPaths:
     truck_text = clean_text(truck_number)
     mapping = resolve_kit_mapping(kit_name, settings)
     display_text = clean_text(mapping.display_name)
@@ -371,12 +523,22 @@ def build_kit_paths(truck_number: str, kit_name: str, settings: ExplorerSettings
 
     release_truck_dir = release_root / truck_text if release_root else None
     release_kit_dir = release_truck_dir / kit_text if release_truck_dir else None
-    existing_release_kit_dir = _existing_named_child(release_truck_dir, kit_name_candidates, want_dir=True)
+    existing_release_kit_dir = _existing_named_child(
+        release_truck_dir,
+        kit_name_candidates,
+        want_dir=True,
+        cache=fs_cache,
+    )
     if existing_release_kit_dir is not None:
         release_kit_dir = existing_release_kit_dir
 
     project_dir = release_kit_dir / project_name if release_kit_dir else None
-    existing_project_dir = _existing_named_child(release_kit_dir, project_name_candidates, want_dir=True)
+    existing_project_dir = _existing_named_child(
+        release_kit_dir,
+        project_name_candidates,
+        want_dir=True,
+        cache=fs_cache,
+    )
     if existing_project_dir is not None:
         project_dir = existing_project_dir
         project_name = existing_project_dir.name
@@ -388,6 +550,7 @@ def build_kit_paths(truck_number: str, kit_name: str, settings: ExplorerSettings
             project_dir,
             (f"{project_name}.rpd",) + rpd_name_candidates,
             want_dir=False,
+            cache=fs_cache,
         )
         if existing_rpd_path is not None:
             rpd_path = existing_rpd_path
@@ -423,9 +586,10 @@ def build_kit_paths(truck_number: str, kit_name: str, settings: ExplorerSettings
 def discover_trucks(settings: ExplorerSettings) -> list[str]:
     names: set[str] = set()
     root = _path_from_setting(settings.release_root)
-    if root is None or not root.exists():
+    if root is None or not cached_path_exists(root):
         return []
     try:
+        GLOBAL_METRICS.record_filesystem_check()
         with os.scandir(root) as entries:
             for entry in entries:
                 try:
@@ -445,10 +609,11 @@ def find_fabrication_truck_dir(truck_number: str, settings: ExplorerSettings) ->
     if not wanted:
         return None
     fabrication_root = _path_from_setting(settings.fabrication_root)
-    if fabrication_root is None or not fabrication_root.exists():
+    if fabrication_root is None or not cached_path_exists(fabrication_root):
         return None
 
     try:
+        GLOBAL_METRICS.record_filesystem_check()
         with os.scandir(fabrication_root) as entries:
             for entry in entries:
                 try:
@@ -468,14 +633,28 @@ def _is_generated_spreadsheet(path: Path) -> bool:
     return any(name.endswith(pattern) for pattern in IGNORED_SPREADSHEET_PATTERNS)
 
 
-def detect_spreadsheet(folder: Path | None) -> SpreadsheetMatch:
+def detect_spreadsheet(
+    folder: Path | None,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> SpreadsheetMatch:
     if folder is None:
         return SpreadsheetMatch(chosen_path=None, candidates=(), issue="root_not_configured")
-    if not folder.exists():
-        return SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
+    cache_obj = fs_cache
+    key = ("spreadsheet", normalize_cache_path(folder))
+    if cache_obj is not None:
+        hit, value = cache_obj.get(key)
+        if hit and isinstance(value, SpreadsheetMatch):
+            return value
+    if not cached_path_exists(folder, cache=cache_obj):
+        result = SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
+        if cache_obj is not None:
+            cache_obj.set(key, result, negative=True)
+        return result
 
     discovered: list[Path] = []
     try:
+        GLOBAL_METRICS.record_filesystem_check()
         with os.scandir(folder) as entries:
             for entry in entries:
                 try:
@@ -490,14 +669,26 @@ def detect_spreadsheet(folder: Path | None) -> SpreadsheetMatch:
                     continue
                 discovered.append(path)
     except OSError:
-        return SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
+        result = SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
+        if cache_obj is not None:
+            cache_obj.set(key, result, negative=True)
+        return result
 
     candidates = tuple(sorted(discovered, key=lambda path: natural_sort_key(path.name)))
     if len(candidates) == 1:
-        return SpreadsheetMatch(chosen_path=candidates[0], candidates=candidates)
+        result = SpreadsheetMatch(chosen_path=candidates[0], candidates=candidates)
+        if cache_obj is not None:
+            cache_obj.set(key, result, negative=False)
+        return result
     if not candidates:
-        return SpreadsheetMatch(chosen_path=None, candidates=(), issue="spreadsheet_missing")
-    return SpreadsheetMatch(chosen_path=None, candidates=candidates, issue="multiple_spreadsheets")
+        result = SpreadsheetMatch(chosen_path=None, candidates=(), issue="spreadsheet_missing")
+        if cache_obj is not None:
+            cache_obj.set(key, result, negative=True)
+        return result
+    result = SpreadsheetMatch(chosen_path=None, candidates=candidates, issue="multiple_spreadsheets")
+    if cache_obj is not None:
+        cache_obj.set(key, result, negative=True)
+    return result
 
 
 def parse_replacement_rules(raw_text: str) -> list[tuple[str, str]]:
@@ -665,6 +856,8 @@ def create_kit_scaffold(
             notes.append("Wrote a minimal placeholder RPD because no template file is configured.")
         created.append(paths.rpd_path)
 
+    invalidate_status_cache_for_truck(truck_number, settings)
+    invalidate_filesystem_cache_for_paths(tuple(created))
     return ScaffoldResult(
         paths=paths,
         created_paths=tuple(created),
@@ -699,6 +892,8 @@ def ensure_rpd_exists(paths: KitPaths, settings: ExplorerSettings) -> tuple[Path
     else:
         _write_minimal_rpd(paths.rpd_path, project_name=paths.project_name)
     created.append(paths.rpd_path)
+    invalidate_status_cache_for_truck(paths.truck_number)
+    invalidate_filesystem_cache_for_paths(tuple(created))
     return tuple(created)
 
 
@@ -733,8 +928,21 @@ def _normalize_pdf_name_words(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
 
 
-def _shallow_descendant_files(root: Path, *, max_depth: int) -> list[tuple[Path, int]]:
-    if not root.exists():
+def _shallow_descendant_files(
+    root: Path,
+    *,
+    max_depth: int,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> list[tuple[Path, int]]:
+    cache_obj = fs_cache
+    key = ("shallow_descendant_files", normalize_cache_path(root), int(max_depth))
+    if cache_obj is not None:
+        hit, value = cache_obj.get(key)
+        if hit and isinstance(value, tuple):
+            return list(value)
+    if not cached_path_exists(root, cache=cache_obj):
+        if cache_obj is not None:
+            cache_obj.set(key, tuple(), negative=True)
         return []
 
     discovered: list[tuple[Path, int]] = []
@@ -742,6 +950,7 @@ def _shallow_descendant_files(root: Path, *, max_depth: int) -> list[tuple[Path,
     while stack:
         folder, depth = stack.pop()
         try:
+            GLOBAL_METRICS.record_filesystem_check()
             with os.scandir(folder) as entries:
                 for entry in entries:
                     try:
@@ -754,19 +963,29 @@ def _shallow_descendant_files(root: Path, *, max_depth: int) -> list[tuple[Path,
                         continue
         except OSError:
             continue
+    if cache_obj is not None:
+        cache_obj.set(key, tuple(discovered), negative=not discovered)
     return discovered
 
 
-def _collect_preview_pdf_candidates(paths: KitPaths) -> tuple[Path, ...]:
+def _collect_preview_pdf_candidates(
+    paths: KitPaths,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> tuple[Path, ...]:
     search_root = paths.release_kit_dir or paths.project_dir
-    if search_root is None or not search_root.exists():
+    if search_root is None or not cached_path_exists(search_root, cache=fs_cache):
         return ()
 
     rpd_stem = paths.rpd_path.stem if paths.rpd_path is not None else paths.project_name
     expected_stem = _normalize_pdf_name_words(f"{rpd_stem} nest summary")
 
     candidates: list[tuple[int, Path]] = []
-    for child, depth in _shallow_descendant_files(search_root, max_depth=MAX_NEST_SUMMARY_DEPTH):
+    for child, depth in _shallow_descendant_files(
+        search_root,
+        max_depth=MAX_NEST_SUMMARY_DEPTH,
+        fs_cache=fs_cache,
+    ):
         if child.suffix.casefold() not in SUPPORTED_PREVIEW_SUFFIXES:
             continue
         child_stem = _normalize_pdf_name_words(child.stem)
@@ -816,18 +1035,23 @@ def _detect_named_packet_pdf(
     paths: KitPaths,
     *,
     matches_fn,
+    fs_cache: BoundedTTLCache[object] | None = None,
 ) -> PdfMatch:
     if paths.project_dir is None:
         return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
-    if not paths.project_dir.exists():
+    if not cached_path_exists(paths.project_dir, cache=fs_cache):
         return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
 
     search_root = paths.release_kit_dir or paths.project_dir
-    if search_root is None or not search_root.exists():
+    if search_root is None or not cached_path_exists(search_root, cache=fs_cache):
         return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
 
     candidates: list[tuple[int, Path]] = []
-    for child, depth in _shallow_descendant_files(search_root, max_depth=MAX_NEST_SUMMARY_DEPTH):
+    for child, depth in _shallow_descendant_files(
+        search_root,
+        max_depth=MAX_NEST_SUMMARY_DEPTH,
+        fs_cache=fs_cache,
+    ):
         if child.suffix.casefold() not in SUPPORTED_PREVIEW_SUFFIXES:
             continue
         if not matches_fn(child):
@@ -841,13 +1065,17 @@ def _detect_named_packet_pdf(
     return PdfMatch(chosen_path=paths_only[-1], candidates=paths_only)
 
 
-def detect_preview_pdf(paths: KitPaths) -> PdfMatch:
+def detect_preview_pdf(
+    paths: KitPaths,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> PdfMatch:
     if paths.project_dir is None:
         return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
-    if not paths.project_dir.exists():
+    if not cached_path_exists(paths.project_dir, cache=fs_cache):
         return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
 
-    candidates = _collect_preview_pdf_candidates(paths)
+    candidates = _collect_preview_pdf_candidates(paths, fs_cache=fs_cache)
     if not candidates:
         return PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
     return PdfMatch(chosen_path=candidates[0], candidates=candidates)
@@ -865,17 +1093,34 @@ def detect_cut_list_packet_pdf(paths: KitPaths) -> PdfMatch:
     return _detect_named_packet_pdf(paths, matches_fn=_is_cut_list_packet_pdf)
 
 
-def fabrication_folder_has_files(folder: Path | None) -> bool:
-    if folder is None or not folder.exists():
+def fabrication_folder_has_files(
+    folder: Path | None,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> bool:
+    if folder is None:
+        return False
+    cache_obj = fs_cache
+    key = ("fabrication_has_files", normalize_cache_path(folder))
+    if cache_obj is not None:
+        hit, value = cache_obj.get(key)
+        if hit:
+            return bool(value)
+    if not cached_path_exists(folder, cache=cache_obj):
+        if cache_obj is not None:
+            cache_obj.set(key, False, negative=True)
         return False
     stack: list[Path] = [folder]
     while stack:
         current = stack.pop()
         try:
+            GLOBAL_METRICS.record_filesystem_check()
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
                         if entry.is_file():
+                            if cache_obj is not None:
+                                cache_obj.set(key, True, negative=False)
                             return True
                         if entry.is_dir():
                             stack.append(Path(entry.path))
@@ -883,6 +1128,8 @@ def fabrication_folder_has_files(folder: Path | None) -> bool:
                         continue
         except OSError:
             continue
+    if cache_obj is not None:
+        cache_obj.set(key, False, negative=True)
     return False
 
 
@@ -902,20 +1149,29 @@ def release_text_for_status(
     return "W missing"
 
 
-def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSettings) -> KitStatus:
-    paths = build_kit_paths(truck_number, kit_name, settings)
+def build_kit_status(
+    truck_number: str,
+    kit_name: str,
+    settings: ExplorerSettings,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> KitStatus:
+    cache_obj = fs_cache
+    paths = build_kit_paths(truck_number, kit_name, settings, fs_cache=cache_obj)
     try:
         ensure_rpd_exists(paths, settings)
     except OSError:
         pass
-    release_folder_exists = bool(paths.release_kit_dir and paths.release_kit_dir.exists())
-    project_folder_exists = bool(paths.project_dir and paths.project_dir.exists())
-    rpd_exists = bool(paths.rpd_path and paths.rpd_path.exists())
-    rpd_size_bytes = paths.rpd_path.stat().st_size if rpd_exists and paths.rpd_path is not None else 0
-    fabrication_folder_exists = bool(paths.fabrication_kit_dir and paths.fabrication_kit_dir.exists())
-    fabrication_has_files = fabrication_folder_has_files(paths.fabrication_kit_dir)
-    spreadsheet_match = detect_spreadsheet(paths.fabrication_kit_dir)
-    preview_pdf_match = detect_preview_pdf(paths)
+    release_folder_exists = bool(paths.release_kit_dir and cached_path_exists(paths.release_kit_dir, cache=cache_obj))
+    project_folder_exists = bool(paths.project_dir and cached_path_exists(paths.project_dir, cache=cache_obj))
+    rpd_exists = bool(paths.rpd_path and cached_path_exists(paths.rpd_path, cache=cache_obj))
+    rpd_size_bytes = cached_path_size(paths.rpd_path, cache=cache_obj) if rpd_exists else 0
+    fabrication_folder_exists = bool(
+        paths.fabrication_kit_dir and cached_path_exists(paths.fabrication_kit_dir, cache=cache_obj)
+    )
+    fabrication_has_files = fabrication_folder_has_files(paths.fabrication_kit_dir, fs_cache=cache_obj)
+    spreadsheet_match = detect_spreadsheet(paths.fabrication_kit_dir, fs_cache=cache_obj)
+    preview_pdf_match = detect_preview_pdf(paths, fs_cache=cache_obj)
     outputs = None
     if spreadsheet_match.chosen_path is not None:
         outputs = inventor_output_paths(spreadsheet_match.chosen_path, paths.project_dir)
@@ -954,15 +1210,29 @@ def build_kit_status(truck_number: str, kit_name: str, settings: ExplorerSetting
     )
 
 
-def collect_kit_statuses(truck_number: str, settings: ExplorerSettings) -> list[KitStatus]:
+def collect_kit_statuses(
+    truck_number: str,
+    settings: ExplorerSettings,
+    *,
+    use_cache: bool = True,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> list[KitStatus]:
+    status_key = _status_cache_key(truck_number, settings)
+    if use_cache:
+        hit, cached = KIT_STATUS_CACHE.get(status_key)
+        if hit and cached is not None:
+            return list(cached)
+    cache_obj = fs_cache or _filesystem_cache()
     statuses = [
-        build_kit_status(truck_number, mapping.kit_name, settings)
+        build_kit_status(truck_number, mapping.kit_name, settings, fs_cache=cache_obj)
         for mapping in configured_kit_mappings(settings)
     ]
     statuses.extend(
-        build_kit_status(truck_number, kit_name, settings)
+        build_kit_status(truck_number, kit_name, settings, fs_cache=cache_obj)
         for kit_name in odd_job_names_for_truck(truck_number, settings)
     )
+    if use_cache:
+        KIT_STATUS_CACHE.set(status_key, tuple(statuses), negative=not statuses)
     return statuses
 
 
@@ -1430,4 +1700,5 @@ def move_inventor_outputs_to_project(
         )
         moved.append(outputs.target_report_path)
 
+    invalidate_filesystem_cache_for_paths(tuple(moved))
     return outputs, tuple(moved)

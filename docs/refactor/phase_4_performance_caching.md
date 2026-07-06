@@ -268,4 +268,81 @@ Phase 4 is complete only when:
 - No removed Inventor watcher workflow has been reintroduced
 - Update this Markdown file with the results above after running the phase.
 
-Last updated: 2026-06-29
+## Phase 4 Results
+
+Completed on 2026-07-06.
+
+### Baseline Inspection
+
+- Pre-Phase-4 recurring timers identified:
+  - Truck/status/flow future completion polling: 120 ms.
+  - Flow cache-token refresh: 1500 ms.
+  - External status fallback refresh: 10000 ms.
+  - Kitter status refresh: 5000 ms, up to 360 attempts after Kitter launch.
+- Truck Nest Explorer has no direct SQLite query sites. Flow data is loaded through `flow_schedule_probe.py`, which calls the sibling fabrication-flow dashboard database layer.
+- The main truck-switch filesystem hot path is `collect_kit_statuses()`, especially path building, W-folder release probing, spreadsheet detection, L-side preview PDF scans, and RPD metadata checks.
+- No production folder watcher exists. Only future-completion timers and dev hot-reload file scanning were present.
+- Existing invalidation/refresh boundaries before Phase 4 were settings save, explicit truck refresh, scaffold creation, packet build completion, Inventor completion, Full Flow completion, RADAN import/kitter refresh polling, and external fallback status refresh.
+
+### Implementation Results
+
+- Added `performance_metrics.py` with optional low-overhead counters for database queries, filesystem checks, truck-switch start/completion, cache hits/misses/invalidations, and stale async results.
+- Added bounded TTL caches:
+  - Service status cache: settings signature + truck number, max 128 entries, 30 second positive TTL.
+  - Filesystem metadata cache: normalized path + operation, max 4096 entries, 5 second positive TTL and 2 second negative TTL.
+  - Flow insight cache: truck number + flow token, max 128 entries, valid until the flow token changes.
+  - MainWindow UI caches: bounded status and flow caches using the same key structure.
+- Direct service helper calls remain live by default; the status collector passes the cache explicitly for the app hot path.
+- Added invalidation after successful scaffold creation, RPD creation, Inventor output movement/discard, packet/Inventor/Full Flow queued refreshes, settings/root refresh, and explicit truck refresh.
+- Added `TruckSwitchRunContext` with a monotonic run id. Status and flow completions now update widgets only when the completed run id still matches the active selection.
+- Reused the existing executor plus Qt timer completion model, but tagged pending status/flow futures with run ids and settings/flow tokens.
+- Moved standalone Inventor completion refresh onto the queued status-refresh path instead of synchronously collecting status on the UI thread.
+- Reduced the broad external fallback status refresh from 10000 ms to 30000 ms. Explicit write paths now drive targeted refreshes.
+- Added SQLite query counting inside `flow_schedule_probe.py` payload metrics; parent flow loading records the returned query count.
+
+### Mocked Measurements
+
+- Temp-workspace cold status collection for one truck/kit:
+  - Filesystem checks: 12.
+  - Cache misses: `kit_status=1`, `filesystem_metadata=11`.
+  - Cache hits during shared in-run metadata reuse: `filesystem_metadata=5`.
+- Immediate warm status collection for the same settings/truck:
+  - Added filesystem checks: 0.
+  - Added status cache hit: `kit_status=1`.
+- Mocked flow probe payload:
+  - Probe-reported database queries: 7.
+  - Parent metrics database query count: 7.
+- Rapid stale completion test:
+  - Stale status result ignored: 1.
+  - Stale flow result ignored: 1.
+  - Visible truck remained the newest selection.
+
+### Files Added
+
+- `performance_metrics.py`
+
+### Files Changed
+
+- `main_window.py`
+- `services.py`
+- `flow_bridge.py`
+- `flow_schedule_probe.py`
+- `inventor_service.py`
+- `controllers/inventor_controller.py`
+- `tests/test_services.py`
+- `docs/refactor/phase_4_performance_caching.md`
+
+### Validation
+
+- Focused suite: `python -m pytest tests/test_services.py -q` -> 110 passed in 2.26s.
+- Full suite: `python -m pytest -q` -> 110 passed in 2.04s.
+- Compile check: `python -m py_compile performance_metrics.py services.py flow_bridge.py flow_schedule_probe.py main_window.py inventor_service.py controllers\inventor_controller.py controllers\full_flow_controller.py tests\test_services.py` -> passed.
+
+### Remaining Risks
+
+- Future completion still uses Qt timer polling rather than Qt signal workers; run-id protection prevents stale UI updates, but the completion mechanism itself remains timer-based.
+- The fallback external status refresh remains intentionally slow at 30000 ms because there is no reliable production folder/data watcher yet.
+- The one-way W/L release-marker optimization was not promoted to permanent caching; the short TTL cache delivered measurable warm-read improvement without adding irreversible-state policy risk.
+- Before/after wall-clock latency was not claimed because only deterministic mocked measurements were taken in this pass.
+
+Last updated: 2026-07-06

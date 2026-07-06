@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from models import canonicalize_kit_name
+from performance_metrics import BoundedTTLCache, GLOBAL_METRICS
 
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 APP_DIR = Path(__file__).resolve().parent
@@ -38,6 +39,12 @@ EXPLORER_TO_FLOW_KIT_NAME = {
     "OPERATIONAL PANELS": "Operational Panels",
 }
 VALID_FLOW_STATUS_KEYS = {"red", "yellow", "green", "blue", "black", "missing"}
+FLOW_INSIGHT_CACHE: BoundedTTLCache["FlowTruckInsight"] = BoundedTTLCache(
+    "flow_insight",
+    max_size=128,
+    positive_ttl_seconds=3600.0,
+    negative_ttl_seconds=2.0,
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,7 @@ class FlowTruckInsight:
     planned_start_date: str = ""
     current_week: float | None = None
     gantt_png_bytes: bytes | None = None
+    database_query_count: int = 0
     kit_insights_by_flow_name: dict[str, FlowKitInsight] = field(default_factory=dict)
 
 
@@ -93,6 +101,7 @@ def _python_executable() -> str:
 
 def _file_cache_token(path: Path) -> str:
     try:
+        GLOBAL_METRICS.record_filesystem_check()
         stat = path.stat()
     except OSError:
         return f"{path.name}:missing"
@@ -174,6 +183,14 @@ def parse_flow_probe_payload(payload: object) -> FlowTruckInsight:
         except Exception:
             gantt_png_bytes = None
 
+    metrics_payload = payload.get("metrics")
+    database_query_count = 0
+    if isinstance(metrics_payload, dict):
+        try:
+            database_query_count = int(metrics_payload.get("database_queries", 0) or 0)
+        except (TypeError, ValueError):
+            database_query_count = 0
+
     return FlowTruckInsight(
         available=bool(payload.get("available")),
         truck_number=truck_number,
@@ -183,6 +200,7 @@ def parse_flow_probe_payload(payload: object) -> FlowTruckInsight:
         planned_start_date=str(payload.get("planned_start_date") or "").strip(),
         current_week=parsed_current_week,
         gantt_png_bytes=gantt_png_bytes,
+        database_query_count=database_query_count,
         kit_insights_by_flow_name=kit_insights_by_flow_name,
     )
 
@@ -303,10 +321,36 @@ def load_flow_truck_insight(
             kit_insights_by_flow_name={},
         )
     insight = parse_flow_probe_payload(payload)
+    if insight.database_query_count:
+        GLOBAL_METRICS.record_database_query(insight.database_query_count)
     returned_truck = str(insight.truck_number or "").strip()
     if returned_truck.casefold() != clean_truck.casefold():
         return _truck_mismatch_insight(clean_truck, returned_truck)
     return insight
+
+
+def load_cached_flow_truck_insight(truck_number: str) -> FlowTruckInsight:
+    clean_truck = str(truck_number or "").strip()
+    token = flow_probe_cache_token()
+    key = (clean_truck.casefold(), token)
+    hit, cached = FLOW_INSIGHT_CACHE.get(key)
+    if hit and cached is not None:
+        return cached
+    insight = load_flow_truck_insight(clean_truck)
+    FLOW_INSIGHT_CACHE.set(key, insight, negative=not insight.available)
+    return insight
+
+
+def invalidate_flow_insight_cache(truck_number: str | None = None) -> None:
+    if truck_number is None:
+        FLOW_INSIGHT_CACHE.clear()
+        return
+    truck_key = str(truck_number or "").strip().casefold()
+    FLOW_INSIGHT_CACHE.invalidate_where(
+        lambda key, _value: isinstance(key, tuple)
+        and len(key) >= 1
+        and str(key[0]).casefold() == truck_key
+    )
 
 
 def flow_kit_insight_for_explorer_kit(
