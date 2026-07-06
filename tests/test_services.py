@@ -2187,16 +2187,6 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             add_odd_job_to_truck(settings, "F55334", "PAINT PACK")
 
-    def test_full_flow_legacy_entrypoint_requires_report_review(self) -> None:
-        status = SimpleNamespace(kit_name="PAINT PACK", paths=SimpleNamespace(rpd_path=Path("paint.rpd")))
-
-        with self.assertRaises(full_flow_service.FullFlowNeedsUserAction):
-            full_flow_service.run_full_flow_before_nester(
-                status,
-                ExplorerSettings(),
-                runtime_dir=Path("."),
-            )
-
     def test_full_flow_skips_kitter_rf_for_non_paint_pack(self) -> None:
         status = SimpleNamespace(kit_name="PUMPHOUSE", paths=SimpleNamespace(rpd_path=Path("job.rpd")))
         progress: list[str] = []
@@ -2284,7 +2274,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertEqual(result.rf_assignment.predicted_count, 12)
         self.assertIsNone(result.rf_assignment.skipped_reason)
 
-    def test_full_flow_rf_prepares_kits_without_attr109_labels(self) -> None:
+    def test_full_flow_rf_prepares_kits_without_part_comment_writes(self) -> None:
         with workspace_tempdir() as temp_root:
             project_path = temp_root / "paint.rpd"
             project_path.write_text("<RadanProject />", encoding="utf-8")
@@ -2298,39 +2288,24 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 priority="9",
             )
             progress: list[str] = []
-            built_kits: list[tuple[str, tuple[str, ...]]] = []
+            prepare_calls: list[dict[str, object]] = []
 
-            def apply_balance_and_update_kit_texts(parts, *, kits_dirname, kit_to_priority):
+            def prepare_kits(parts, **kwargs):
+                prepare_calls.append(dict(kwargs))
+                self.assertIs(kwargs.get("write_part_kit_comments"), False)
                 for row in parts:
                     row.kit_label = str(row.kit_label).strip().upper()
-                    row.kit_text = f"{kits_dirname}/{row.kit_label}.sym"
-                    row.priority = kit_to_priority.get(row.kit_label, row.priority)
+                    row.kit_text = f"{kwargs['kits_dirname']}/{row.kit_label}.sym"
+                    row.priority = kwargs["kit_to_priority"].get(row.kit_label, row.priority)
+                progress_cb = kwargs.get("progress_cb")
+                if progress_cb is not None:
+                    progress_cb(0, 1, "Preparing kits")
+                    progress_cb(1, 1, "Building kit: BODY")
+                return 1
 
-            def group_parts_by_kit(*, parts, sanitize_kit_name, is_valid_kit_name):
-                grouped: dict[str, list[object]] = {}
-                for row in parts:
-                    grouped.setdefault(row.kit_label, []).append(row)
-                return grouped
-
-            def build_kit_sym_from_donor(*, donor_path, member_part_syms, out_kit_sym_path, backup_dir):
-                built_kits.append((out_kit_sym_path, tuple(member_part_syms)))
-
-            fake_sym_io = SimpleNamespace(
-                group_parts_by_kit=group_parts_by_kit,
-                build_kit_sym_from_donor=build_kit_sym_from_donor,
-            )
             fake_kit_service = SimpleNamespace(
-                apply_balance_and_update_kit_texts=apply_balance_and_update_kit_texts,
-                prepare_kits=lambda *args, **kwargs: (_ for _ in ()).throw(
-                    AssertionError("Full Flow must not call prepare_kits because it updates Attr109")
-                ),
+                prepare_kits=prepare_kits,
                 write_rpd_with_backup=lambda tree, parts, *, rpd_path, bak_dirname: str(temp_root / "backup.rpd"),
-                ensure_dir=lambda path: Path(path).mkdir(parents=True, exist_ok=True),
-                sanitize_kit_name=lambda value: str(value or "").strip().upper(),
-                is_valid_kit_name=lambda value: bool(str(value or "").strip()),
-                force_l_drive_path=lambda value: str(value),
-                kit_file_path_for_part_sym=lambda sym, kit, kits_dirname: str(temp_root / kits_dirname / f"{kit}.sym"),
-                sym_io=fake_sym_io,
             )
             fake_modules = {
                 "assets": SimpleNamespace(
@@ -2368,9 +2343,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(result.kit_count, 1)
             self.assertEqual(part.priority, "2")
             self.assertEqual(part.kit_text, "_kits/BODY.sym")
-            self.assertEqual(len(built_kits), 1)
-            self.assertTrue(any("skipping RF kit-label Attr109 comments" in message for message in progress))
-            self.assertTrue(any("without updating RF kit-label Attr109 comments" in message for message in progress))
+            self.assertEqual(len(prepare_calls), 1)
+            self.assertTrue(any("skipping RF kit-label part comments" in message for message in progress))
+            self.assertTrue(any("prepare kits 1/1 Building kit: BODY" in message for message in progress))
 
     def test_full_flow_packet_build_still_inserts_assembly_context(self) -> None:
         status = SimpleNamespace(
@@ -2910,6 +2885,36 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         text = (PROJECT_DIR / "main_window.py").read_text(encoding="utf-8")
         self.assertNotIn("PacketJobWorker", text)
         self.assertNotIn("PacketJobSignals", text)
+
+    def test_phase_3_obsolete_symbols_are_absent_from_production_source(self) -> None:
+        obsolete_symbols = (
+            "run_inventor_inline_for_status",
+            "_prepare_full_flow_kits_without_" + "attr" + "109",
+            "run_full_flow_before_nester",
+            "_create_full_flow_progress_dialog",
+            "_start_full_flow_worker",
+            "_review_full_flow_inventor_report",
+            "PendingInventorJob",
+            "PacketJobSignals",
+            "PacketJobWorker",
+        )
+        forbidden_workflow_tokens = ("attr" + "109", "attr_" + "109")
+        production_files = [
+            path
+            for path in PROJECT_DIR.rglob("*.py")
+            if "tests" not in path.parts
+            and "docs" not in path.parts
+            and "__pycache__" not in path.parts
+        ]
+
+        for path in production_files:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                for symbol in obsolete_symbols:
+                    self.assertNotIn(symbol, text)
+                lowered = text.casefold()
+                for token in forbidden_workflow_tokens:
+                    self.assertNotIn(token, lowered)
 
 
 def detect_status_from_paths(paths):

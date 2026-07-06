@@ -195,3 +195,110 @@ This phase is complete only when:
 - Required measurements are recorded
 - No work from the next phase has been started
 - Update this Markdown file with the results above after running the phase.
+
+## Phase 3 Results
+
+Completed on 2026-07-06.
+
+### Line Counts
+
+- `main_window.py` original baseline physical line count: 3816 lines.
+- `main_window.py` post-Phase-1 physical line count: 3484 lines.
+- `main_window.py` post-Phase-2 physical line count: 3086 lines.
+- `main_window.py` final post-Phase-3 physical line count: 3086 lines.
+- Phase 3 did not change `main_window.py`.
+
+### Files Added
+
+`radan_kitter`:
+
+- `tests/test_sym_io.py`
+
+No `truck_nest_explorer` source files were added.
+
+### Files Changed
+
+`truck_nest_explorer`:
+
+- `full_flow_service.py`
+- `packet_build_service.py`
+- `tests/test_services.py`
+- `docs/refactor/phase_3_cleanup_kitter.md`
+
+`radan_kitter`:
+
+- `README.md`
+- `kit_service.py`
+- `sym_io.py`
+- `tests/test_kit_service.py`
+
+`radan_kitter/_runtime/runtime_trace.jsonl` was already dirty before this phase and remained a generated runtime-file modification after test runs.
+
+### Files Removed
+
+No files were removed.
+
+### Architecture And Ownership Changes
+
+- `radan_kitter.kit_service.prepare_kits()` now accepts `write_part_kit_comments: bool = True`.
+- Default Kitter behavior is preserved: part comments are written and part-symbol backups are created when `write_part_kit_comments=True`.
+- When `write_part_kit_comments=False`, Kitter skips part-comment writes and comment-only part backups, while still normalizing kit labels, updating priorities and `kit_text`, validating the donor, grouping kits, generating kit symbols, running `refresh_kit_fn`, reporting progress, and returning the kit count.
+- `radan_kitter.sym_io` now exposes semantic part-comment helpers:
+  - `part_comment_from_text()`
+  - `set_part_comment_text()`
+  - `set_part_comment()`
+- Numeric RADAN storage details are isolated to `radan_kitter/sym_io.py` and the single low-level format test in `radan_kitter/tests/test_sym_io.py`.
+- `truck_nest_explorer.full_flow_service.run_kitter_rf_assignment_for_project()` now calls `rk_kit_service.prepare_kits(..., write_part_kit_comments=False)`.
+- The duplicated Truck Nest Explorer Kitter clone was deleted.
+- `truck_nest_explorer.packet_build_service` now reuses `radan_kitter.sym_io` semantic text helpers for assembly comment updates instead of owning duplicated file-format regexes.
+
+### Obsolete Symbols Removed Or Confirmed Absent
+
+Confirmed absent from production `truck_nest_explorer` source:
+
+- `PendingInventorJob`
+- `run_inventor_inline_for_status`
+- `_prepare_full_flow_kits_without_attr109`
+- `_create_full_flow_progress_dialog`
+- `_start_full_flow_worker`
+- `_review_full_flow_inventor_report`
+- `PacketJobSignals`
+- `PacketJobWorker`
+
+`run_full_flow_before_nester` and its supporting `FullFlowNeedsUserAction` compatibility path were also removed.
+
+The Phase 2 Full Flow locking methods remain absent from `MainWindow`.
+
+### Kitter And Full Flow Confirmations
+
+- `InventorController` and `FullFlowController` continue to use the Phase 1 `BackgroundJobWorker`.
+- Assembly and cut-list background jobs in `MainWindow` already use `BackgroundJobWorker`.
+- The print-packet builder still delegates to `radan_kitter.packet_runtime.PacketBuildWorker`; this is a Kitter domain worker and not the removed `PacketJobWorker`.
+- Full Flow passes `write_part_kit_comments=False` to Kitter RF preparation.
+- No fallback retry for an older `prepare_kits()` signature was added.
+- No workflow-level production identifier contains `attr109` or `attr_109`.
+
+### Validation Results
+
+Focused tests:
+
+- `radan_kitter`: `python -m pytest tests/test_kit_service.py tests/test_sym_io.py -q` -> 9 passed in 0.17s.
+- `truck_nest_explorer`: `python -m pytest tests/test_services.py -q` -> 105 passed in 1.48s.
+
+Full and relevant suite checks:
+
+- `truck_nest_explorer`: `python -m pytest -q` -> 105 passed in 1.41s.
+- `radan_kitter` checked-in test files: `$tests = Get-ChildItem -Path .\tests -Filter 'test_*.py' -File | ForEach-Object { $_.FullName }; python -m pytest @tests -q` -> 58 passed, 7 warnings in 2.33s.
+- `radan_kitter` repo-root discovery: `python -m pytest -q` -> 10 pre-existing collection errors from inaccessible generated temp folders (`_smoke_uzutih1v`, `tmp4ttlqq61`, and `tests/_tmp...` / `tests/_tmp_probe...`).
+
+Compile checks:
+
+- `truck_nest_explorer`: `python -m py_compile main_window.py full_flow_service.py packet_build_service.py background_job.py controllers\inventor_controller.py controllers\full_flow_controller.py tests\test_services.py` -> passed.
+- `radan_kitter`: `python -m py_compile kit_service.py sym_io.py tests\test_kit_service.py tests\test_sym_io.py` -> passed.
+
+### Remaining Risks And Follow-Up
+
+- `truck_nest_explorer` now depends on the updated `radan_kitter.sym_io` semantic text helpers for assembly comment updates, so these repository changes should be deployed together.
+- `radan_kitter` repo-root pytest remains blocked by inaccessible generated temp folders until those folders are excluded or cleaned by an explicit operator action.
+- Generated runtime traces in `radan_kitter/_runtime/runtime_trace.jsonl` remain dirty and were not deleted or reverted under the generated-data safety rule.
+- No Phase 4 caching or Phase 5/6 optimization work was started.

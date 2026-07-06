@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 import hashlib
-import html
 import os
 from pathlib import Path
 import re
@@ -59,6 +58,13 @@ def _load_radan_kitter_modules():
     import rpd_io as rk_rpd_io  # type: ignore[import-not-found]
 
     return rk_assets, rk_packet_runtime, rk_rpd_io
+
+
+def _load_radan_kitter_sym_io():
+    _ensure_radan_kitter_on_path()
+    import sym_io as rk_sym_io  # type: ignore[import-not-found]
+
+    return rk_sym_io
 
 
 def _fitz_module():
@@ -291,27 +297,6 @@ def _backup_sym_before_comment_update(sym_path: Path, backup_dir: Path | None) -
     candidate.write_bytes(sym_path.read_bytes())
 
 
-def _sym_attr_109_comment(text: str) -> str:
-    match = re.search(r'<Attr\s+num="109"[^>]*\bvalue="([^"]*)"', str(text or ""), flags=re.IGNORECASE)
-    if not match:
-        return ""
-    return html.unescape(match.group(1))
-
-
-def _set_sym_attr_109_comment_text(text: str, comment: str) -> tuple[str, bool]:
-    match = re.search(r'(<Attr\s+num="109"[^>]*)(>)', str(text or ""), flags=re.IGNORECASE)
-    if not match:
-        return text, False
-    open_tag = match.group(1)
-    escaped = html.escape(str(comment or ""), quote=True)
-    if re.search(r'\bvalue="[^"]*"', open_tag, flags=re.IGNORECASE):
-        open_tag = re.sub(r'\bvalue="[^"]*"', f'value="{escaped}"', open_tag, flags=re.IGNORECASE)
-    else:
-        open_tag = open_tag + f' value="{escaped}"'
-    new_text = text[: match.start(1)] + open_tag + text[match.end(1) :]
-    return new_text, True
-
-
 def _append_assembly_shorthands_to_comment(existing_comment: str, shorthands: Sequence[str]) -> str:
     clean_shorthands: list[str] = []
     seen: set[str] = set()
@@ -356,6 +341,7 @@ def apply_assembly_context_to_sym_comments(
     result: AssemblyBomContextResult,
     backup_dir: Path | None = None,
 ) -> AssemblySymCommentUpdateResult:
+    rk_sym_io = _load_radan_kitter_sym_io()
     sym_by_part: dict[str, Path] = {}
     for part in parts:
         part_name = _part_display_name(part)
@@ -383,9 +369,12 @@ def apply_assembly_context_to_sym_comments(
             continue
         try:
             text = _read_text_fallback(sym_path)
-            updated_comment = _append_assembly_shorthands_to_comment(_sym_attr_109_comment(text), shorthands)
-            updated_text, found_attr = _set_sym_attr_109_comment_text(text, updated_comment)
-            if not found_attr:
+            updated_comment = _append_assembly_shorthands_to_comment(
+                rk_sym_io.part_comment_from_text(text),
+                shorthands,
+            )
+            updated_text, found_comment = rk_sym_io.set_part_comment_text(text, updated_comment)
+            if not found_comment:
                 skipped += 1
                 continue
             if updated_text != text:

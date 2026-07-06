@@ -35,10 +35,6 @@ class FullFlowError(RuntimeError):
     pass
 
 
-class FullFlowNeedsUserAction(FullFlowError):
-    pass
-
-
 @dataclass(frozen=True)
 class CsvImportResult:
     log_path: Path
@@ -406,10 +402,9 @@ def run_kitter_rf_assignment_for_project(
 
     _emit(
         progress_cb,
-        f"Kitter RF: conditioning priorities and kit files for {predicted_count} predicted assignment(s); skipping RF kit-label Attr109 comments",
+        f"Kitter RF: conditioning priorities and kit files for {predicted_count} predicted assignment(s); skipping RF kit-label part comments",
     )
-    kit_count = _prepare_full_flow_kits_without_attr109(
-        rk_kit_service,
+    kit_count = rk_kit_service.prepare_kits(
         parts,
         rpd_path=str(project_path),
         donor_template_path=rk_config.DONOR_TEMPLATE_PATH,
@@ -417,6 +412,7 @@ def run_kitter_rf_assignment_for_project(
         kits_dirname=rk_config.KITS_DIRNAME,
         kit_to_priority=rk_config.KIT_TO_PRIORITY,
         progress_cb=lambda done, total, text: _emit(progress_cb, f"Kitter RF: prepare kits {done}/{total} {text}"),
+        write_part_kit_comments=False,
     )
     backup_path = Path(
         rk_kit_service.write_rpd_with_backup(
@@ -433,61 +429,6 @@ def run_kitter_rf_assignment_for_project(
         kit_count=int(kit_count),
         backup_path=backup_path,
     )
-
-
-def _prepare_full_flow_kits_without_attr109(
-    rk_kit_service,
-    parts: list[object],
-    *,
-    rpd_path: str,
-    donor_template_path: str,
-    bak_dirname: str,
-    kits_dirname: str,
-    kit_to_priority: dict[str, str],
-    progress_cb: Callable[[int, int, str], None] | None = None,
-) -> int:
-    def _kit_progress(done: int, total: int, status: str) -> None:
-        if progress_cb is None:
-            return
-        progress_cb(int(done), int(total), str(status))
-
-    rk_kit_service.apply_balance_and_update_kit_texts(
-        parts,
-        kits_dirname=kits_dirname,
-        kit_to_priority=kit_to_priority,
-    )
-
-    if not os.path.exists(donor_template_path):
-        raise RuntimeError(f"Donor not found: {donor_template_path}")
-
-    base_dir = os.path.dirname(rpd_path)
-    kits_backup_dir = os.path.join(base_dir, bak_dirname, "kits")
-    rk_kit_service.ensure_dir(kits_backup_dir)
-    kits_to_parts = rk_kit_service.sym_io.group_parts_by_kit(
-        parts=parts,
-        sanitize_kit_name=rk_kit_service.sanitize_kit_name,
-        is_valid_kit_name=rk_kit_service.is_valid_kit_name,
-    )
-
-    total_steps = max(1, len(kits_to_parts))
-    done_steps = 0
-    _kit_progress(done_steps, total_steps, "Preparing kits without updating RF kit-label Attr109 comments...")
-    for kit_label, part_rows in kits_to_parts.items():
-        status = "Skipping invalid kit label"
-        clean_kit = rk_kit_service.sanitize_kit_name(kit_label)
-        if clean_kit and rk_kit_service.is_valid_kit_name(clean_kit):
-            member_syms = [rk_kit_service.force_l_drive_path(part.sym) for part in part_rows]
-            out_path = rk_kit_service.kit_file_path_for_part_sym(part_rows[0].sym, clean_kit, kits_dirname)
-            rk_kit_service.sym_io.build_kit_sym_from_donor(
-                donor_path=donor_template_path,
-                member_part_syms=member_syms,
-                out_kit_sym_path=out_path,
-                backup_dir=kits_backup_dir,
-            )
-            status = f"Building kit: {clean_kit}"
-        done_steps += 1
-        _kit_progress(done_steps, total_steps, status)
-    return len(kits_to_parts)
 
 
 def build_all_packets_for_status(
@@ -586,20 +527,6 @@ def build_all_packets_for_status(
         cut_list_pages=int(cut_list_result.output_pages),
         assembly_context_path=assembly_context_path,
         sym_comment_updated_count=int(sym_comment_result.updated_count),
-    )
-
-
-def run_full_flow_before_nester(
-    status: KitStatus,
-    settings: ExplorerSettings,
-    *,
-    runtime_dir: Path,
-    progress_cb: ProgressCallback | None = None,
-) -> FullFlowResult:
-    raise FullFlowNeedsUserAction(
-        "Inventor report review is required before RADAN CSV import. "
-        "Run Inventor as a separate Full Flow phase, review the report on the UI thread, "
-        "then call run_full_flow_after_inventor_review()."
     )
 
 
