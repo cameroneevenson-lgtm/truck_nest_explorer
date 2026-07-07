@@ -90,6 +90,7 @@ from services import (
     filter_kit_statuses,
     filter_truck_numbers,
     find_fabrication_truck_dir,
+    build_project_block_transfer_plan,
     invalidate_status_cache_for_truck,
     is_hidden_kit,
     is_hidden_truck,
@@ -105,6 +106,7 @@ from services import (
     release_text_for_status,
     resolve_existing_inventor_csv,
     restore_truck_visibility,
+    send_project_block_files_to_machine,
     sort_truck_numbers_by_fabrication_order,
 )
 
@@ -1626,6 +1628,92 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertTrue(outputs.target_report_path.exists())
             self.assertFalse(source_csv.exists())
             self.assertFalse(source_report.exists())
+
+    def test_block_transfer_plan_matches_truncated_cnc_and_untruncates_target_name(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
+            project_dir = release_root / "F57524" / "CONSOLE PACK" / "F57524 CONSOLE PACK"
+            nests_dir = project_dir / "nests"
+            source_root = temp_root / "BLOCK FILES"
+            machine_root = temp_root / "A" / "EiaFiles" / "Battleshield" / "F-LARGE FLEET"
+            nests_dir.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            machine_root.mkdir(parents=True)
+            drg_path = nests_dir / "P1 F57524 CONSOLE PACK.drg"
+            drg_path.write_text("drg", encoding="utf-8")
+            source_path = source_root / "P1 F57524 CONSOLE PA.cnc"
+            source_path.write_text("block", encoding="utf-8")
+
+            plan = build_project_block_transfer_plan(
+                project_dir,
+                release_root,
+                source_root=source_root,
+                machine_root=machine_root,
+            )
+
+            self.assertEqual(len(plan.matches), 1)
+            self.assertEqual(plan.matches[0].source_path, source_path)
+            self.assertEqual(plan.matches[0].match_reason, "truncated_prefix")
+            self.assertEqual(plan.matches[0].target_path.name, "P1 F57524 CONSOLE PACK.cnc")
+            self.assertEqual(
+                plan.target_dir,
+                machine_root / "F57524" / "CONSOLE PACK",
+            )
+
+    def test_send_project_block_files_copies_full_name_then_deletes_source(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
+            project_dir = release_root / "F57524" / "CONSOLE PACK" / "F57524 CONSOLE PACK"
+            nests_dir = project_dir / "nests"
+            source_root = temp_root / "BLOCK FILES"
+            machine_root = temp_root / "A" / "EiaFiles" / "Battleshield" / "F-LARGE FLEET"
+            nests_dir.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            machine_root.mkdir(parents=True)
+            (nests_dir / "P1 F57524 CONSOLE PACK.drg").write_text("drg", encoding="utf-8")
+            source_path = source_root / "P1 F57524 CONSOLE PA.cnc"
+            source_path.write_text("block content", encoding="utf-8")
+
+            result = send_project_block_files_to_machine(
+                project_dir,
+                release_root,
+                source_root=source_root,
+                machine_root=machine_root,
+            )
+
+            target_path = (
+                machine_root
+                / "F57524"
+                / "CONSOLE PACK"
+                / "P1 F57524 CONSOLE PACK.cnc"
+            )
+            self.assertFalse(source_path.exists())
+            self.assertTrue(target_path.exists())
+            self.assertEqual(target_path.read_text(encoding="utf-8"), "block content")
+            self.assertEqual(result.transferred_paths, (target_path,))
+            self.assertFalse(result.canceled)
+
+    def test_block_transfer_plan_fails_cleanly_when_machine_root_is_unavailable(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
+            project_dir = release_root / "F57524" / "CONSOLE PACK" / "F57524 CONSOLE PACK"
+            nests_dir = project_dir / "nests"
+            source_root = temp_root / "BLOCK FILES"
+            machine_root = temp_root / "A" / "EiaFiles" / "Battleshield" / "F-LARGE FLEET"
+            nests_dir.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            (nests_dir / "P1 F57524 CONSOLE PACK.drg").write_text("drg", encoding="utf-8")
+            source_path = source_root / "P1 F57524 CONSOLE PA.cnc"
+            source_path.write_text("block content", encoding="utf-8")
+
+            with self.assertRaisesRegex(FileNotFoundError, "Machine block destination is not available"):
+                build_project_block_transfer_plan(
+                    project_dir,
+                    release_root,
+                    source_root=source_root,
+                    machine_root=machine_root,
+                )
+            self.assertTrue(source_path.exists())
 
     def test_w_drive_guard_allows_only_owned_inventor_outputs(self) -> None:
         spreadsheet = Path(r"W:\LASER\TruckBom.xlsx")

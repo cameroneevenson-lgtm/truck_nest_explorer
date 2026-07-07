@@ -85,6 +85,7 @@ from services import (
     clear_performance_caches,
     collect_kit_statuses,
     configured_kit_mappings,
+    build_project_block_transfer_plan,
     create_kit_scaffold,
     detect_assembly_packet_pdf,
     detect_cut_list_packet_pdf,
@@ -108,6 +109,7 @@ from services import (
     release_text_for_status,
     resolve_existing_inventor_csv,
     restore_truck_visibility,
+    send_project_block_files_to_machine,
     sort_truck_numbers_by_fabrication_order,
     visible_radan_sessions,
 )
@@ -205,6 +207,7 @@ class MainWindow(QMainWindow):
         self._active_packet_build_keys: set[tuple[str, str]] = set()
         self._packet_build_running = False
         self._packet_build_worker = None
+        self._block_file_worker: BackgroundJobWorker | None = None
         self._status_cache_by_truck: BoundedTTLCache[list[KitStatus]] = BoundedTTLCache(
             "ui_status",
             max_size=128,
@@ -269,6 +272,7 @@ class MainWindow(QMainWindow):
             "build_assembly_packet_button",
             "build_cut_list_button",
             "launch_kitter_button",
+            "send_blocks_button",
             "launch_inventor_button",
             "import_csv_button",
             "radan_dxf_source_slider",
@@ -561,6 +565,7 @@ class MainWindow(QMainWindow):
         truck_row.addStretch(1)
 
         kit_row = QHBoxLayout()
+        production_row = QHBoxLayout()
         self.open_release_folder_button = QPushButton("Open L Kit")
         self.open_release_folder_button.setToolTip("Open the selected kit folder on L.")
         self.open_release_folder_button.clicked.connect(self.open_selected_release_folder)
@@ -593,6 +598,11 @@ class MainWindow(QMainWindow):
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
+        self.send_blocks_button = QPushButton("Send Blocks")
+        self.send_blocks_button.setToolTip(
+            "Copy this project's block files to the machine folder, then delete the source block files after each copy verifies."
+        )
+        self.send_blocks_button.clicked.connect(self.send_selected_block_files_to_machine)
         self.launch_inventor_button = QPushButton("Run Inventor Tool")
         self.launch_inventor_button.setToolTip(
             "Run the Inventor-to-RADAN launcher on the selected spreadsheet, then move the generated output into the matching L project folder."
@@ -641,12 +651,18 @@ class MainWindow(QMainWindow):
             self.build_print_packet_button,
             self.build_assembly_packet_button,
             self.build_cut_list_button,
-            self.launch_kitter_button,
-            self.launch_inventor_button,
-            self.toggle_selected_kits_hidden_button,
         ):
             kit_row.addWidget(button)
         kit_row.addStretch(1)
+
+        for button in (
+            self.launch_kitter_button,
+            self.send_blocks_button,
+            self.launch_inventor_button,
+            self.toggle_selected_kits_hidden_button,
+        ):
+            production_row.addWidget(button)
+        production_row.addStretch(1)
 
         radan_row = QHBoxLayout()
         radan_row.addWidget(QLabel("RADAN CSV:"))
@@ -668,6 +684,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(actions_helper_label)
         layout.addLayout(truck_row)
         layout.addLayout(kit_row)
+        layout.addLayout(production_row)
         layout.addLayout(radan_row)
         return group
 
@@ -2021,6 +2038,7 @@ class MainWindow(QMainWindow):
         )
         self._refresh_details_pane()
         self._refresh_packet_build_button_states()
+        self._refresh_send_blocks_button_state()
         full_flow_controller = getattr(self, "full_flow_controller", None)
         if full_flow_controller is not None:
             full_flow_controller.reapply_action_lock()
@@ -2660,6 +2678,31 @@ class MainWindow(QMainWindow):
                     "Use the packet cell in the table to open it, or delete the packet file before rebuilding."
                 )
 
+    def _refresh_send_blocks_button_state(self) -> None:
+        button = getattr(self, "send_blocks_button", None)
+        if not isinstance(button, QPushButton):
+            return
+        if self._block_file_worker is not None:
+            button.setEnabled(False)
+            button.setText("Sending Blocks...")
+            button.setToolTip("Block files are being copied to the machine.")
+            return
+        status = self._current_status()
+        button.setText("Send Blocks")
+        if status is None:
+            button.setEnabled(False)
+            button.setToolTip("Select a kit first.")
+            return
+        if status.paths.project_dir is None or not status.paths.project_dir.exists():
+            button.setEnabled(False)
+            button.setToolTip("The selected kit does not have an L-side project folder yet.")
+            return
+        button.setEnabled(True)
+        button.setToolTip(
+            "Copy this project's matched block files to the mirrored A: machine folder, "
+            "write full DRG-based file names, then delete each source block file after the copy verifies."
+        )
+
     def _show_existing_packet_feedback(
         self,
         *,
@@ -3283,6 +3326,148 @@ class MainWindow(QMainWindow):
 
     def run_selected_inventor_flow(self) -> None:
         self.inventor_controller.start_selected()
+
+    def send_selected_block_files_to_machine(self) -> None:
+        title = "Send Blocks"
+        if self._block_file_worker is not None:
+            QMessageBox.information(self, title, "Block files are already being sent to the machine.")
+            return
+        status = self._current_status()
+        if status is None:
+            QMessageBox.information(self, title, "Select a kit first.")
+            return
+        if status.paths.project_dir is None or not status.paths.project_dir.exists():
+            QMessageBox.warning(self, title, "The selected kit does not have an L-side project folder yet.")
+            return
+        try:
+            plan = build_project_block_transfer_plan(status.paths.project_dir, self.settings.release_root)
+        except Exception as exc:
+            QMessageBox.warning(self, title, str(exc))
+            return
+        if not plan.drg_paths:
+            QMessageBox.information(
+                self,
+                title,
+                f"No nest .drg files were found under:\n{status.paths.project_dir}",
+            )
+            return
+        if not plan.matches:
+            missing = "\n".join(path.name for path in plan.missing_drg_paths[:20])
+            if len(plan.missing_drg_paths) > 20:
+                missing += f"\n... (+{len(plan.missing_drg_paths) - 20} more)"
+            QMessageBox.information(
+                self,
+                title,
+                "No matching block .cnc files were found.\n\n"
+                f"Source:\n{plan.source_root}\n\n"
+                f"Missing for:\n{missing or '(none)'}",
+            )
+            return
+
+        matched_lines = [
+            f"- {match.source_path.name} -> {match.target_path.name}"
+            for match in plan.matches[:12]
+        ]
+        if len(plan.matches) > 12:
+            matched_lines.append(f"... (+{len(plan.matches) - 12} more)")
+        missing_text = ""
+        if plan.missing_drg_paths:
+            missing_lines = [path.name for path in plan.missing_drg_paths[:8]]
+            if len(plan.missing_drg_paths) > 8:
+                missing_lines.append(f"... (+{len(plan.missing_drg_paths) - 8} more)")
+            missing_text = (
+                "\n\nNo matching block file was found for these nest drawing(s):\n"
+                + "\n".join(missing_lines)
+            )
+        choice = QMessageBox.warning(
+            self,
+            title,
+            "Send matched block files to the machine?\n\n"
+            f"Destination:\n{plan.target_dir}\n\n"
+            "Each file will be copied using the full nest .drg name, verified, then deleted from "
+            f"{plan.source_root}. Existing machine files with the same names will be overwritten.\n\n"
+            + "\n".join(matched_lines)
+            + missing_text,
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if choice != QMessageBox.Ok:
+            self.log("Send Blocks cancelled before transfer.")
+            return
+
+        progress = QProgressDialog("Sending block files to the machine...", "Cancel", 0, len(plan.matches), self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        def _job(worker: BackgroundJobWorker):
+            return send_project_block_files_to_machine(
+                status.paths.project_dir,
+                self.settings.release_root,
+                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
+                should_cancel_cb=worker.should_cancel,
+            )
+
+        worker = BackgroundJobWorker(_job)
+        self._block_file_worker = worker
+        self._refresh_send_blocks_button_state()
+
+        def _cleanup() -> None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            self._block_file_worker = None
+            self._refresh_send_blocks_button_state()
+
+        def _on_progress(done: int, total: int, status_text: str) -> None:
+            if int(total) <= 0:
+                progress.setRange(0, 0)
+            else:
+                progress.setRange(0, int(total))
+                progress.setValue(max(0, min(int(total), int(done))))
+            progress.setLabelText(f"Sending block files to the machine...\n{status_text}")
+
+        def _on_done(payload: object) -> None:
+            _cleanup()
+            result = payload
+            transferred_paths = tuple(getattr(result, "transferred_paths", ()) or ())
+            skipped_paths = tuple(getattr(result, "skipped_paths", ()) or ())
+            result_plan = getattr(result, "plan", plan)
+            if bool(getattr(result, "canceled", False)):
+                QMessageBox.information(
+                    self,
+                    title,
+                    f"Send Blocks was canceled.\n\nSent: {len(transferred_paths)}\nSkipped: {len(skipped_paths)}",
+                )
+                self.log(
+                    f"Send Blocks canceled for {status.paths.display_name}; "
+                    f"sent {len(transferred_paths)}, skipped {len(skipped_paths)}."
+                )
+                return
+            QMessageBox.information(
+                self,
+                title,
+                f"Sent {len(transferred_paths)} block file(s) to:\n{getattr(result_plan, 'target_dir', plan.target_dir)}",
+            )
+            self.log(
+                f"Sent {len(transferred_paths)} block file(s) for {status.paths.display_name} to "
+                f"{getattr(result_plan, 'target_dir', plan.target_dir)}."
+            )
+
+        def _on_error(traceback_text: str) -> None:
+            _cleanup()
+            message = str(traceback_text or "").strip() or "Send Blocks failed."
+            QMessageBox.critical(self, title, message)
+            self.log(f"Send Blocks failed for {status.paths.display_name}: {message}")
+
+        progress.canceled.connect(worker.request_stop)
+        worker.signals.progress.connect(_on_progress)
+        worker.signals.done.connect(_on_done)
+        worker.signals.error.connect(_on_error)
+        QThreadPool.globalInstance().start(worker)
 
     def import_selected_csv_to_radan(self) -> None:
         use_cleaned_dxf = (

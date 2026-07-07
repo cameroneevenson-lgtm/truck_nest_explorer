@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
@@ -51,6 +52,8 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 """
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
+DEFAULT_BLOCK_FILES_ROOT = Path(r"L:\BATTLESHIELD\BLOCK FILES")
+DEFAULT_MACHINE_EIA_ROOT = Path(r"A:\EiaFiles\Battleshield\F-LARGE FLEET")
 FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
 TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
@@ -77,6 +80,34 @@ class InventorToRadanInlineNeedsUi(RuntimeError):
         self.missing_dxf_count = missing_dxf_count
         self.missing_rule_count = missing_rule_count
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class BlockFileMatch:
+    drg_path: Path
+    source_path: Path
+    target_path: Path
+    match_reason: str
+
+
+@dataclass(frozen=True)
+class BlockFileTransferPlan:
+    project_dir: Path
+    source_root: Path
+    machine_root: Path
+    target_dir: Path
+    drg_paths: tuple[Path, ...]
+    matches: tuple[BlockFileMatch, ...]
+    missing_drg_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class BlockFileTransferResult:
+    plan: BlockFileTransferPlan
+    operation: str
+    transferred_paths: tuple[Path, ...]
+    skipped_paths: tuple[Path, ...]
+    canceled: bool = False
 
 
 def is_w_drive_path(path: Path | str) -> bool:
@@ -1695,6 +1726,201 @@ def _move_or_replace(
         target_path.unlink()
     shutil.move(str(source_path), str(target_path))
     return target_path
+
+
+def _normalize_block_match_stem(value: str) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _relative_path_case_insensitive(path: Path, root: Path) -> Path:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        path_text = str(path).replace("/", "\\").rstrip("\\")
+        root_text = str(root).replace("/", "\\").rstrip("\\")
+        root_prefix = f"{root_text}\\"
+        if path_text.casefold().startswith(root_prefix.casefold()):
+            return Path(*PureWindowsPath(path_text[len(root_prefix) :]).parts)
+        raise ValueError(f"{path} is not under {root}") from None
+
+
+def machine_block_project_dir(
+    project_dir: Path | str,
+    release_root: Path | str,
+    *,
+    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
+) -> Path:
+    project = Path(str(project_dir))
+    release = Path(str(release_root))
+    root = Path(str(machine_root))
+    # RPD projects live one folder below the shop-facing kit folder
+    # (for example F57524\CONSOLE PACK\F57524 CONSOLE PACK). The machine
+    # expects block files in the kit folder, not inside that inner project folder.
+    relative_kit_folder = _relative_path_case_insensitive(project.parent, release)
+    return root / relative_kit_folder
+
+
+def discover_project_drg_paths(project_dir: Path | str) -> tuple[Path, ...]:
+    project = Path(str(project_dir))
+    if not project.exists():
+        raise FileNotFoundError(str(project))
+    nests_dir = project / "nests"
+    search_root = nests_dir if nests_dir.exists() else project
+    return tuple(
+        sorted(
+            (
+                path
+                for path in search_root.rglob("*")
+                if path.is_file() and path.suffix.casefold() == ".drg"
+            ),
+            key=lambda item: str(item).casefold(),
+        )
+    )
+
+
+def _discover_block_files(source_root: Path) -> tuple[Path, ...]:
+    return tuple(
+        sorted(
+            (
+                path
+                for path in source_root.iterdir()
+                if path.is_file() and path.suffix.casefold() == ".cnc"
+            ),
+            key=lambda item: str(item).casefold(),
+        )
+    )
+
+
+def _block_match_for_drg(drg_path: Path, block_files: tuple[Path, ...]) -> tuple[Path | None, str]:
+    drg_stem = _normalize_block_match_stem(drg_path.stem)
+    candidates: list[tuple[int, str, Path]] = []
+    for block_path in block_files:
+        block_stem = _normalize_block_match_stem(block_path.stem)
+        if not block_stem:
+            continue
+        if block_stem == drg_stem:
+            candidates.append((len(block_stem), "exact_stem", block_path))
+        elif drg_stem.startswith(block_stem):
+            candidates.append((len(block_stem), "truncated_prefix", block_path))
+    if not candidates:
+        return None, ""
+    candidates.sort(key=lambda item: (item[0], item[1] == "exact_stem"), reverse=True)
+    best_length = candidates[0][0]
+    best = [candidate for candidate in candidates if candidate[0] == best_length]
+    if len(best) > 1:
+        names = ", ".join(path.name for _length, _reason, path in best)
+        raise ValueError(f"Multiple block files match {drg_path.name}: {names}")
+    _length, reason, path = best[0]
+    return path, reason
+
+
+def build_project_block_transfer_plan(
+    project_dir: Path | str,
+    release_root: Path | str,
+    *,
+    source_root: Path | str = DEFAULT_BLOCK_FILES_ROOT,
+    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
+) -> BlockFileTransferPlan:
+    project = Path(str(project_dir))
+    source = Path(str(source_root))
+    machine = Path(str(machine_root))
+    if not project.exists():
+        raise FileNotFoundError(str(project))
+    if not source.exists():
+        raise FileNotFoundError(f"Block file source folder is not available: {source}")
+    if not machine.exists():
+        raise FileNotFoundError(f"Machine block destination is not available: {machine}")
+    target_dir = machine_block_project_dir(project, release_root, machine_root=machine)
+    drg_paths = discover_project_drg_paths(project)
+    block_files = _discover_block_files(source)
+    matches: list[BlockFileMatch] = []
+    missing: list[Path] = []
+    used_sources: set[str] = set()
+    for drg_path in drg_paths:
+        source_path, reason = _block_match_for_drg(drg_path, block_files)
+        if source_path is None:
+            missing.append(drg_path)
+            continue
+        source_key = normalize_cache_path(source_path)
+        if source_key in used_sources:
+            raise ValueError(f"Block file {source_path.name} matches more than one DRG.")
+        used_sources.add(source_key)
+        # The post output can truncate names; write the machine copy with the full DRG stem.
+        target_path = target_dir / f"{drg_path.stem}{source_path.suffix}"
+        matches.append(
+            BlockFileMatch(
+                drg_path=drg_path,
+                source_path=source_path,
+                target_path=target_path,
+                match_reason=reason,
+            )
+        )
+    return BlockFileTransferPlan(
+        project_dir=project,
+        source_root=source,
+        machine_root=machine,
+        target_dir=target_dir,
+        drg_paths=drg_paths,
+        matches=tuple(matches),
+        missing_drg_paths=tuple(missing),
+    )
+
+
+def send_project_block_files_to_machine(
+    project_dir: Path | str,
+    release_root: Path | str,
+    *,
+    source_root: Path | str = DEFAULT_BLOCK_FILES_ROOT,
+    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
+    progress_cb=None,
+    should_cancel_cb=None,
+) -> BlockFileTransferResult:
+    plan = build_project_block_transfer_plan(
+        project_dir,
+        release_root,
+        source_root=source_root,
+        machine_root=machine_root,
+    )
+    if not plan.matches:
+        return BlockFileTransferResult(
+            plan=plan,
+            operation="copy_then_delete",
+            transferred_paths=(),
+            skipped_paths=(),
+        )
+    plan.target_dir.mkdir(parents=True, exist_ok=True)
+    transferred: list[Path] = []
+    skipped: list[Path] = []
+    total = len(plan.matches)
+    for index, match in enumerate(plan.matches, start=1):
+        if should_cancel_cb is not None and should_cancel_cb():
+            skipped.extend(item.source_path for item in plan.matches[index - 1 :])
+            return BlockFileTransferResult(
+                plan=plan,
+                operation="copy_then_delete",
+                transferred_paths=tuple(transferred),
+                skipped_paths=tuple(skipped),
+                canceled=True,
+            )
+        if progress_cb is not None:
+            progress_cb(index - 1, total, f"Sending {match.source_path.name}")
+        if match.target_path.exists():
+            match.target_path.unlink()
+        shutil.copy2(match.source_path, match.target_path)
+        if not match.target_path.exists() or match.target_path.stat().st_size != match.source_path.stat().st_size:
+            raise RuntimeError(f"Copied block file did not verify: {match.target_path}")
+        match.source_path.unlink()
+        transferred.append(match.target_path)
+        if progress_cb is not None:
+            progress_cb(index, total, f"Sent {match.target_path.name}")
+    invalidate_filesystem_cache_for_paths(tuple(transferred))
+    invalidate_filesystem_cache_for_path(plan.source_root)
+    return BlockFileTransferResult(
+        plan=plan,
+        operation="copy_then_delete",
+        transferred_paths=tuple(transferred),
+        skipped_paths=tuple(skipped),
+    )
 
 
 def move_inventor_outputs_to_project(
