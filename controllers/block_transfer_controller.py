@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtWidgets import QMessageBox, QProgressDialog, QPushButton
 
@@ -55,8 +57,9 @@ class BlockTransferController:
         if status.paths.project_dir is None or not status.paths.project_dir.exists():
             QMessageBox.warning(self.window, title, "The selected kit does not have an L-side project folder yet.")
             return
+        release_root = self._release_root_for_status(status)
         try:
-            plan = build_project_block_transfer_plan(status.paths.project_dir, self.window.settings.release_root)
+            plan = build_project_block_transfer_plan(status.paths.project_dir, release_root)
         except Exception as exc:
             QMessageBox.warning(self.window, title, str(exc))
             return
@@ -147,7 +150,7 @@ class BlockTransferController:
         def _job(worker: BackgroundJobWorker):
             return send_project_block_files_to_machine(
                 status.paths.project_dir,
-                self.window.settings.release_root,
+                release_root,
                 progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
                 should_cancel_cb=worker.should_cancel,
             )
@@ -215,3 +218,13 @@ class BlockTransferController:
         worker.signals.done.connect(_on_done)
         worker.signals.error.connect(_on_error)
         QThreadPool.globalInstance().start(worker)
+
+    def _release_root_for_status(self, status) -> Path | str:
+        paths = getattr(status, "paths", None)
+        release_truck_dir = getattr(paths, "release_truck_dir", None)
+        if release_truck_dir is not None:
+            return Path(str(release_truck_dir)).parent
+        project_dir = getattr(paths, "project_dir", None)
+        if project_dir is not None:
+            return Path(str(project_dir)).parent.parent.parent
+        return self.window.settings.release_root

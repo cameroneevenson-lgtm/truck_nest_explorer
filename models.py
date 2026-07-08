@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 
 DEFAULT_RELEASE_ROOT = r"L:\BATTLESHIELD\F-LARGE FLEET"
+DEFAULT_P_RELEASE_ROOT = r"L:\BATTLESHIELD\P-SMALL FLEET"
 DEFAULT_FABRICATION_ROOT = r"W:\LASER\For Battleshield Fabrication"
 DEFAULT_DASHBOARD_LAUNCHER = r"C:\Tools\fabrication_flow_dashboard\run_app.bat"
 DEFAULT_RADAN_KITTER_LAUNCHER = r"C:\Tools\radan_kitter\radan_kitter.bat"

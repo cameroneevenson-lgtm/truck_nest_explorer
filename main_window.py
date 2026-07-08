@@ -81,6 +81,7 @@ from services import (
     is_hidden_truck,
     launch_launcher,
     open_path,
+    release_root_for_job,
     release_text_for_status,
     restore_truck_visibility,
     sort_truck_numbers_by_fabrication_order,
@@ -2233,8 +2234,8 @@ class MainWindow(QMainWindow):
         if not truck_number:
             QMessageBox.information(self, "Open Truck Release", "Select a truck first.")
             return
-        release_root = Path(self.settings.release_root)
-        if not release_root.exists():
+        release_root = release_root_for_job(truck_number, self.settings)
+        if release_root is None or not release_root.exists():
             QMessageBox.warning(self, "Open Truck Release", f"Release root not found:\n{release_root}")
             return
         self._open_path_with_message(release_root / truck_number)

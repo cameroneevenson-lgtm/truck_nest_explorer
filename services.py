@@ -15,6 +15,7 @@ from pathlib import Path, PureWindowsPath
 
 from models import (
     DEFAULT_SUPPORT_FOLDERS,
+    DEFAULT_P_RELEASE_ROOT,
     ExplorerSettings,
     InventorOutputPaths,
     KitMapping,
@@ -481,6 +482,35 @@ def _path_from_setting(value: str) -> Path | None:
     return Path(text)
 
 
+def release_root_for_job(truck_number: str, settings: ExplorerSettings) -> Path | None:
+    truck = normalize_hidden_truck_number(truck_number)
+    if truck.startswith("P"):
+        configured_root = _path_from_setting(settings.release_root)
+        if configured_root is not None:
+            parent = configured_root.parent
+            p_root = parent / PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name
+            if p_root.exists():
+                return p_root
+        return Path(DEFAULT_P_RELEASE_ROOT)
+    return _path_from_setting(settings.release_root)
+
+
+def _release_roots_for_discovery(settings: ExplorerSettings) -> tuple[Path, ...]:
+    root = _path_from_setting(settings.release_root)
+    if root is None:
+        return ()
+    candidates = (root, root.parent / PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name)
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = normalize_cache_path(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(candidate)
+    return tuple(roots)
+
+
 def _existing_named_child(
     parent: Path | None,
     candidate_names: tuple[str, ...],
@@ -558,7 +588,7 @@ def build_kit_paths(
     kit_name_candidates = kit_name_variants(kit_text) or (kit_text,)
     project_name_candidates = tuple(f"{truck_text} {name}".strip() for name in kit_name_candidates)
     project_name = project_name_candidates[0]
-    release_root = _path_from_setting(settings.release_root)
+    release_root = release_root_for_job(truck_text, settings)
     fabrication_root = _path_from_setting(settings.fabrication_root)
 
     release_truck_dir = release_root / truck_text if release_root else None
@@ -625,8 +655,9 @@ def build_kit_paths(
 
 def discover_trucks(settings: ExplorerSettings) -> list[str]:
     names: set[str] = set()
-    root = _path_from_setting(settings.release_root)
-    if root is not None and cached_path_exists(root):
+    for root in _release_roots_for_discovery(settings):
+        if not cached_path_exists(root):
+            continue
         try:
             GLOBAL_METRICS.record_filesystem_check()
             with os.scandir(root) as entries:

@@ -4,13 +4,13 @@ import csv
 from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import sys
 from typing import Callable, Optional, Sequence
 import xml.etree.ElementTree as ET
 
-from models import ExplorerSettings
+from models import DEFAULT_P_RELEASE_ROOT, ExplorerSettings
 
 DEFAULT_PACKET_OUT_DIR = "_out"
 ASSEMBLY_PACKET_PREFIX = "AssemblyPacket_TABLOID"
@@ -741,6 +741,12 @@ def _configure_asset_lookup(rk_assets, settings: ExplorerSettings) -> None:
     if release_root and fabrication_root:
         eng_release_map.append((release_root, fabrication_root))
         release_parent = os.path.dirname(release_root.rstrip("\\/"))
+        if release_parent:
+            p_release_root = os.path.normpath(
+                os.path.join(release_parent, PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name)
+            )
+            if p_release_root.lower() != release_root.lower():
+                eng_release_map.append((p_release_root, fabrication_root))
         if release_parent and release_parent.lower() != release_root.lower():
             eng_release_map.append((release_parent, fabrication_root))
 

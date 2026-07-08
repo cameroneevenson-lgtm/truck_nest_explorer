@@ -60,6 +60,7 @@ from models import (
 from performance_metrics import BoundedTTLCache, performance_snapshot, reset_performance_metrics
 from packet_build_service import (
     PacketBuildReadinessError,
+    _configure_asset_lookup,
     apply_assembly_context_to_sym_comments,
     assembly_comment_shorthand,
     build_assembly_packet,
@@ -103,6 +104,7 @@ from services import (
     odd_job_names_for_truck,
     radan_csv_missing_symbols,
     radan_csv_import_lock_status,
+    release_root_for_job,
     run_inventor_to_radan_inline,
     release_text_for_status,
     resolve_existing_inventor_csv,
@@ -710,6 +712,26 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             str(paths.fabrication_kit_dir),
             r"W:\LASER\For Battleshield Fabrication\F55334\PUMP PACK\BRACKETS",
         )
+
+    def test_build_kit_paths_routes_p_jobs_to_p_small_fleet_release_root(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            f_root = release_parent / "F-LARGE FLEET"
+            p_root = release_parent / "P-SMALL FLEET"
+            fabrication_root = temp_root / "W"
+            p_root.mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(f_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            paths = build_kit_paths("P12345", "DRIVER PACK", settings)
+
+            self.assertEqual(release_root_for_job("P12345", settings), p_root)
+            self.assertEqual(paths.release_truck_dir, p_root / "P12345")
+            self.assertEqual(paths.release_kit_dir, p_root / "P12345" / "DRIVER PACK")
+            self.assertEqual(paths.project_dir, p_root / "P12345" / "DRIVER PACK" / "P12345 DRIVER PACK")
+            self.assertEqual(paths.fabrication_kit_dir, fabrication_root / "P12345" / "DRIVER PACK")
 
     def test_collect_kit_statuses_respects_configured_canonical_order(self) -> None:
         settings = ExplorerSettings(
@@ -1339,6 +1361,32 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(context.resolve_asset_fn(str(sym_path), ".pdf"), str(part_pdf))
             self.assertEqual(context.assembly_source_pdfs, ())
 
+    def test_configure_asset_lookup_maps_p_small_fleet_paths_to_w_job_root(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            release_root = release_parent / "F-LARGE FLEET"
+            p_release_root = release_parent / "P-SMALL FLEET"
+            fabrication_root = temp_root / "W"
+            calls: list[dict[str, object]] = []
+
+            fake_assets = SimpleNamespace(
+                configure_release_mapping=lambda **kwargs: calls.append(kwargs),
+            )
+
+            _configure_asset_lookup(
+                fake_assets,
+                ExplorerSettings(
+                    release_root=str(release_root),
+                    fabrication_root=str(fabrication_root),
+                ),
+            )
+
+            self.assertEqual(len(calls), 1)
+            self.assertIn(
+                (os.path.normpath(str(p_release_root)), os.path.normpath(str(fabrication_root))),
+                calls[0]["eng_release_map"],
+            )
+
     def test_prepare_packet_build_context_collects_unused_tabloid_assembly_pdfs_from_project_dir(self) -> None:
         with workspace_tempdir() as temp_root:
             settings = ExplorerSettings(
@@ -1834,6 +1882,25 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     machine_root=machine_root,
                 )
             self.assertTrue(source_path.exists())
+
+    def test_block_transfer_controller_uses_status_release_root_for_p_jobs(self) -> None:
+        from controllers.block_transfer_controller import BlockTransferController
+
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            f_root = release_parent / "F-LARGE FLEET"
+            p_root = release_parent / "P-SMALL FLEET"
+            project_dir = p_root / "P12345" / "DRIVER PACK" / "P12345 DRIVER PACK"
+            controller = object.__new__(BlockTransferController)
+            controller.window = SimpleNamespace(settings=ExplorerSettings(release_root=str(f_root)))
+            status = SimpleNamespace(
+                paths=SimpleNamespace(
+                    release_truck_dir=p_root / "P12345",
+                    project_dir=project_dir,
+                )
+            )
+
+            self.assertEqual(controller._release_root_for_status(status), p_root)
 
     def test_w_drive_guard_allows_only_owned_inventor_outputs(self) -> None:
         spreadsheet = Path(r"W:\LASER\TruckBom.xlsx")
@@ -2347,12 +2414,33 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertIn(job, trucks)
 
+    def test_discover_trucks_includes_p_small_fleet_job_folder(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            release_root = release_parent / "F-LARGE FLEET"
+            p_release_root = release_parent / "P-SMALL FLEET"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            release_root.mkdir(parents=True)
+            (p_release_root / job).mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            trucks = discover_trucks(settings)
+
+            self.assertIn(job, trucks)
+
     def test_collect_kit_statuses_for_nonstandard_job_uses_w_side_subfolders(self) -> None:
         with workspace_tempdir() as temp_root:
-            release_root = temp_root / "release"
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            release_root = release_parent / "F-LARGE FLEET"
+            p_release_root = release_parent / "P-SMALL FLEET"
             fabrication_root = temp_root / "fab"
             job = "P12345"
             job_dir = fabrication_root / job
+            p_release_root.mkdir(parents=True)
             for kit_name in ("ALPHA KIT", "BRAVO KIT", "CHARLIE KIT"):
                 kit_dir = job_dir / kit_name
                 kit_dir.mkdir(parents=True)
@@ -2370,6 +2458,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             )
             first_status = statuses[0]
             self.assertEqual(first_status.paths.fabrication_kit_dir, job_dir / "ALPHA KIT")
+            self.assertEqual(first_status.paths.release_kit_dir, p_release_root / job / "ALPHA KIT")
             self.assertTrue(first_status.paths.rpd_path is not None and first_status.paths.rpd_path.exists())
             self.assertEqual(first_status.spreadsheet_match.chosen_path, job_dir / "ALPHA KIT" / "ALPHA KIT.xlsx")
 
