@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -362,29 +361,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        main_column = QWidget()
-        main_layout = QVBoxLayout(main_column)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(10)
-        main_layout.addWidget(self._build_actions_group())
-        main_layout.addWidget(self._build_table_group(), 1)
-
-        sidebar_column = QWidget()
-        sidebar_column.setMinimumWidth(280)
-        sidebar_layout = QVBoxLayout(sidebar_column)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(10)
-        sidebar_layout.addWidget(self._build_details_group(), 1)
-
-        content_splitter = QSplitter(Qt.Horizontal)
-        content_splitter.setChildrenCollapsible(False)
-        content_splitter.addWidget(main_column)
-        content_splitter.addWidget(sidebar_column)
-        content_splitter.setStretchFactor(0, 1)
-        content_splitter.setStretchFactor(1, 0)
-        content_splitter.setSizes([1180, 320])
-
-        layout.addWidget(content_splitter, 1)
+        layout.addWidget(self._build_actions_group())
+        layout.addWidget(self._build_table_group(), 1)
         return box
 
     def _build_actions_group(self) -> QWidget:
@@ -581,31 +559,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.kit_table)
         return group
 
-    def _build_details_group(self) -> QWidget:
-        group = QGroupBox("Selection Summary")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        self.details_summary_label = QLabel("No truck selected")
-        self.details_summary_label.setWordWrap(True)
-        self.details_summary_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #0F172A;")
-
-        self.details_helper_label = QLabel("Choose a truck to inspect status, readiness, and likely next actions.")
-        self.details_helper_label.setWordWrap(True)
-        self.details_helper_label.setStyleSheet("color: #64748B;")
-
-        self.details_text = QPlainTextEdit()
-        self.details_text.setObjectName("details_text")
-        self.details_text.setReadOnly(True)
-        self.details_text.setPlaceholderText("Truck and kit summary will appear here.")
-
-        layout.addWidget(self.details_summary_label)
-        layout.addWidget(self.details_helper_label)
-        layout.addWidget(self.details_text, 1)
-        group.setMinimumHeight(220)
-        return group
-
     def _release_text_for_status(self, status: KitStatus) -> str:
         flow_insight = self._flow_insight_for_status(status)
         return release_text_for_status(
@@ -742,177 +695,6 @@ class MainWindow(QMainWindow):
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
         actions.append("Show Kit" if hidden else "Hide Kit")
         return ", ".join(actions) if actions else "(none)"
-
-    def _truck_rollup_lines(self) -> list[str]:
-        total_kits = len(self._all_statuses)
-        visible_kits = len(self._current_statuses)
-        complete = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Complete")
-        released = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Released")
-        not_released = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "Not released")
-        w_missing = sum(1 for status in self._all_statuses if self._release_text_for_status(status) == "W missing")
-        rpd_ready = sum(1 for status in self._all_statuses if status.rpd_exists)
-        bom_ambiguous = sum(
-            1 for status in self._all_statuses if status.spreadsheet_match.issue == "multiple_spreadsheets"
-        )
-        bom_missing = sum(
-            1
-            for status in self._all_statuses
-            if status.spreadsheet_match.chosen_path is None and status.spreadsheet_match.issue != "multiple_spreadsheets"
-        )
-        nest_ready = sum(1 for status in self._all_statuses if status.preview_pdf_match.chosen_path is not None)
-        print_packet_ready = sum(1 for status in self._all_statuses if self._print_packet_match_for_status(status).chosen_path is not None)
-        assembly_packet_ready = sum(
-            1 for status in self._all_statuses if self._assembly_packet_match_for_status(status).chosen_path is not None
-        )
-        cut_list_ready = sum(
-            1 for status in self._all_statuses if self._cut_list_match_for_status(status).chosen_path is not None
-        )
-        hidden_filtered = max(0, total_kits - visible_kits)
-        lines = [
-            f"Kits in truck: {total_kits}",
-            f"Kits visible in table: {visible_kits}",
-            f"Complete: {complete} | Released: {released} | Not released: {not_released} | W missing: {w_missing}",
-            f"Project files ready: {rpd_ready}/{total_kits}",
-            f"BOMs ambiguous: {bom_ambiguous} | Missing: {bom_missing}",
-            f"Nest summaries ready: {nest_ready}/{total_kits}",
-            f"Print packets ready: {print_packet_ready}/{total_kits} | Assembly packets ready: {assembly_packet_ready}/{total_kits} | Cut lists ready: {cut_list_ready}/{total_kits}",
-        ]
-        if hidden_filtered:
-            lines.append(f"Filtered out by hidden toggle: {hidden_filtered}")
-        return lines
-
-    def _selection_rollup_lines(self, statuses: list[KitStatus]) -> list[str]:
-        missing_projects = sum(1 for status in statuses if not status.project_folder_exists or not status.rpd_exists)
-        complete = sum(1 for status in statuses if self._release_text_for_status(status) == "Complete")
-        unreleased = sum(
-            1
-            for status in statuses
-            if self._release_text_for_status(status) in {"Not released", "W missing"}
-        )
-        bom_ambiguous = sum(
-            1 for status in statuses if status.spreadsheet_match.issue == "multiple_spreadsheets"
-        )
-        nest_missing = sum(1 for status in statuses if status.preview_pdf_match.chosen_path is None)
-        hidden_count = sum(
-            1
-            for status in statuses
-            if is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
-        )
-        lines = [
-            f"Selection size: {len(statuses)}",
-            f"Need repair: {missing_projects}",
-            f"Complete in flow: {complete}",
-            f"Not fully released yet: {unreleased}",
-            f"BOMs ambiguous: {bom_ambiguous}",
-            f"Nest summaries missing: {nest_missing}",
-        ]
-        if hidden_count:
-            lines.append(f"Already hidden: {hidden_count}")
-        return lines
-
-    def _kit_details_lines(self, status: KitStatus) -> list[str]:
-        flow_insight = self._flow_insight_for_status(status)
-        packet_match = self._print_packet_match_for_status(status)
-        assembly_packet_match = self._assembly_packet_match_for_status(status)
-        cut_list_match = self._cut_list_match_for_status(status)
-        lines = [
-            f"Kit: {status.paths.display_name}",
-            f"RADAN name: {status.kit_name}",
-            f"Kit hidden: {'Yes' if is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings) else 'No'}",
-            f"Status summary: {self._status_summary_for_display(status)}",
-            f"Release state: {self._release_text_for_status(status)}",
-            f"Flow status: {flow_insight.display_text or 'Not mapped'}",
-            f"Project setup: {'Ready' if status.rpd_exists else 'Needs repair'}",
-            (
-                f"Nest summary: {self._match_summary_text(chosen_path=status.preview_pdf_match.chosen_path, candidates=status.preview_pdf_match.candidates, missing_label='Missing')}"
-            ),
-            (
-                f"BOM: {self._match_summary_text(chosen_path=status.spreadsheet_match.chosen_path, candidates=status.spreadsheet_match.candidates, missing_label='Missing')}"
-            ),
-            (
-                f"Print packet: {self._match_summary_text(chosen_path=packet_match.chosen_path, candidates=packet_match.candidates, missing_label='Missing')}"
-            ),
-            (
-                f"Assembly packet: {self._match_summary_text(chosen_path=assembly_packet_match.chosen_path, candidates=assembly_packet_match.candidates, missing_label='Missing')}"
-            ),
-            (
-                f"Cut list: {self._match_summary_text(chosen_path=cut_list_match.chosen_path, candidates=cut_list_match.candidates, missing_label='Missing')}"
-            ),
-            f"Punch code: {self._punch_code_text_for_status(status) or '(blank)'}",
-            f"Notes: {self._note_text_for_status(status) or '(blank)'}",
-            "",
-            f"Available actions: {self._available_actions_for_status(status)}",
-            f"Recommended next step: {self._recommended_action_for_status(status)}",
-        ]
-        return lines
-
-    def _refresh_details_pane(self) -> None:
-        truck_number = self.current_truck_number()
-        selected_statuses = self._selected_statuses()
-
-        if not truck_number:
-            self.details_summary_label.setText("No truck selected")
-            self.details_helper_label.setText("Choose a truck to inspect status, readiness, and likely next actions.")
-            self.details_text.setPlainText(
-                "This panel follows the truck list and selected kit rows. It focuses on readiness, counts, and actions."
-            )
-            return
-
-        flow_summary = str(self._current_flow_truck_insight.summary_text or "").strip()
-        if flow_summary.casefold().startswith("flow:"):
-            flow_summary = flow_summary[5:].strip()
-        if not flow_summary:
-            flow_summary = "Unavailable"
-
-        loading_statuses = truck_number.casefold() in self._pending_status_by_truck
-
-        detail_lines = [
-            f"Truck: {truck_number}",
-            f"Client: {self._client_number_for_truck(truck_number) or '(not set)'}",
-            f"Truck hidden: {'Yes' if is_hidden_truck(truck_number, self.settings) else 'No'}",
-        ]
-        detail_lines.append(f"Truck flow: {flow_summary}")
-        if loading_statuses:
-            detail_lines.append("Kit statuses: loading...")
-        else:
-            detail_lines.extend(self._truck_rollup_lines())
-
-        if not selected_statuses:
-            self.details_summary_label.setText(f"{truck_number} overview")
-            if loading_statuses:
-                self.details_helper_label.setText("Kit summary will appear once the current truck finishes loading.")
-            elif self._current_statuses:
-                self.details_helper_label.setText("Select a kit row to see readiness and the next likely action.")
-            else:
-                self.details_helper_label.setText("No visible kits are currently available for this truck.")
-            self.details_text.setPlainText("\n".join(detail_lines))
-            return
-
-        if len(selected_statuses) == 1:
-            status = selected_statuses[0]
-            self.details_summary_label.setText(f"{status.paths.display_name} on {truck_number}")
-            self.details_helper_label.setText(self._status_summary_for_display(status))
-            detail_lines.extend(["", *self._kit_details_lines(status)])
-            self.details_text.setPlainText("\n".join(detail_lines))
-            return
-
-        selected_names = [status.paths.display_name for status in selected_statuses]
-        visible_names = ", ".join(selected_names[:6])
-        if len(selected_names) > 6:
-            visible_names = f"{visible_names}, +{len(selected_names) - 6} more"
-        self.details_summary_label.setText(f"{len(selected_statuses)} kits selected on {truck_number}")
-        self.details_helper_label.setText("Showing the selection rollup plus the first selected kit as a representative example.")
-        detail_lines.extend(
-            [
-                "",
-                f"Selected kits: {visible_names}",
-                *self._selection_rollup_lines(selected_statuses),
-                "",
-                "First selected kit:",
-                *self._kit_details_lines(selected_statuses[0]),
-            ]
-        )
-        self.details_text.setPlainText("\n".join(detail_lines))
 
     def _load_settings_into_form(self) -> None:
         return
@@ -1568,7 +1350,6 @@ class MainWindow(QMainWindow):
         finally:
             self.kit_table.setUpdatesEnabled(True)
             self._updating_kit_table = False
-        self._refresh_details_pane()
 
     def _on_kit_selection_changed(self) -> None:
         self._refresh_hidden_action_labels()
@@ -1643,7 +1424,6 @@ class MainWindow(QMainWindow):
             self.settings.punch_codes_by_kit = updated
             save_settings(self.settings)
             self.log(f"Saved punch code for {status.paths.display_name}.")
-            self._refresh_details_pane()
             return
 
         raw_text = item.text()
@@ -1653,7 +1433,6 @@ class MainWindow(QMainWindow):
             self.settings.notes_by_kit.pop(kit_key, None)
         save_settings(self.settings)
         self.log(f"Saved notes for {status.paths.display_name}.")
-        self._refresh_details_pane()
 
     def _on_kit_table_item_activated(self, item: QTableWidgetItem) -> None:
         row = item.row()
@@ -1903,7 +1682,6 @@ class MainWindow(QMainWindow):
         self.toggle_selected_kits_hidden_button.setText(
             "Show Kits" if selected_hidden else "Hide Kits"
         )
-        self._refresh_details_pane()
         packet_build_controller = getattr(self, "packet_build_controller", None)
         if packet_build_controller is not None:
             packet_build_controller.refresh_button_states()
