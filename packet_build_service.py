@@ -654,6 +654,73 @@ def _revision_base_stem(stem: str) -> str:
     return base if base and base != stem else ""
 
 
+def _asset_stem(path_text: str) -> str:
+    text = str(path_text or "").strip()
+    if not text:
+        return ""
+    return PureWindowsPath(text).stem or Path(text).stem
+
+
+def _pdf_part_stem_key(stem: str) -> str:
+    base = _revision_base_stem(stem) or str(stem or "").strip()
+    return re.sub(r"[^a-z0-9]+", "", base.casefold())
+
+
+def _find_part_pdf_in_fabrication_dir(sym_path: str, fabrication_dir: Path | None) -> str | None:
+    if fabrication_dir is None:
+        return None
+
+    root = Path(fabrication_dir)
+    if not root.exists():
+        return None
+
+    target_stem = _asset_stem(sym_path)
+    target_key = _pdf_part_stem_key(target_stem)
+    if not target_key:
+        return None
+
+    candidates: list[tuple[int, tuple[int, list[object]], Path]] = []
+    for pdf_path in _iter_pdf_paths(root):
+        if _looks_generated_pdf_artifact(pdf_path):
+            continue
+        if _pdf_part_stem_key(pdf_path.stem) != target_key:
+            continue
+        candidate_base = _revision_base_stem(pdf_path.stem) or pdf_path.stem
+        rank = 0 if pdf_path.stem.casefold() == target_stem.casefold() else 1
+        if candidate_base.casefold() != target_stem.casefold():
+            rank = 2
+        candidates.append((rank, _sorted_relative_key(pdf_path, root), pdf_path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return str(candidates[0][2])
+
+
+def _kit_packet_asset_resolver(
+    base_resolve_asset_fn: Callable[[str, str], Optional[str]],
+    *,
+    fabrication_dir: Path | None,
+) -> Callable[[str, str], Optional[str]]:
+    def _resolve(sym_path: str, ext: str) -> Optional[str]:
+        resolved = base_resolve_asset_fn(sym_path, ext)
+        if resolved and os.path.exists(resolved):
+            return resolved
+
+        clean_ext = str(ext or "").strip().lower()
+        if clean_ext and not clean_ext.startswith("."):
+            clean_ext = "." + clean_ext
+        if clean_ext == ".pdf":
+            fallback = _find_part_pdf_in_fabrication_dir(sym_path, fabrication_dir)
+            if fallback:
+                return fallback
+
+        return resolved
+
+    return _resolve
+
+
 def _inventor_sibling_exists(path: Path, suffix: str) -> bool:
     if path.with_suffix(suffix).exists():
         return True
@@ -804,7 +871,10 @@ def prepare_packet_build_context(
     # Packet builds are explicit user actions, so prefer the subtree-capable
     # resolver over the preview-optimized fast path. This covers cases where
     # W-side PDFs live under kit-specific subfolders such as PUMP PACK\PUMP HOUSE.
-    resolve_asset_fn = rk_assets.resolve_asset
+    resolve_asset_fn = _kit_packet_asset_resolver(
+        rk_assets.resolve_asset,
+        fabrication_dir=fabrication_dir,
+    )
     assembly_search_roots = _assembly_search_roots(fabrication_dir, rpd_path.parent)
     assembly_source_pdfs = (
         collect_unused_tabloid_pdfs(

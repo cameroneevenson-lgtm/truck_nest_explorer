@@ -1364,6 +1364,37 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(context.resolve_asset_fn(str(sym_path), ".pdf"), str(part_pdf))
             self.assertEqual(context.assembly_source_pdfs, ())
 
+    def test_prepare_packet_build_context_falls_back_to_w_kit_dir_for_unc_sym_paths(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            settings = ExplorerSettings(
+                release_root=str(release_parent / "F-LARGE FLEET"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("P56113", "PARTITION PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True, exist_ok=True)
+            paths.fabrication_kit_dir.mkdir(parents=True, exist_ok=True)
+
+            sym_path = (
+                r"\\SVRDC\Laser\BATTLESHIELD\P-SMALL FLEET\P56113"
+                r"\PARTITION PACK\P56113 PARTITION PACK\P56112-196.sym"
+            )
+            part_pdf = paths.fabrication_kit_dir / "P56112-196.pdf"
+            write_pdf(part_pdf, text="P56112-196", width=612, height=792)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.resolve_asset_fn(sym_path, ".pdf"), str(part_pdf))
+            self.assertEqual(context.assembly_source_pdfs, ())
+
     def test_configure_asset_lookup_maps_p_small_fleet_paths_to_w_job_root(self) -> None:
         with workspace_tempdir() as temp_root:
             release_parent = temp_root / "L" / "BATTLESHIELD"
