@@ -65,7 +65,6 @@ from services import (
     FILE_METADATA_CACHE,
     clear_performance_caches,
     collect_kit_statuses,
-    configured_kit_mappings,
     create_kit_scaffold,
     detect_assembly_packet_pdf,
     detect_cut_list_packet_pdf,
@@ -79,11 +78,13 @@ from services import (
     inventor_output_paths,
     is_hidden_kit,
     is_hidden_truck,
+    is_standard_truck_number,
     launch_launcher,
     open_path,
     release_root_for_job,
     release_text_for_status,
     restore_truck_visibility,
+    scaffold_kit_names_for_truck,
     sort_truck_numbers_by_fabrication_order,
 )
 from settings_store import load_settings, save_settings
@@ -176,7 +177,7 @@ class MainWindow(QMainWindow):
             "ui_flow",
             max_size=128,
             positive_ttl_seconds=3600.0,
-            negative_ttl_seconds=2.0,
+            negative_ttl_seconds=600.0,
         )
         self._flow_gantt_source_bytes: bytes | None = None
         self._flow_gantt_source_pixmap: QPixmap | None = None
@@ -1224,9 +1225,31 @@ class MainWindow(QMainWindow):
             tooltip_text="Loading scheduling insights from the fabrication flow dashboard.",
         )
 
+    def _one_off_flow_insight(self, truck_number: str) -> FlowTruckInsight:
+        return FlowTruckInsight(
+            available=False,
+            truck_number=truck_number,
+            summary_text="Flow: one-off job.",
+            issue="one_off_job",
+            tooltip_text="One-off jobs are not checked against the fabrication flow dashboard.",
+        )
+
+    def _should_probe_flow_for_truck(self, truck_number: str) -> bool:
+        return is_standard_truck_number(truck_number)
+
     def _load_flow_for_truck(self, truck_number: str, *, run_id: int) -> bool:
         truck_key = truck_number.casefold()
         current_flow_token = self._flow_request_token(truck_number)
+        if not self._should_probe_flow_for_truck(truck_number):
+            insight = self._one_off_flow_insight(truck_number)
+            self._flow_cache_by_truck.set(
+                self._flow_cache_key(truck_number, current_flow_token),
+                (current_flow_token, insight),
+                negative=False,
+            )
+            self._current_flow_truck_insight = insight
+            self._refresh_current_truck_heading()
+            return True
         hidden_flow_kit_names = self._hidden_flow_kit_names_for_truck(truck_number)
         flow_cache_key = self._flow_cache_key(truck_number, current_flow_token)
         hit, cached_flow = self._flow_cache_by_truck.get(flow_cache_key)
@@ -1947,21 +1970,22 @@ class MainWindow(QMainWindow):
                 )
                 started_status = True
             flow_token = self._flow_request_token(truck_number)
-            hidden_flow_kit_names = self._hidden_flow_kit_names_for_truck(truck_number)
-            flow_key = self._flow_cache_key(truck_number, flow_token)
-            flow_hit, _cached_flow = self._flow_cache_by_truck.get(flow_key)
-            if not flow_hit and truck_key not in self._pending_flow_by_truck:
-                self._pending_flow_by_truck[truck_key] = (
-                    truck_number,
-                    flow_token,
-                    0,
-                    self._flow_executor.submit(
-                        load_cached_flow_truck_insight,
+            if self._should_probe_flow_for_truck(truck_number):
+                hidden_flow_kit_names = self._hidden_flow_kit_names_for_truck(truck_number)
+                flow_key = self._flow_cache_key(truck_number, flow_token)
+                flow_hit, _cached_flow = self._flow_cache_by_truck.get(flow_key)
+                if not flow_hit and truck_key not in self._pending_flow_by_truck:
+                    self._pending_flow_by_truck[truck_key] = (
                         truck_number,
-                        hidden_flow_kit_names=hidden_flow_kit_names,
-                    ),
-                )
-                started_flow = True
+                        flow_token,
+                        0,
+                        self._flow_executor.submit(
+                            load_cached_flow_truck_insight,
+                            truck_number,
+                            hidden_flow_kit_names=hidden_flow_kit_names,
+                        ),
+                    )
+                    started_flow = True
             self._prewarm_truck_keys.add(truck_key)
         if started_status:
             self._status_watch_timer.start()
@@ -2133,7 +2157,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Add Truck",
-                "Enter a truck number in the F##### format, for example F55985.",
+                "Enter a job number in the F##### or P##### format, for example F55985 or P56113.",
             )
             return
 
@@ -2148,12 +2172,26 @@ class MainWindow(QMainWindow):
 
         created_count = 0
         errors: list[str] = []
-        for mapping in configured_kit_mappings(self.settings):
+        kit_names = scaffold_kit_names_for_truck(truck_text, self.settings)
+        if not kit_names:
+            QMessageBox.warning(
+                self,
+                "Add Truck",
+                f"Could not find any kit folders under:\n{fabrication_truck_dir}",
+            )
+            return
+
+        for kit_name in kit_names:
             try:
-                result = create_kit_scaffold(truck_text, mapping.kit_name, self.settings)
+                result = create_kit_scaffold(truck_text, kit_name, self.settings)
                 created_count += len(result.created_paths)
             except Exception as exc:
-                errors.append(f"{mapping.kit_name}: {exc}")
+                errors.append(f"{kit_name}: {exc}")
+
+        truck_order = normalize_truck_order_entries(self.settings.truck_order)
+        if truck_text.casefold() not in {truck.casefold() for truck in truck_order}:
+            self.settings.truck_order = truck_order + [truck_text]
+            save_settings(self.settings)
 
         restored_hidden_truck, restored_hidden_kit_count = restore_truck_visibility(truck_text, self.settings)
         if restored_hidden_truck or restored_hidden_kit_count:

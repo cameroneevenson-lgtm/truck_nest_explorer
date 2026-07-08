@@ -55,6 +55,7 @@ DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
 DEFAULT_BLOCK_FILES_ROOT = Path(r"L:\BATTLESHIELD\BLOCK FILES")
 DEFAULT_MACHINE_EIA_ROOT = Path(r"A:\EiaFiles\Battleshield\F-LARGE FLEET")
+DEFAULT_P_MACHINE_EIA_ROOT = DEFAULT_MACHINE_EIA_ROOT.parent / PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name
 FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
 TRUCK_FOLDER_PATTERN = re.compile(r"^[A-Z]\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
@@ -293,6 +294,20 @@ def odd_job_names_for_truck(truck_number: str, settings: ExplorerSettings) -> li
     return cleaned
 
 
+def scaffold_kit_names_for_truck(
+    truck_number: str,
+    settings: ExplorerSettings,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> list[str]:
+    if is_standard_truck_number(truck_number):
+        kit_names = [mapping.kit_name for mapping in configured_kit_mappings(settings)]
+    else:
+        kit_names = discovered_fabrication_kit_names_for_job(truck_number, settings, fs_cache=fs_cache)
+    kit_names.extend(odd_job_names_for_truck(truck_number, settings))
+    return kit_names
+
+
 def add_odd_job_to_truck(settings: ExplorerSettings, truck_number: str, kit_name: str) -> bool:
     truck = normalize_hidden_truck_number(truck_number)
     job_name = canonicalize_kit_name(kit_name)
@@ -444,6 +459,21 @@ def sort_truck_numbers_by_fabrication_order(
             natural_sort_key(truck_number),
         ),
     )
+
+
+def explicit_truck_numbers(settings: ExplorerSettings) -> list[str]:
+    candidates: list[object] = []
+    candidates.extend(settings.truck_order)
+    candidates.extend(settings.hidden_trucks)
+    candidates.extend(settings.client_numbers_by_truck.keys())
+    candidates.extend(settings.odd_jobs_by_truck.keys())
+    for mapping in (settings.punch_codes_by_kit, settings.notes_by_kit):
+        for key in mapping.keys():
+            key_text = str(key or "")
+            if "::" not in key_text:
+                continue
+            candidates.append(key_text.split("::", 1)[0])
+    return normalize_truck_order_entries(candidates)
 
 
 def filter_kit_statuses(
@@ -665,33 +695,19 @@ def discover_trucks(settings: ExplorerSettings) -> list[str]:
                     try:
                         if not entry.is_dir():
                             continue
-                        if is_release_truck_discoverable(entry.name, Path(entry.path), settings):
+                        truck = normalize_hidden_truck_number(entry.name)
+                        if not is_standard_truck_number(truck):
+                            continue
+                        if is_release_truck_discoverable(truck, Path(entry.path), settings):
                             names.add(entry.name)
                     except OSError:
                         continue
         except OSError:
             pass
 
-    fabrication_root = _path_from_setting(settings.fabrication_root)
-    if fabrication_root is not None and cached_path_exists(fabrication_root):
-        registered_trucks = active_registered_truck_numbers()
-        try:
-            GLOBAL_METRICS.record_filesystem_check()
-            with os.scandir(fabrication_root) as entries:
-                for entry in entries:
-                    try:
-                        if not entry.is_dir():
-                            continue
-                    except OSError:
-                        continue
-                    job = normalize_hidden_truck_number(entry.name)
-                    if not job or not TRUCK_FOLDER_PATTERN.fullmatch(job):
-                        continue
-                    if registered_trucks and is_standard_truck_number(job) and job.upper() not in registered_trucks:
-                        continue
-                    names.add(entry.name)
-        except OSError:
-            pass
+    for truck in explicit_truck_numbers(settings):
+        if find_fabrication_truck_dir(truck, settings) is not None:
+            names.add(truck)
     return sorted(names, key=natural_sort_key)
 
 
@@ -1311,10 +1327,6 @@ def build_kit_status(
 ) -> KitStatus:
     cache_obj = fs_cache
     paths = build_kit_paths(truck_number, kit_name, settings, fs_cache=cache_obj)
-    try:
-        ensure_rpd_exists(paths, settings)
-    except OSError:
-        pass
     release_folder_exists = bool(paths.release_kit_dir and cached_path_exists(paths.release_kit_dir, cache=cache_obj))
     project_folder_exists = bool(paths.project_dir and cached_path_exists(paths.project_dir, cache=cache_obj))
     rpd_exists = bool(paths.rpd_path and cached_path_exists(paths.rpd_path, cache=cache_obj))
@@ -1376,12 +1388,7 @@ def collect_kit_statuses(
         if hit and cached is not None:
             return list(cached)
     cache_obj = fs_cache or _filesystem_cache()
-    if is_standard_truck_number(truck_number):
-        kit_names = [mapping.kit_name for mapping in configured_kit_mappings(settings)]
-        kit_names.extend(odd_job_names_for_truck(truck_number, settings))
-    else:
-        kit_names = discovered_fabrication_kit_names_for_job(truck_number, settings, fs_cache=cache_obj)
-        kit_names.extend(odd_job_names_for_truck(truck_number, settings))
+    kit_names = scaffold_kit_names_for_truck(truck_number, settings, fs_cache=cache_obj)
     statuses = [
         build_kit_status(truck_number, kit_name, settings, fs_cache=cache_obj)
         for kit_name in kit_names
@@ -1855,6 +1862,22 @@ def machine_block_project_dir(
     return root / relative_kit_folder
 
 
+def machine_block_root_for_release_root(
+    release_root: Path | str,
+    *,
+    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
+) -> Path:
+    release_name = PureWindowsPath(str(release_root)).name
+    p_release_name = PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name
+    root = Path(str(machine_root))
+    if release_name.casefold() == p_release_name.casefold():
+        machine_name = PureWindowsPath(str(root)).name
+        if machine_name.casefold() == p_release_name.casefold():
+            return root
+        return root.parent / p_release_name
+    return root
+
+
 def local_block_project_dir(project_dir: Path | str) -> Path:
     project = Path(str(project_dir))
     # Keep the L-side archive beside the inner RADAN project folder, matching
@@ -1948,7 +1971,7 @@ def build_project_block_transfer_plan(
 ) -> BlockFileTransferPlan:
     project = Path(str(project_dir))
     source = Path(str(source_root))
-    machine = Path(str(machine_root))
+    machine = machine_block_root_for_release_root(release_root, machine_root=machine_root)
     if not project.exists():
         raise FileNotFoundError(str(project))
     if not source.exists():

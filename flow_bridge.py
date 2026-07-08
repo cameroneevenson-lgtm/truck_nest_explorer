@@ -44,7 +44,7 @@ FLOW_INSIGHT_CACHE: BoundedTTLCache["FlowTruckInsight"] = BoundedTTLCache(
     "flow_insight",
     max_size=128,
     positive_ttl_seconds=3600.0,
-    negative_ttl_seconds=2.0,
+    negative_ttl_seconds=600.0,
 )
 
 

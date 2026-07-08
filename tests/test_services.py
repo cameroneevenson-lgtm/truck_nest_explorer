@@ -100,6 +100,7 @@ from services import (
     is_w_drive_path,
     launch_tool,
     launch_radan_csv_import,
+    machine_block_root_for_release_root,
     move_inventor_outputs_to_project,
     odd_job_names_for_truck,
     radan_csv_missing_symbols,
@@ -109,6 +110,7 @@ from services import (
     release_text_for_status,
     resolve_existing_inventor_csv,
     restore_truck_visibility,
+    scaffold_kit_names_for_truck,
     send_project_block_files_to_machine,
     sort_truck_numbers_by_fabrication_order,
 )
@@ -943,8 +945,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             empty_status = build_kit_status("F55334", "PAINT PACK", settings)
             self.assertTrue(empty_status.fabrication_folder_exists)
             self.assertFalse(empty_status.fabrication_has_files)
-            self.assertTrue(empty_status.rpd_exists)
-            self.assertTrue(empty_status.paths.rpd_path is not None and empty_status.paths.rpd_path.exists())
+            self.assertFalse(empty_status.rpd_exists)
+            self.assertTrue(empty_status.paths.rpd_path is not None)
+            self.assertFalse(empty_status.paths.rpd_path.exists())
             self.assertIn("Not released", empty_status.status_summary)
             self.assertIn("BOM missing", empty_status.status_summary)
             self.assertNotIn("Spreadsheet missing", empty_status.status_summary)
@@ -1762,6 +1765,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             )
             self.assertEqual(plan.local_target_dir, project_dir.parent)
 
+    def test_block_transfer_plan_routes_p_release_to_p_small_fleet_machine_root(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "L" / "BATTLESHIELD" / "P-SMALL FLEET"
+            project_dir = release_root / "P12345" / "DRIVER PACK" / "P12345 DRIVER PACK"
+            nests_dir = project_dir / "nests"
+            source_root = temp_root / "BLOCK FILES"
+            machine_parent = temp_root / "A" / "EiaFiles" / "Battleshield"
+            f_machine_root = machine_parent / "F-LARGE FLEET"
+            p_machine_root = machine_parent / "P-SMALL FLEET"
+            nests_dir.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            p_machine_root.mkdir(parents=True)
+            drg_path = nests_dir / "P1 P12345 DRIVER PACK.drg"
+            drg_path.write_text("drg", encoding="utf-8")
+            source_path = source_root / "P1 P12345 DRIVER PA.cnc"
+            source_path.write_text("block", encoding="utf-8")
+
+            plan = build_project_block_transfer_plan(
+                project_dir,
+                release_root,
+                source_root=source_root,
+                machine_root=f_machine_root,
+            )
+
+            self.assertEqual(
+                machine_block_root_for_release_root(release_root, machine_root=f_machine_root),
+                p_machine_root,
+            )
+            self.assertEqual(plan.machine_root, p_machine_root)
+            self.assertEqual(plan.target_dir, p_machine_root / "P12345" / "DRIVER PACK")
+            self.assertEqual(plan.matches[0].target_path, plan.target_dir / "P1 P12345 DRIVER PACK.cnc")
+
     def test_send_project_block_files_copies_full_name_to_machine_and_l_then_deletes_source(self) -> None:
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
@@ -2397,7 +2432,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(trucks, ["F55334"])
 
-    def test_discover_trucks_includes_w_side_nonstandard_job_folder(self) -> None:
+    def test_discover_trucks_includes_explicit_w_side_nonstandard_job_folder(self) -> None:
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "release"
             fabrication_root = temp_root / "fab"
@@ -2408,13 +2443,14 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             settings = ExplorerSettings(
                 release_root=str(release_root),
                 fabrication_root=str(fabrication_root),
+                truck_order=[job],
             )
 
             trucks = discover_trucks(settings)
 
             self.assertIn(job, trucks)
 
-    def test_discover_trucks_includes_p_small_fleet_job_folder(self) -> None:
+    def test_discover_trucks_does_not_use_p_small_fleet_as_source_of_truth(self) -> None:
         with workspace_tempdir() as temp_root:
             release_parent = temp_root / "L" / "BATTLESHIELD"
             release_root = release_parent / "F-LARGE FLEET"
@@ -2426,6 +2462,38 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             settings = ExplorerSettings(
                 release_root=str(release_root),
                 fabrication_root=str(fabrication_root),
+            )
+
+            trucks = discover_trucks(settings)
+
+            self.assertNotIn(job, trucks)
+
+    def test_discover_trucks_does_not_scan_w_side_archive_without_explicit_order(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            (fabrication_root / "P12345" / "DRIVER PACK").mkdir(parents=True)
+            (fabrication_root / "M12345" / "MISC PACK").mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            trucks = discover_trucks(settings)
+
+            self.assertNotIn("P12345", trucks)
+            self.assertNotIn("M12345", trucks)
+
+    def test_discover_trucks_includes_nonstandard_job_with_saved_kit_metadata(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            (fabrication_root / job / "DRIVER PACK").mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+                punch_codes_by_kit={f"{job}::DRIVER PACK": "23579"},
             )
 
             trucks = discover_trucks(settings)
@@ -2459,8 +2527,48 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             first_status = statuses[0]
             self.assertEqual(first_status.paths.fabrication_kit_dir, job_dir / "ALPHA KIT")
             self.assertEqual(first_status.paths.release_kit_dir, p_release_root / job / "ALPHA KIT")
-            self.assertTrue(first_status.paths.rpd_path is not None and first_status.paths.rpd_path.exists())
+            self.assertFalse(first_status.release_folder_exists)
+            self.assertFalse(first_status.project_folder_exists)
+            self.assertFalse(first_status.rpd_exists)
+            self.assertFalse((p_release_root / job).exists())
             self.assertEqual(first_status.spreadsheet_match.chosen_path, job_dir / "ALPHA KIT" / "ALPHA KIT.xlsx")
+
+    def test_scaffold_kit_names_for_nonstandard_job_uses_w_side_subfolders(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            for kit_name in ("DRIVER PACK", "PARTITION PACK", "PASSENGER PACK"):
+                (fabrication_root / job / kit_name).mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+                kit_templates=["PAINT PACK", "INTERIOR PACK", "EXTERIOR PACK"],
+            )
+
+            self.assertEqual(
+                scaffold_kit_names_for_truck(job, settings),
+                ["DRIVER PACK", "PARTITION PACK", "PASSENGER PACK"],
+            )
+
+    def test_collect_kit_statuses_does_not_create_l_side_scaffolds(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            release_root = release_parent / "F-LARGE FLEET"
+            p_release_root = release_parent / "P-SMALL FLEET"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            (fabrication_root / job / "DRIVER PACK").mkdir(parents=True)
+            p_release_root.mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            statuses = collect_kit_statuses(job, settings, use_cache=False)
+
+            self.assertEqual([status.kit_name for status in statuses], ["DRIVER PACK"])
+            self.assertFalse((p_release_root / job).exists())
 
     def test_create_kit_scaffold_rejects_unregistered_f_job_when_registry_exists(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -2707,8 +2815,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual([status.kit_name for status in statuses], ["PAINT PACK", "Loose Brackets"])
             odd_status = statuses[-1]
-            self.assertTrue(odd_status.rpd_exists)
-            self.assertTrue(odd_status.paths.release_kit_dir is not None and odd_status.paths.release_kit_dir.exists())
+            self.assertFalse(odd_status.rpd_exists)
+            self.assertTrue(odd_status.paths.release_kit_dir is not None)
+            self.assertFalse(odd_status.paths.release_kit_dir.exists())
 
     def test_odd_job_rejects_canonical_kit_name(self) -> None:
         settings = ExplorerSettings(kit_templates=["BODY | PAINT PACK"])
@@ -3299,6 +3408,36 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 window.close()
                 app.processEvents()
 
+    def test_one_off_truck_does_not_start_flow_probe(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+            patch("main_window.load_cached_flow_truck_insight") as flow_probe_mock,
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("P12345")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+
+                self.assertTrue(window._load_flow_for_truck("P12345", run_id=1))
+
+                flow_probe_mock.assert_not_called()
+                self.assertEqual(window._pending_flow_by_truck, {})
+                self.assertEqual(window._current_flow_truck_insight.issue, "one_off_job")
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
     def _make_packet_button_status(self, temp_root: Path, *, create_packets: bool = False) -> KitStatus:
         project_dir = temp_root / "release" / "F55334" / "PAINT PACK"
         fabrication_dir = temp_root / "fab" / "F55334" / "PAINT PACK"
@@ -3337,6 +3476,58 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             inventor_outputs=None,
             status_summary="Released",
         )
+
+    def test_add_truck_scaffolds_nonstandard_job_from_w_side_folders(self) -> None:
+        from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with workspace_tempdir() as temp_root:
+            release_parent = temp_root / "L" / "BATTLESHIELD"
+            release_root = release_parent / "F-LARGE FLEET"
+            p_release_root = release_parent / "P-SMALL FLEET"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            p_release_root.mkdir(parents=True)
+            for kit_name in ("DRIVER PACK", "PARTITION PACK", "PASSENGER PACK"):
+                (fabrication_root / job / kit_name).mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+                kit_templates=["PAINT PACK", "INTERIOR PACK", "EXTERIOR PACK"],
+            )
+
+            with (
+                patch("main_window.load_settings", return_value=settings),
+                patch("main_window.save_settings", return_value=temp_root / "settings.json"),
+                patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+            ):
+                window = main_window.MainWindow(runtime_dir=temp_root)
+                try:
+                    with (
+                        patch.object(QInputDialog, "getText", return_value=(job, True)),
+                        patch.object(QMessageBox, "warning") as warning_mock,
+                        patch.object(window, "refresh_trucks") as refresh_mock,
+                    ):
+                        window.create_new_truck()
+
+                    truck_dir = p_release_root / job
+                    self.assertTrue((truck_dir / "DRIVER PACK").exists())
+                    self.assertTrue((truck_dir / "PARTITION PACK").exists())
+                    self.assertTrue((truck_dir / "PASSENGER PACK").exists())
+                    self.assertFalse((truck_dir / "PAINT PACK").exists())
+                    self.assertFalse((truck_dir / "INTERIOR PACK").exists())
+                    self.assertFalse((truck_dir / "EXTERIOR PACK").exists())
+                    self.assertEqual(settings.truck_order, [job])
+                    self.assertEqual(window._pending_truck_selection, job)
+                    warning_mock.assert_not_called()
+                    refresh_mock.assert_called_once()
+                finally:
+                    window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                    window._status_executor.shutdown(wait=False, cancel_futures=True)
+                    window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                    window.close()
+                    app.processEvents()
 
     def test_packet_build_buttons_disable_when_packets_already_exist(self) -> None:
         from PySide6.QtWidgets import QApplication
