@@ -2303,7 +2303,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertNotIn("--d-record-view-height-threshold-guard", command)
             self.assertNotIn("--assign-project-colors", command)
 
-    def test_discover_trucks_uses_release_root_only(self) -> None:
+    def test_discover_trucks_respects_registry_for_standard_f_jobs(self) -> None:
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "release"
             fabrication_root = temp_root / "fab"
@@ -2329,6 +2329,49 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 trucks = discover_trucks(settings)
 
             self.assertEqual(trucks, ["F55334"])
+
+    def test_discover_trucks_includes_w_side_nonstandard_job_folder(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            (release_root / "F55334").mkdir(parents=True)
+            (fabrication_root / job / "KIT ONE").mkdir(parents=True)
+            (fabrication_root / job / "KIT TWO").mkdir(parents=True)
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            trucks = discover_trucks(settings)
+
+            self.assertIn(job, trucks)
+
+    def test_collect_kit_statuses_for_nonstandard_job_uses_w_side_subfolders(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            job = "P12345"
+            job_dir = fabrication_root / job
+            for kit_name in ("ALPHA KIT", "BRAVO KIT", "CHARLIE KIT"):
+                kit_dir = job_dir / kit_name
+                kit_dir.mkdir(parents=True)
+                (kit_dir / f"{kit_name}.xlsx").write_text("bom", encoding="utf-8")
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            statuses = collect_kit_statuses(job, settings, use_cache=False)
+
+            self.assertEqual(
+                [status.kit_name for status in statuses],
+                ["ALPHA KIT", "BRAVO KIT", "CHARLIE KIT"],
+            )
+            first_status = statuses[0]
+            self.assertEqual(first_status.paths.fabrication_kit_dir, job_dir / "ALPHA KIT")
+            self.assertTrue(first_status.paths.rpd_path is not None and first_status.paths.rpd_path.exists())
+            self.assertEqual(first_status.spreadsheet_match.chosen_path, job_dir / "ALPHA KIT" / "ALPHA KIT.xlsx")
 
     def test_create_kit_scaffold_rejects_unregistered_f_job_when_registry_exists(self) -> None:
         with workspace_tempdir() as temp_root:

@@ -55,7 +55,7 @@ DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_c
 DEFAULT_BLOCK_FILES_ROOT = Path(r"L:\BATTLESHIELD\BLOCK FILES")
 DEFAULT_MACHINE_EIA_ROOT = Path(r"A:\EiaFiles\Battleshield\F-LARGE FLEET")
 FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
-TRUCK_FOLDER_PATTERN = re.compile(r"^F\d{5}$", re.IGNORECASE)
+TRUCK_FOLDER_PATTERN = re.compile(r"^[A-Z]\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
 FILESYSTEM_CACHE_POSITIVE_TTL_SECONDS = 5.0
 FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS = 2.0
@@ -268,6 +268,11 @@ def configured_kit_mappings(settings: ExplorerSettings) -> list[KitMapping]:
     return build_kit_mappings(settings.kit_templates)
 
 
+def is_standard_truck_number(truck_number: str) -> bool:
+    truck = normalize_hidden_truck_number(truck_number)
+    return bool(truck and truck.startswith("F"))
+
+
 def odd_job_names_for_truck(truck_number: str, settings: ExplorerSettings) -> list[str]:
     truck = normalize_hidden_truck_number(truck_number)
     if not truck:
@@ -347,7 +352,7 @@ def is_release_truck_discoverable(
     if release_truck_dir is None or not Path(str(release_truck_dir)).exists():
         return False
     registered_trucks = active_registered_truck_numbers()
-    if registered_trucks:
+    if registered_trucks and is_standard_truck_number(truck):
         return truck.upper() in registered_trucks
     return True
 
@@ -355,7 +360,7 @@ def is_release_truck_discoverable(
 def assert_truck_scaffold_allowed(truck_number: str, settings: ExplorerSettings) -> None:
     truck = normalize_hidden_truck_number(truck_number)
     registered_trucks = active_registered_truck_numbers()
-    if not registered_trucks or truck.upper() in registered_trucks:
+    if not registered_trucks or not is_standard_truck_number(truck) or truck.upper() in registered_trucks:
         return
     raise RuntimeError(
         f"Refusing to create kit scaffolds for {truck or truck_number}. "
@@ -621,21 +626,41 @@ def build_kit_paths(
 def discover_trucks(settings: ExplorerSettings) -> list[str]:
     names: set[str] = set()
     root = _path_from_setting(settings.release_root)
-    if root is None or not cached_path_exists(root):
-        return []
-    try:
-        GLOBAL_METRICS.record_filesystem_check()
-        with os.scandir(root) as entries:
-            for entry in entries:
-                try:
-                    if not entry.is_dir():
+    if root is not None and cached_path_exists(root):
+        try:
+            GLOBAL_METRICS.record_filesystem_check()
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                        if is_release_truck_discoverable(entry.name, Path(entry.path), settings):
+                            names.add(entry.name)
+                    except OSError:
                         continue
-                    if is_release_truck_discoverable(entry.name, Path(entry.path), settings):
-                        names.add(entry.name)
-                except OSError:
-                    continue
-    except OSError:
-        return []
+        except OSError:
+            pass
+
+    fabrication_root = _path_from_setting(settings.fabrication_root)
+    if fabrication_root is not None and cached_path_exists(fabrication_root):
+        registered_trucks = active_registered_truck_numbers()
+        try:
+            GLOBAL_METRICS.record_filesystem_check()
+            with os.scandir(fabrication_root) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    job = normalize_hidden_truck_number(entry.name)
+                    if not job or not TRUCK_FOLDER_PATTERN.fullmatch(job):
+                        continue
+                    if registered_trucks and is_standard_truck_number(job) and job.upper() not in registered_trucks:
+                        continue
+                    names.add(entry.name)
+        except OSError:
+            pass
     return sorted(names, key=natural_sort_key)
 
 
@@ -661,6 +686,39 @@ def find_fabrication_truck_dir(truck_number: str, settings: ExplorerSettings) ->
     except OSError:
         return None
     return None
+
+
+def discovered_fabrication_kit_names_for_job(
+    truck_number: str,
+    settings: ExplorerSettings,
+    *,
+    fs_cache: BoundedTTLCache[object] | None = None,
+) -> list[str]:
+    fabrication_truck_dir = find_fabrication_truck_dir(truck_number, settings)
+    if fabrication_truck_dir is None or not cached_path_exists(fabrication_truck_dir, cache=fs_cache):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    try:
+        GLOBAL_METRICS.record_filesystem_check()
+        with os.scandir(fabrication_truck_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                name = clean_text(entry.name)
+                if not name or name.casefold() in {folder.casefold() for folder in DEFAULT_SUPPORT_FOLDERS}:
+                    continue
+                key = name.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(name)
+    except OSError:
+        return []
+    return sorted(names, key=natural_sort_key)
 
 
 def _is_generated_spreadsheet(path: Path) -> bool:
@@ -1287,14 +1345,16 @@ def collect_kit_statuses(
         if hit and cached is not None:
             return list(cached)
     cache_obj = fs_cache or _filesystem_cache()
+    if is_standard_truck_number(truck_number):
+        kit_names = [mapping.kit_name for mapping in configured_kit_mappings(settings)]
+        kit_names.extend(odd_job_names_for_truck(truck_number, settings))
+    else:
+        kit_names = discovered_fabrication_kit_names_for_job(truck_number, settings, fs_cache=cache_obj)
+        kit_names.extend(odd_job_names_for_truck(truck_number, settings))
     statuses = [
-        build_kit_status(truck_number, mapping.kit_name, settings, fs_cache=cache_obj)
-        for mapping in configured_kit_mappings(settings)
-    ]
-    statuses.extend(
         build_kit_status(truck_number, kit_name, settings, fs_cache=cache_obj)
-        for kit_name in odd_job_names_for_truck(truck_number, settings)
-    )
+        for kit_name in kit_names
+    ]
     if use_cache:
         KIT_STATUS_CACHE.set(status_key, tuple(statuses), negative=not statuses)
     return statuses
