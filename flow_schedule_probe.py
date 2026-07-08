@@ -32,8 +32,28 @@ def _normalize_embedded_gantt_kit_key(kit_name: object) -> str:
     return text
 
 
-def include_kit_in_embedded_gantt(kit_name: object) -> bool:
-    return _normalize_embedded_gantt_kit_key(kit_name) not in EMBEDDED_GANTT_SMALL_KIT_KEYS
+def _normalized_hidden_kit_keys(hidden_kit_names: object = ()) -> set[str]:
+    if hidden_kit_names is None:
+        return set()
+    if isinstance(hidden_kit_names, str):
+        hidden_values = [hidden_kit_names]
+    else:
+        try:
+            hidden_values = list(hidden_kit_names)
+        except TypeError:
+            hidden_values = [hidden_kit_names]
+    return {
+        key
+        for key in (_normalize_embedded_gantt_kit_key(value) for value in hidden_values)
+        if key
+    }
+
+
+def include_kit_in_embedded_gantt(kit_name: object, hidden_kit_names: object = ()) -> bool:
+    kit_key = _normalize_embedded_gantt_kit_key(kit_name)
+    if kit_key in _normalized_hidden_kit_keys(hidden_kit_names):
+        return False
+    return kit_key not in EMBEDDED_GANTT_SMALL_KIT_KEYS
 
 
 def _overlay_row_kit_name(row: object) -> str:
@@ -43,17 +63,36 @@ def _overlay_row_kit_name(row: object) -> str:
     return parts[1].strip()
 
 
-def split_overlay_rows_for_embedded_gantt(rows: list[object]) -> tuple[list[object], dict[str, object]]:
+def split_overlay_rows_for_embedded_gantt(
+    rows: list[object],
+    hidden_kit_names: object = (),
+) -> tuple[list[object], dict[str, object]]:
     embedded_rows: list[object] = []
     rows_by_kit_name: dict[str, object] = {}
+    hidden_keys = _normalized_hidden_kit_keys(hidden_kit_names)
     for row in rows:
         kit_name = _overlay_row_kit_name(row)
         if not kit_name:
             continue
         rows_by_kit_name[kit_name.casefold()] = row
-        if include_kit_in_embedded_gantt(kit_name):
+        if include_kit_in_embedded_gantt(kit_name, hidden_keys):
             embedded_rows.append(row)
     return embedded_rows, rows_by_kit_name
+
+
+def _parse_hidden_kit_names(argv: list[str]) -> tuple[str, ...]:
+    hidden_kit_names: list[str] = []
+    index = 2
+    while index < len(argv):
+        argument = str(argv[index] or "").strip()
+        if argument == "--hide-kit" and index + 1 < len(argv):
+            hidden_kit_names.append(str(argv[index + 1] or "").strip())
+            index += 2
+            continue
+        if argument.startswith("--hide-kit="):
+            hidden_kit_names.append(argument.split("=", 1)[1].strip())
+        index += 1
+    return tuple(name for name in hidden_kit_names if name)
 
 
 def _emit(payload: dict[str, object]) -> int:
@@ -131,6 +170,7 @@ def _overlay_sort_key(row: object) -> tuple[float, str]:
 
 def main(argv: list[str]) -> int:
     truck_number = str(argv[1] if len(argv) > 1 else "").strip()
+    hidden_gantt_kit_names = _parse_hidden_kit_names(argv)
     if not truck_number:
         return _emit(
             {
@@ -232,7 +272,10 @@ def main(argv: list[str]) -> int:
         max_rows=max(1, len(getattr(target_truck, "kits", [])) * 2),
         include_small_kits=True,
     )
-    overlay_rows, rows_by_kit_name = split_overlay_rows_for_embedded_gantt(all_overlay_rows)
+    overlay_rows, rows_by_kit_name = split_overlay_rows_for_embedded_gantt(
+        all_overlay_rows,
+        hidden_gantt_kit_names,
+    )
     truck_start_week = None
     if getattr(target_truck, "id", None) is not None:
         truck_start_week = insights.truck_planned_start_week_by_id.get(int(target_truck.id))
@@ -247,7 +290,7 @@ def main(argv: list[str]) -> int:
         for kit in getattr(target_truck, "kits", []):
             if not bool(getattr(kit, "is_active", True)):
                 continue
-            if not include_kit_in_embedded_gantt(getattr(kit, "kit_name", "")):
+            if not include_kit_in_embedded_gantt(getattr(kit, "kit_name", ""), hidden_gantt_kit_names):
                 continue
             if stage_from_id(getattr(kit, "front_stage_id", None)) != Stage.COMPLETE:
                 continue

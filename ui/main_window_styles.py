@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+_CHECKMARK_ICON_PATH = (Path(__file__).resolve().parent / "icons" / "checkmark.png").as_posix()
+
 
 def dashboard_stylesheet() -> str:
     return """
@@ -105,15 +109,21 @@ def dashboard_stylesheet() -> str:
                 spacing: 6px;
             }
             QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
+                width: 16px;
+                height: 16px;
                 border: 1px solid #94A3B8;
                 border-radius: 3px;
                 background: #FFFFFF;
             }
             QCheckBox::indicator:checked {
-                background: #93C5FD;
-                border-color: #60A5FA;
+                background: #3B82F6;
+                border-color: #2563EB;
+                image: url("__CHECKMARK_ICON__");
+            }
+            QCheckBox::indicator:checked:disabled {
+                background: #94A3B8;
+                border-color: #64748B;
+                image: url("__CHECKMARK_ICON__");
             }
             QSplitter::handle {
                 background: #E2E8F0;
@@ -134,4 +144,4 @@ def dashboard_stylesheet() -> str:
             QLabel#flow_gantt_label {
                 background: #FFFFFF;
             }
-            """
+            """.replace("__CHECKMARK_ICON__", _CHECKMARK_ICON_PATH)

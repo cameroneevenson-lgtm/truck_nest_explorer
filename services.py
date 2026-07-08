@@ -87,6 +87,7 @@ class BlockFileMatch:
     drg_path: Path
     source_path: Path
     target_path: Path
+    local_target_path: Path
     match_reason: str
 
 
@@ -96,8 +97,10 @@ class BlockFileTransferPlan:
     source_root: Path
     machine_root: Path
     target_dir: Path
+    local_target_dir: Path
     drg_paths: tuple[Path, ...]
     matches: tuple[BlockFileMatch, ...]
+    already_sent_paths: tuple[Path, ...]
     missing_drg_paths: tuple[Path, ...]
 
 
@@ -107,6 +110,7 @@ class BlockFileTransferResult:
     operation: str
     transferred_paths: tuple[Path, ...]
     skipped_paths: tuple[Path, ...]
+    local_transferred_paths: tuple[Path, ...] = ()
     canceled: bool = False
 
 
@@ -1760,6 +1764,13 @@ def machine_block_project_dir(
     return root / relative_kit_folder
 
 
+def local_block_project_dir(project_dir: Path | str) -> Path:
+    project = Path(str(project_dir))
+    # Keep the L-side archive beside the inner RADAN project folder, matching
+    # the machine folder layout and avoiding an extra project-name layer.
+    return project.parent
+
+
 def discover_project_drg_paths(project_dir: Path | str) -> tuple[Path, ...]:
     project = Path(str(project_dir))
     if not project.exists():
@@ -1814,6 +1825,29 @@ def _block_match_for_drg(drg_path: Path, block_files: tuple[Path, ...]) -> tuple
     return path, reason
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_verified(source_path: Path, target_path: Path, *, expected_size: int, expected_sha256: str) -> None:
+    if normalize_cache_path(source_path) == normalize_cache_path(target_path):
+        return
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        target_path.unlink()
+    shutil.copy2(source_path, target_path)
+    if not target_path.exists():
+        raise RuntimeError(f"Copied block file did not verify: {target_path}")
+    if target_path.stat().st_size != expected_size:
+        raise RuntimeError(f"Copied block file size did not verify: {target_path}")
+    if _sha256_path(target_path) != expected_sha256:
+        raise RuntimeError(f"Copied block file checksum did not verify: {target_path}")
+
+
 def build_project_block_transfer_plan(
     project_dir: Path | str,
     release_root: Path | str,
@@ -1831,14 +1865,20 @@ def build_project_block_transfer_plan(
     if not machine.exists():
         raise FileNotFoundError(f"Machine block destination is not available: {machine}")
     target_dir = machine_block_project_dir(project, release_root, machine_root=machine)
+    local_target_dir = local_block_project_dir(project)
     drg_paths = discover_project_drg_paths(project)
     block_files = _discover_block_files(source)
     matches: list[BlockFileMatch] = []
+    already_sent: list[Path] = []
     missing: list[Path] = []
     used_sources: set[str] = set()
     for drg_path in drg_paths:
         source_path, reason = _block_match_for_drg(drg_path, block_files)
         if source_path is None:
+            target_path = target_dir / f"{drg_path.stem}.cnc"
+            if target_path.exists():
+                already_sent.append(target_path)
+                continue
             missing.append(drg_path)
             continue
         source_key = normalize_cache_path(source_path)
@@ -1847,11 +1887,13 @@ def build_project_block_transfer_plan(
         used_sources.add(source_key)
         # The post output can truncate names; write the machine copy with the full DRG stem.
         target_path = target_dir / f"{drg_path.stem}{source_path.suffix}"
+        local_target_path = local_target_dir / f"{drg_path.stem}{source_path.suffix}"
         matches.append(
             BlockFileMatch(
                 drg_path=drg_path,
                 source_path=source_path,
                 target_path=target_path,
+                local_target_path=local_target_path,
                 match_reason=reason,
             )
         )
@@ -1860,8 +1902,10 @@ def build_project_block_transfer_plan(
         source_root=source,
         machine_root=machine,
         target_dir=target_dir,
+        local_target_dir=local_target_dir,
         drg_paths=drg_paths,
         matches=tuple(matches),
+        already_sent_paths=tuple(already_sent),
         missing_drg_paths=tuple(missing),
     )
 
@@ -1887,9 +1931,12 @@ def send_project_block_files_to_machine(
             operation="copy_then_delete",
             transferred_paths=(),
             skipped_paths=(),
+            local_transferred_paths=(),
         )
     plan.target_dir.mkdir(parents=True, exist_ok=True)
+    plan.local_target_dir.mkdir(parents=True, exist_ok=True)
     transferred: list[Path] = []
+    local_transferred: list[Path] = []
     skipped: list[Path] = []
     total = len(plan.matches)
     for index, match in enumerate(plan.matches, start=1):
@@ -1900,26 +1947,39 @@ def send_project_block_files_to_machine(
                 operation="copy_then_delete",
                 transferred_paths=tuple(transferred),
                 skipped_paths=tuple(skipped),
+                local_transferred_paths=tuple(local_transferred),
                 canceled=True,
             )
         if progress_cb is not None:
             progress_cb(index - 1, total, f"Sending {match.source_path.name}")
-        if match.target_path.exists():
-            match.target_path.unlink()
-        shutil.copy2(match.source_path, match.target_path)
-        if not match.target_path.exists() or match.target_path.stat().st_size != match.source_path.stat().st_size:
-            raise RuntimeError(f"Copied block file did not verify: {match.target_path}")
+        source_size = match.source_path.stat().st_size
+        source_sha256 = _sha256_path(match.source_path)
+        _copy_verified(
+            match.source_path,
+            match.target_path,
+            expected_size=source_size,
+            expected_sha256=source_sha256,
+        )
+        _copy_verified(
+            match.source_path,
+            match.local_target_path,
+            expected_size=source_size,
+            expected_sha256=source_sha256,
+        )
         match.source_path.unlink()
         transferred.append(match.target_path)
+        local_transferred.append(match.local_target_path)
         if progress_cb is not None:
             progress_cb(index, total, f"Sent {match.target_path.name}")
-    invalidate_filesystem_cache_for_paths(tuple(transferred))
+    invalidate_filesystem_cache_for_paths(tuple(transferred) + tuple(local_transferred))
     invalidate_filesystem_cache_for_path(plan.source_root)
+    invalidate_filesystem_cache_for_path(plan.local_target_dir)
     return BlockFileTransferResult(
         plan=plan,
         operation="copy_then_delete",
         transferred_paths=tuple(transferred),
         skipped_paths=tuple(skipped),
+        local_transferred_paths=tuple(local_transferred),
     )
 
 

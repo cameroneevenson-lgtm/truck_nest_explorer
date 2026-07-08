@@ -133,6 +133,28 @@ def flow_probe_cache_token() -> str:
     return "|".join(_file_cache_token(path) for path in FLOW_CACHE_DEPENDENCY_PATHS)
 
 
+def normalize_flow_kit_names(values: object = ()) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        raw_values = [values]
+    else:
+        try:
+            raw_values = list(values)
+        except TypeError:
+            raw_values = [values]
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        name = str(value or "").strip()
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return tuple(sorted(names, key=lambda item: item.casefold()))
+
+
 def _normalize_status_key(value: object) -> str:
     clean_value = str(value or "").strip().lower()
     if clean_value in VALID_FLOW_STATUS_KEYS:
@@ -247,6 +269,7 @@ def _truck_mismatch_insight(requested_truck: str, returned_truck: str) -> FlowTr
 def load_flow_truck_insight(
     truck_number: str,
     *,
+    hidden_flow_kit_names: object = (),
     runner=subprocess.run,
 ) -> FlowTruckInsight:
     clean_truck = str(truck_number or "").strip()
@@ -278,6 +301,8 @@ def load_flow_truck_insight(
         )
 
     command = [_python_executable(), str(FLOW_PROBE_PATH), clean_truck]
+    for kit_name in normalize_flow_kit_names(hidden_flow_kit_names):
+        command.extend(["--hide-kit", kit_name])
     try:
         completed = runner(
             command,
@@ -351,14 +376,19 @@ def load_flow_truck_insight(
     return insight
 
 
-def load_cached_flow_truck_insight(truck_number: str) -> FlowTruckInsight:
+def load_cached_flow_truck_insight(
+    truck_number: str,
+    *,
+    hidden_flow_kit_names: object = (),
+) -> FlowTruckInsight:
     clean_truck = str(truck_number or "").strip()
     token = flow_probe_cache_token()
-    key = (clean_truck.casefold(), token)
+    hidden_names = normalize_flow_kit_names(hidden_flow_kit_names)
+    key = (clean_truck.casefold(), token, tuple(name.casefold() for name in hidden_names))
     hit, cached = FLOW_INSIGHT_CACHE.get(key)
     if hit and cached is not None:
         return cached
-    insight = load_flow_truck_insight(clean_truck)
+    insight = load_flow_truck_insight(clean_truck, hidden_flow_kit_names=hidden_names)
     FLOW_INSIGHT_CACHE.set(key, insight, negative=not insight.available)
     return insight
 

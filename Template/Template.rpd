@@ -63,8 +63,8 @@
       <CommonCutGapXY>0.2</CommonCutGapXY>
       <CommonCutGapAuto>y</CommonCutGapAuto>
       <IncludeToolingInShape>n</IncludeToolingInShape>
-      <AutoTool>n</AutoTool>
-      <SheetCut>n</SheetCut>
+      <AutoTool>y</AutoTool>
+      <SheetCut>y</SheetCut>
       <RunPreOrderMacro>n</RunPreOrderMacro>
       <PreOrderMacroName/>
       <RunPreAnnotateMacro>n</RunPreAnnotateMacro>
@@ -74,7 +74,7 @@
       <RunNestMacro>n</RunNestMacro>
       <NestMacroName/>
       <AutoDetectFloatingScrap>n</AutoDetectFloatingScrap>
-      <AutoCompile>n</AutoCompile>
+      <AutoCompile>y</AutoCompile>
       <AutoReport>n</AutoReport>
       <ReportFileName>setupsheet</ReportFileName>
       <AutoNestProjectReport>n</AutoNestProjectReport>

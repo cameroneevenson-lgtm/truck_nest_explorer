@@ -38,6 +38,7 @@ from flow_bridge import (
     flow_probe_cache_token,
     load_flow_truck_insight,
     map_explorer_kit_to_flow_kit,
+    normalize_flow_kit_names,
     normalize_flow_insight_for_local_release,
     parse_flow_probe_payload,
 )
@@ -257,6 +258,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
     def test_embedded_gantt_excludes_small_kit_lanes(self) -> None:
         self.assertTrue(include_kit_in_embedded_gantt("Body"))
         self.assertTrue(include_kit_in_embedded_gantt("Console"))
+        self.assertFalse(include_kit_in_embedded_gantt("Body", hidden_kit_names=("Body",)))
         self.assertFalse(include_kit_in_embedded_gantt("Chassis"))
         self.assertFalse(include_kit_in_embedded_gantt("Pump Mounts"))
         self.assertFalse(include_kit_in_embedded_gantt("Pump Coverings"))
@@ -274,6 +276,22 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertEqual([row.row_label for row in embedded_rows], ["F55334 | Exterior"])
         self.assertEqual(rows_by_kit_name["pump covering"].status_key, "red")
         self.assertEqual(rows_by_kit_name["exterior"].status_key, "yellow")
+
+    def test_split_overlay_rows_for_embedded_gantt_hides_requested_kit_rows(self) -> None:
+        rows = [
+            SimpleNamespace(row_label="F55334 | Body", status_key="green"),
+            SimpleNamespace(row_label="F55334 | Console", status_key="yellow"),
+            SimpleNamespace(row_label="F55334 | Pump Mounts", status_key="red"),
+        ]
+
+        embedded_rows, rows_by_kit_name = split_overlay_rows_for_embedded_gantt(
+            rows,
+            hidden_kit_names=("Body",),
+        )
+
+        self.assertEqual([row.row_label for row in embedded_rows], ["F55334 | Console"])
+        self.assertEqual(rows_by_kit_name["body"].status_key, "green")
+        self.assertEqual(rows_by_kit_name["pump mounts"].status_key, "red")
 
     def test_flow_kit_insight_for_explorer_kit_uses_probe_payload_and_fails_safe(self) -> None:
         gantt_png = b"fake-png"
@@ -432,6 +450,40 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn("creationflags", captured_kwargs)
         else:
             self.assertNotIn("startupinfo", captured_kwargs)
+
+    def test_load_flow_truck_insight_passes_hidden_flow_kits_to_probe(self) -> None:
+        captured_command: list[str] = []
+        with workspace_tempdir() as temp_root:
+            flow_dir = temp_root / "flow"
+            flow_dir.mkdir()
+            probe_path = temp_root / "flow_schedule_probe.py"
+            probe_path.write_text("# probe placeholder\n", encoding="utf-8")
+
+            def runner(command, **_kwargs):
+                captured_command[:] = list(command)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "available": True,
+                            "truck_number": "F55334",
+                            "summary_text": "Flow plan 2026-02-09",
+                            "kits": [],
+                        }
+                    ),
+                    stderr="",
+                )
+
+            with patch("flow_bridge.FLOW_APP_DIR", flow_dir), patch("flow_bridge.FLOW_PROBE_PATH", probe_path):
+                insight = load_flow_truck_insight(
+                    "F55334",
+                    hidden_flow_kit_names=("Console", "Body", "body"),
+                    runner=runner,
+                )
+
+        self.assertTrue(insight.available)
+        self.assertEqual(normalize_flow_kit_names(("Console", "Body", "body")), ("Body", "Console"))
+        self.assertEqual(captured_command[-4:], ["--hide-kit", "Body", "--hide-kit", "Console"])
 
     def test_normalize_flow_insight_for_local_release_prefers_local_unreleased_signal(self) -> None:
         truck_insight = parse_flow_probe_payload(
@@ -1655,12 +1707,14 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(plan.matches[0].source_path, source_path)
             self.assertEqual(plan.matches[0].match_reason, "truncated_prefix")
             self.assertEqual(plan.matches[0].target_path.name, "P1 F57524 CONSOLE PACK.cnc")
+            self.assertEqual(plan.matches[0].local_target_path, project_dir.parent / "P1 F57524 CONSOLE PACK.cnc")
             self.assertEqual(
                 plan.target_dir,
                 machine_root / "F57524" / "CONSOLE PACK",
             )
+            self.assertEqual(plan.local_target_dir, project_dir.parent)
 
-    def test_send_project_block_files_copies_full_name_then_deletes_source(self) -> None:
+    def test_send_project_block_files_copies_full_name_to_machine_and_l_then_deletes_source(self) -> None:
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
             project_dir = release_root / "F57524" / "CONSOLE PACK" / "F57524 CONSOLE PACK"
@@ -1687,11 +1741,77 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 / "CONSOLE PACK"
                 / "P1 F57524 CONSOLE PACK.cnc"
             )
+            local_target_path = project_dir.parent / "P1 F57524 CONSOLE PACK.cnc"
             self.assertFalse(source_path.exists())
             self.assertTrue(target_path.exists())
+            self.assertTrue(local_target_path.exists())
             self.assertEqual(target_path.read_text(encoding="utf-8"), "block content")
+            self.assertEqual(local_target_path.read_text(encoding="utf-8"), "block content")
             self.assertEqual(result.transferred_paths, (target_path,))
+            self.assertEqual(result.local_transferred_paths, (local_target_path,))
             self.assertFalse(result.canceled)
+
+    def test_send_project_block_files_keeps_source_when_l_side_copy_fails(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
+            project_dir = release_root / "F57524" / "CONSOLE PACK" / "F57524 CONSOLE PACK"
+            nests_dir = project_dir / "nests"
+            source_root = temp_root / "BLOCK FILES"
+            machine_root = temp_root / "A" / "EiaFiles" / "Battleshield" / "F-LARGE FLEET"
+            nests_dir.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            machine_root.mkdir(parents=True)
+            (nests_dir / "P1 F57524 CONSOLE PACK.drg").write_text("drg", encoding="utf-8")
+            source_path = source_root / "P1 F57524 CONSOLE PA.cnc"
+            source_path.write_text("block content", encoding="utf-8")
+
+            import services
+
+            real_copy_verified = services._copy_verified
+
+            def fail_l_side_copy(source_path_arg, target_path_arg, **kwargs):
+                if Path(target_path_arg).parent == project_dir.parent:
+                    raise RuntimeError("simulated L-side archive failure")
+                return real_copy_verified(source_path_arg, target_path_arg, **kwargs)
+
+            with patch("services._copy_verified", side_effect=fail_l_side_copy):
+                with self.assertRaisesRegex(RuntimeError, "simulated L-side archive failure"):
+                    send_project_block_files_to_machine(
+                        project_dir,
+                        release_root,
+                        source_root=source_root,
+                        machine_root=machine_root,
+                    )
+
+            self.assertTrue(source_path.exists())
+            self.assertTrue((machine_root / "F57524" / "CONSOLE PACK" / "P1 F57524 CONSOLE PACK.cnc").exists())
+            self.assertFalse((project_dir.parent / "P1 F57524 CONSOLE PACK.cnc").exists())
+
+    def test_block_transfer_plan_treats_existing_machine_file_as_already_sent(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "L" / "BATTLESHIELD" / "F-LARGE FLEET"
+            project_dir = release_root / "F57524" / "CONSOLE PACK" / "F57524 CONSOLE PACK"
+            nests_dir = project_dir / "nests"
+            source_root = temp_root / "BLOCK FILES"
+            machine_root = temp_root / "A" / "EiaFiles" / "Battleshield" / "F-LARGE FLEET"
+            target_dir = machine_root / "F57524" / "CONSOLE PACK"
+            nests_dir.mkdir(parents=True)
+            source_root.mkdir(parents=True)
+            target_dir.mkdir(parents=True)
+            (nests_dir / "P1 F57524 CONSOLE PACK.drg").write_text("drg", encoding="utf-8")
+            target_path = target_dir / "P1 F57524 CONSOLE PACK.cnc"
+            target_path.write_text("already sent", encoding="utf-8")
+
+            plan = build_project_block_transfer_plan(
+                project_dir,
+                release_root,
+                source_root=source_root,
+                machine_root=machine_root,
+            )
+
+            self.assertEqual(plan.matches, ())
+            self.assertEqual(plan.missing_drg_paths, ())
+            self.assertEqual(plan.already_sent_paths, (target_path,))
 
     def test_block_transfer_plan_fails_cleanly_when_machine_root_is_unavailable(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -3140,7 +3260,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 window._set_current_statuses([status], cache=False)
 
                 with (
-                    patch("main_window.prepare_packet_build_context") as prepare_mock,
+                    patch("controllers.packet_build_controller.prepare_packet_build_context") as prepare_mock,
                     patch.object(QMessageBox, "information") as information_mock,
                 ):
                     window.build_selected_print_packet()
@@ -3149,8 +3269,8 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
                 prepare_mock.assert_not_called()
                 self.assertEqual(information_mock.call_count, 3)
-                self.assertFalse(window._packet_build_running)
-                self.assertFalse(window._active_packet_build_keys)
+                self.assertFalse(window.packet_build_controller._running)
+                self.assertFalse(window.packet_build_controller._active_keys)
             finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)
@@ -3178,18 +3298,18 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 window.truck_list.blockSignals(False)
                 window._set_current_statuses([status], cache=False)
 
-                guard = window._begin_packet_build_guard("Build Print Packet", status, "print")
+                guard = window.packet_build_controller._begin_guard("Build Print Packet", status, "print")
                 self.assertIsNotNone(guard)
-                self.assertTrue(window._packet_build_running)
+                self.assertTrue(window.packet_build_controller._running)
                 self.assertFalse(window.build_print_packet_button.isEnabled())
 
                 with patch.object(QMessageBox, "information") as information_mock:
-                    blocked_guard = window._begin_packet_build_guard("Build Print Packet", status, "print")
+                    blocked_guard = window.packet_build_controller._begin_guard("Build Print Packet", status, "print")
 
                 self.assertIsNone(blocked_guard)
                 information_mock.assert_called_once()
-                window._finish_packet_build_guard(guard)
-                self.assertFalse(window._packet_build_running)
+                window.packet_build_controller._finish_guard(guard)
+                self.assertFalse(window.packet_build_controller._running)
                 self.assertTrue(window.build_print_packet_button.isEnabled())
             finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)

@@ -137,7 +137,14 @@ class HotReloadController:
         window = self.window
         if not window._hot_reload_request_id:
             return
+        request_id = window._hot_reload_request_id
         self.write_response("accept")
+        # Treat an accepted request as handled immediately. The launcher should
+        # restart the app on the next poll, but suppress this same request in
+        # the UI until that happens so the countdown cannot keep repainting.
+        window._hot_reload_canceled_request_id = request_id
+        window._hot_reload_request_id = ""
+        window._hot_reload_end_time = None
         self.clear_banner()
         window.statusBar().showMessage("Hot reload accepted; restarting app.", 3000)
 

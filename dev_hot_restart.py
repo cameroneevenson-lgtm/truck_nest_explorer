@@ -373,6 +373,38 @@ def main() -> int:
                         f"(auto-reload in {decision_timeout:.0f}s)..."
                     )
 
+                resp = _read_reload_response(resp_path)
+                if resp.get("request_id", "") == current_request_id:
+                    action = resp.get("action", "")
+                    if action == "accept":
+                        if _defer_reload_if_radan_import_active(root, reason="accept"):
+                            request_posted_at = now
+                            _safe_remove(resp_path)
+                            continue
+                        batch_count = len(pending_changes)
+                        print(f"Reload accepted ({batch_count} file(s)); restarting app...")
+                        _terminate_process(proc)
+                        proc = _spawn_app(py_exe, app_py, app_args, cwd=root)
+                        last_spawn_at = time.time()
+                        pending_restart = False
+                        awaiting_user_decision = False
+                        current_request_id = ""
+                        request_posted_at = 0.0
+                        last_change_at = 0.0
+                        pending_changes = []
+                        _clear_reload_handshake(req_path, resp_path)
+                        continue
+                    if action == "reject":
+                        print("Reload canceled in app; keeping current session.")
+                        pending_restart = False
+                        awaiting_user_decision = False
+                        current_request_id = ""
+                        request_posted_at = 0.0
+                        last_change_at = 0.0
+                        pending_changes = []
+                        _clear_reload_handshake(req_path, resp_path)
+                        continue
+
                 waited_for = max(0.0, now - request_posted_at)
                 if awaiting_user_decision and request_posted_at > 0.0 and waited_for >= decision_timeout:
                     if _defer_reload_if_radan_import_active(root, reason="auto-reload"):
@@ -391,38 +423,6 @@ def main() -> int:
                     pending_changes = []
                     _clear_reload_handshake(req_path, resp_path)
                     continue
-
-                resp = _read_reload_response(resp_path)
-                if resp.get("request_id", "") != current_request_id:
-                    continue
-
-                action = resp.get("action", "")
-                if action == "accept":
-                    if _defer_reload_if_radan_import_active(root, reason="accept"):
-                        request_posted_at = now
-                        _safe_remove(resp_path)
-                        continue
-                    batch_count = len(pending_changes)
-                    print(f"Reload accepted ({batch_count} file(s)); restarting app...")
-                    _terminate_process(proc)
-                    proc = _spawn_app(py_exe, app_py, app_args, cwd=root)
-                    last_spawn_at = time.time()
-                    pending_restart = False
-                    awaiting_user_decision = False
-                    current_request_id = ""
-                    request_posted_at = 0.0
-                    last_change_at = 0.0
-                    pending_changes = []
-                    _clear_reload_handshake(req_path, resp_path)
-                elif action == "reject":
-                    print("Reload canceled in app; keeping current session.")
-                    pending_restart = False
-                    awaiting_user_decision = False
-                    current_request_id = ""
-                    request_posted_at = 0.0
-                    last_change_at = 0.0
-                    pending_changes = []
-                    _clear_reload_handshake(req_path, resp_path)
     except KeyboardInterrupt:
         print("\nStopping hot restart launcher.")
         _clear_reload_handshake(req_path, resp_path)

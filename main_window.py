@@ -2,22 +2,15 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-import json
-import subprocess
 import threading
-import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QThreadPool
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
-    QDialog,
-    QFileDialog,
     QFrame,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -29,10 +22,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressDialog,
     QPushButton,
     QScrollArea,
-    QSlider,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -41,23 +32,12 @@ from PySide6.QtWidgets import (
 )
 
 from background_job import BackgroundJobWorker
+from controllers.block_transfer_controller import BlockTransferController
 from controllers.full_flow_controller import FullFlowController
 from controllers.hot_reload_controller import HotReloadController
 from controllers.inventor_controller import InventorController
-from dialogs.import_log_dialog import ImportLogDialog
-from dialogs.multiline_editor_dialog import MultilineEditorDialog
-from packet_build_service import (
-    PacketBuildReadinessError,
-    apply_assembly_context_to_sym_comments,
-    build_assembly_packet,
-    build_cut_list_packet,
-    create_main_packet_worker,
-    prepare_packet_build_context,
-    review_pdf_assets_for_action,
-    scan_assembly_bom_context,
-    validate_print_packet_readiness,
-    write_assembly_bom_context_csv,
-)
+from controllers.packet_build_controller import PacketBuildController
+from controllers.radan_import_controller import RadanImportController
 from flow_bridge import (
     FlowTruckInsight,
     empty_flow_truck_insight,
@@ -65,6 +45,7 @@ from flow_bridge import (
     flow_probe_cache_token,
     invalidate_flow_insight_cache,
     load_cached_flow_truck_insight,
+    map_explorer_kit_to_flow_kit,
     normalize_flow_insight_for_local_release,
 )
 from models import (
@@ -79,13 +60,12 @@ from models import (
     normalize_truck_order_entries,
     resolve_punch_code_text,
 )
-from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, normalize_cache_path, settings_cache_signature
+from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, settings_cache_signature
 from services import (
     FILE_METADATA_CACHE,
     clear_performance_caches,
     collect_kit_statuses,
     configured_kit_mappings,
-    build_project_block_transfer_plan,
     create_kit_scaffold,
     detect_assembly_packet_pdf,
     detect_cut_list_packet_pdf,
@@ -100,18 +80,10 @@ from services import (
     is_hidden_kit,
     is_hidden_truck,
     launch_launcher,
-    launch_radan_csv_import,
-    launch_tool,
-    open_external_target,
     open_path,
-    radan_csv_missing_symbols,
-    radan_csv_import_lock_status,
     release_text_for_status,
-    resolve_existing_inventor_csv,
     restore_truck_visibility,
-    send_project_block_files_to_machine,
     sort_truck_numbers_by_fabrication_order,
-    visible_radan_sessions,
 )
 from settings_store import load_settings, save_settings
 from ui.main_window_styles import dashboard_stylesheet
@@ -128,14 +100,6 @@ class TruckSwitchRunContext:
     flow_done: bool = False
     error: str = ""
     completed: bool = False
-
-
-@dataclass(frozen=True)
-class PacketBuildGuard:
-    title: str
-    action_key: str
-    status: KitStatus
-    lock_key: tuple[str, str]
 
 
 class MainWindow(QMainWindow):
@@ -201,13 +165,6 @@ class MainWindow(QMainWindow):
         self._updating_kit_table = False
         self._kit_table_render_signature: tuple[object, ...] | None = None
         self._current_flow_truck_insight: FlowTruckInsight = empty_flow_truck_insight()
-        self._radan_import_log_dialog: ImportLogDialog | None = None
-        self._radan_import_log_dialogs: list[ImportLogDialog] = []
-        self._packet_build_lock = threading.RLock()
-        self._active_packet_build_keys: set[tuple[str, str]] = set()
-        self._packet_build_running = False
-        self._packet_build_worker = None
-        self._block_file_worker: BackgroundJobWorker | None = None
         self._status_cache_by_truck: BoundedTTLCache[list[KitStatus]] = BoundedTTLCache(
             "ui_status",
             max_size=128,
@@ -275,18 +232,6 @@ class MainWindow(QMainWindow):
             "send_blocks_button",
             "launch_inventor_button",
             "import_csv_button",
-            "radan_dxf_source_slider",
-            "radan_project_update_slider",
-            "release_root_edit",
-            "fabrication_root_edit",
-            "radan_kitter_edit",
-            "inventor_entry_edit",
-            "create_support_folders_checkbox",
-            "settings_browse_release_button",
-            "settings_browse_fabrication_button",
-            "settings_browse_kitter_button",
-            "settings_browse_inventor_button",
-            "settings_save_button",
         ):
             widget = getattr(self, widget_name, None)
             if isinstance(widget, QWidget):
@@ -295,6 +240,17 @@ class MainWindow(QMainWindow):
             self,
             mutating_widgets=tuple(full_flow_lock_widgets),
             editable_table=self.kit_table,
+        )
+        self.block_transfer_controller = BlockTransferController(
+            self,
+            send_blocks_button=self.send_blocks_button,
+        )
+        self.radan_import_controller = RadanImportController(self)
+        self.packet_build_controller = PacketBuildController(
+            self,
+            print_button=self.build_print_packet_button,
+            assembly_button=self.build_assembly_packet_button,
+            cut_list_button=self.build_cut_list_button,
         )
         self._apply_dashboard_style()
         self._load_settings_into_form()
@@ -354,6 +310,9 @@ class MainWindow(QMainWindow):
         self.new_truck_button.clicked.connect(self.create_new_truck)
         self.show_hidden_trucks_button = QPushButton("Show Hidden (0)")
         self.show_hidden_trucks_button.setCheckable(True)
+        self.show_hidden_trucks_button.setMinimumWidth(
+            self.show_hidden_trucks_button.fontMetrics().horizontalAdvance("Show Hidden (000)") + 24
+        )
         self.show_hidden_trucks_button.setToolTip("Temporarily show trucks hidden from the active list.")
         self.show_hidden_trucks_button.toggled.connect(self._apply_truck_filter)
         header.addWidget(title)
@@ -426,68 +385,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(content_splitter, 1)
         return box
 
-    def _build_settings_group(self) -> QWidget:
-        group = QGroupBox("Settings")
-        layout = QGridLayout(group)
-        layout.setColumnStretch(1, 1)
-
-        self.release_root_edit = QLineEdit()
-        self.fabrication_root_edit = QLineEdit()
-        self.radan_kitter_edit = QLineEdit()
-        self.inventor_entry_edit = QLineEdit()
-        self.create_support_folders_checkbox = QCheckBox("Create _bak / _out / _kits support folders")
-
-        browse_release = QPushButton("Browse")
-        browse_release.clicked.connect(lambda: self._pick_directory(self.release_root_edit))
-        browse_fabrication = QPushButton("Browse")
-        browse_fabrication.clicked.connect(lambda: self._pick_directory(self.fabrication_root_edit))
-        browse_kitter = QPushButton("Browse")
-        browse_kitter.clicked.connect(
-            lambda: self._pick_file(
-                self.radan_kitter_edit,
-                "Select radan_kitter launcher",
-                "Batch File (*.bat);;All Files (*.*)",
-            )
-        )
-        browse_inventor = QPushButton("Browse")
-        browse_inventor.clicked.connect(
-            lambda: self._pick_file(
-                self.inventor_entry_edit,
-                "Select inventor_to_radan launcher",
-                "Batch or Python (*.bat *.cmd *.py);;All Files (*.*)",
-            )
-        )
-
-        self.settings_browse_release_button = browse_release
-        self.settings_browse_fabrication_button = browse_fabrication
-        self.settings_browse_kitter_button = browse_kitter
-        self.settings_browse_inventor_button = browse_inventor
-        self.settings_save_button = QPushButton("Save Settings")
-        self.settings_save_button.clicked.connect(self.save_settings_from_form)
-
-        row = 0
-        layout.addWidget(QLabel("Release Root"), row, 0)
-        layout.addWidget(self.release_root_edit, row, 1)
-        layout.addWidget(browse_release, row, 2)
-        row += 1
-        layout.addWidget(QLabel("Fabrication Root"), row, 0)
-        layout.addWidget(self.fabrication_root_edit, row, 1)
-        layout.addWidget(browse_fabrication, row, 2)
-        row += 1
-        layout.addWidget(QLabel("RADAN Kitter Launcher"), row, 0)
-        layout.addWidget(self.radan_kitter_edit, row, 1)
-        layout.addWidget(browse_kitter, row, 2)
-        row += 1
-        layout.addWidget(QLabel("Inventor Launcher"), row, 0)
-        layout.addWidget(self.inventor_entry_edit, row, 1)
-        layout.addWidget(browse_inventor, row, 2)
-        row += 1
-        layout.addWidget(self.create_support_folders_checkbox, row, 0, 1, 3)
-        row += 1
-        layout.addWidget(self.settings_save_button, row, 2)
-
-        return group
-
     def _build_actions_group(self) -> QWidget:
         group = QGroupBox("Truck / Kit Actions")
         layout = QVBoxLayout(group)
@@ -544,9 +441,6 @@ class MainWindow(QMainWindow):
         self.open_truck_fabrication_button = QPushButton("Open W Truck")
         self.open_truck_fabrication_button.setToolTip("Open the selected truck folder on W.")
         self.open_truck_fabrication_button.clicked.connect(self.open_selected_truck_fabrication)
-        self.launch_dashboard_button = QPushButton("Flow App")
-        self.launch_dashboard_button.setToolTip("Launch the fabrication flow app.")
-        self.launch_dashboard_button.clicked.connect(self.open_flow_app)
         self.edit_truck_client_button = QPushButton("Client")
         self.edit_truck_client_button.setToolTip("Store or update the client number for the selected truck.")
         self.edit_truck_client_button.clicked.connect(self.edit_current_truck_client_number)
@@ -559,7 +453,6 @@ class MainWindow(QMainWindow):
         truck_row.addWidget(self.create_selected_button)
         truck_row.addWidget(self.open_truck_release_button)
         truck_row.addWidget(self.open_truck_fabrication_button)
-        truck_row.addWidget(self.launch_dashboard_button)
         truck_row.addWidget(self.edit_truck_client_button)
         truck_row.addWidget(self.toggle_truck_hidden_button)
         truck_row.addStretch(1)
@@ -575,11 +468,6 @@ class MainWindow(QMainWindow):
         self.open_spreadsheet_button = QPushButton("BOM")
         self.open_spreadsheet_button.setToolTip("Open the single spreadsheet found for the selected kit on W.")
         self.open_spreadsheet_button.clicked.connect(self.open_selected_spreadsheet)
-        self.open_flow_pdf_button = QPushButton("Flow Link")
-        self.open_flow_pdf_button.setToolTip(
-            "Open the linked file or URL for the selected mapped flow kit from the fabrication flow dashboard."
-        )
-        self.open_flow_pdf_button.clicked.connect(self.open_selected_flow_pdf)
         self.build_print_packet_button = QPushButton("Build Print Packet")
         self.build_print_packet_button.setToolTip(
             "Build the QTY print packet from the selected kit's saved RPD."
@@ -600,7 +488,7 @@ class MainWindow(QMainWindow):
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
         self.send_blocks_button = QPushButton("Send Blocks")
         self.send_blocks_button.setToolTip(
-            "Copy this project's block files to the machine folder, then delete the source block files after each copy verifies."
+            "Copy this project's block files to the machine folder and L-side kit folder, then delete the source after checksum verification."
         )
         self.send_blocks_button.clicked.connect(self.send_selected_block_files_to_machine)
         self.launch_inventor_button = QPushButton("Run Inventor Tool")
@@ -608,36 +496,11 @@ class MainWindow(QMainWindow):
             "Run the Inventor-to-RADAN launcher on the selected spreadsheet, then move the generated output into the matching L project folder."
         )
         self.launch_inventor_button.clicked.connect(self.run_selected_inventor_flow)
-        self.import_csv_button = QPushButton("Import CSV")
+        self.import_csv_button = QPushButton("Import BOM")
         self.import_csv_button.setToolTip(
             "Import the selected kit's generated _Radan.csv into the matching RADAN project."
         )
         self.import_csv_button.clicked.connect(lambda _checked=False: self.import_selected_csv_to_radan())
-        self.radan_dxf_source_label = QLabel("DXF:")
-        self.radan_dxf_source_left_label = QLabel("Src")
-        self.radan_dxf_source_right_label = QLabel("Clean")
-        self.radan_dxf_source_slider = QSlider(Qt.Horizontal)
-        self.radan_dxf_source_slider.setRange(0, 1)
-        self.radan_dxf_source_slider.setSingleStep(1)
-        self.radan_dxf_source_slider.setPageStep(1)
-        self.radan_dxf_source_slider.setFixedWidth(52)
-        self.radan_dxf_source_slider.setValue(1)
-        self.radan_dxf_source_slider.setToolTip(
-            "Copy/preprocess source DXFs into the L-side _preprocessed_dxfs folder, then let RADAN create symbols from those cleaned copies."
-        )
-        self.radan_project_update_label = QLabel("Project:")
-        self.radan_project_update_left_label = QLabel("RPD")
-        self.radan_project_update_right_label = QLabel("Proj")
-        self.radan_project_update_slider = QSlider(Qt.Horizontal)
-        self.radan_project_update_slider.setRange(0, 1)
-        self.radan_project_update_slider.setSingleStep(1)
-        self.radan_project_update_slider.setPageStep(1)
-        self.radan_project_update_slider.setFixedWidth(52)
-        self.radan_project_update_slider.setToolTip(
-            "Disabled for now: RADAN's NST schedule API did not persist imported parts into the RPD."
-        )
-        self.radan_project_update_slider.setEnabled(False)
-        self.radan_project_update_right_label.setEnabled(False)
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
         self.toggle_selected_kits_hidden_button.setToolTip(
             "Hide or unhide the selected kits in the explorer without deleting anything."
@@ -647,7 +510,6 @@ class MainWindow(QMainWindow):
             self.open_release_folder_button,
             self.open_fabrication_folder_button,
             self.open_spreadsheet_button,
-            self.open_flow_pdf_button,
             self.build_print_packet_button,
             self.build_assembly_packet_button,
             self.build_cut_list_button,
@@ -665,15 +527,6 @@ class MainWindow(QMainWindow):
         production_row.addStretch(1)
 
         radan_row = QHBoxLayout()
-        radan_row.addWidget(QLabel("RADAN CSV:"))
-        radan_row.addWidget(self.radan_dxf_source_label)
-        radan_row.addWidget(self.radan_dxf_source_left_label)
-        radan_row.addWidget(self.radan_dxf_source_slider)
-        radan_row.addWidget(self.radan_dxf_source_right_label)
-        radan_row.addWidget(self.radan_project_update_label)
-        radan_row.addWidget(self.radan_project_update_left_label)
-        radan_row.addWidget(self.radan_project_update_slider)
-        radan_row.addWidget(self.radan_project_update_right_label)
         radan_row.addWidget(self.import_csv_button)
         radan_row.addStretch(1)
 
@@ -694,7 +547,7 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.show_hidden_kits_checkbox = QCheckBox("Show hidden kits")
-        self.show_hidden_kits_checkbox.toggled.connect(self._render_current_statuses)
+        self.show_hidden_kits_checkbox.toggled.connect(self._on_show_hidden_kits_toggled)
         controls.addWidget(self.show_hidden_kits_checkbox)
         controls.addStretch(1)
 
@@ -711,9 +564,9 @@ class MainWindow(QMainWindow):
             | QAbstractItemView.SelectedClicked
         )
         self.kit_table.itemSelectionChanged.connect(self._on_kit_selection_changed)
-        self.kit_table.itemClicked.connect(self._on_kit_table_item_clicked)
+        self.kit_table.itemClicked.connect(self._on_kit_table_item_activated)
         self.kit_table.itemChanged.connect(self._on_kit_table_item_changed)
-        self.kit_table.itemDoubleClicked.connect(self._on_kit_table_item_double_clicked)
+        self.kit_table.itemDoubleClicked.connect(self._on_kit_table_item_activated)
         self.kit_table.verticalHeader().setVisible(False)
         self.kit_table.verticalHeader().setDefaultSectionSize(26)
         self.kit_table.verticalHeader().setMinimumSectionSize(22)
@@ -845,7 +698,6 @@ class MainWindow(QMainWindow):
         return "Open Project: the kit is mostly ready and worth a quick review."
 
     def _available_actions_for_status(self, status: KitStatus) -> str:
-        flow_insight = self._flow_insight_for_status(status)
         packet_match = self._print_packet_match_for_status(status)
         assembly_packet_match = self._assembly_packet_match_for_status(status)
         cut_list_match = self._cut_list_match_for_status(status)
@@ -860,8 +712,6 @@ class MainWindow(QMainWindow):
             actions.append("Open W Kit")
         if status.spreadsheet_match.chosen_path is not None:
             actions.append("BOM")
-        if str(flow_insight.pdf_link or "").strip():
-            actions.append("Flow Link")
         if status.preview_pdf_match.chosen_path is not None:
             actions.append("Open Nest Summary")
         if packet_match.chosen_path is not None:
@@ -1086,42 +936,6 @@ class MainWindow(QMainWindow):
             hidden_kits=list(self.settings.hidden_kits),
         )
 
-    def save_settings_from_form(self) -> None:
-        self.settings = self._settings_from_form()
-        save_path = save_settings(self.settings)
-        self.log(f"Saved settings to {save_path}")
-        self.refresh_trucks()
-
-    def edit_template_rules(self) -> None:
-        dialog = MultilineEditorDialog(
-            title="Edit Template Replacement Rules",
-            value=self.settings.template_replacements_text,
-            helper_text=(
-                "Use one rule per line in the form FIND => REPLACE.\n"
-                "Available replacement placeholders: {truck_number}, {kit_name}, "
-                "{project_name}, {rpd_stem}.\n"
-                "Example:\n"
-                "TEMPLATE PROJECT => {project_name}"
-            ),
-            parent=self,
-        )
-        if dialog.exec() != QDialog.Accepted:
-            return
-        self.settings.template_replacements_text = dialog.value()
-        self.save_settings_from_form()
-
-    def _pick_directory(self, line_edit: QLineEdit) -> None:
-        start_dir = line_edit.text().strip()
-        path = QFileDialog.getExistingDirectory(self, "Select folder", start_dir)
-        if path:
-            line_edit.setText(path)
-
-    def _pick_file(self, line_edit: QLineEdit, title: str, file_filter: str) -> None:
-        start_dir = line_edit.text().strip()
-        path, _ = QFileDialog.getOpenFileName(self, title, start_dir, file_filter)
-        if path:
-            line_edit.setText(path)
-
     def _settings_signature(self) -> str:
         return settings_cache_signature(self.settings)
 
@@ -1130,6 +944,37 @@ class MainWindow(QMainWindow):
 
     def _flow_cache_key(self, truck_number: str, cache_token: str) -> tuple[str, str, str]:
         return ("ui_flow", str(truck_number or "").strip().casefold(), str(cache_token or ""))
+
+    def _hidden_flow_kit_names_for_truck(self, truck_number: str) -> tuple[str, ...]:
+        if bool(self.show_hidden_kits_checkbox.isChecked()):
+            return ()
+        truck_key = normalize_hidden_truck_number(truck_number).casefold()
+        if not truck_key:
+            return ()
+
+        hidden_flow_names: list[str] = []
+        seen: set[str] = set()
+        for value in canonicalize_hidden_kit_entries(self.settings.hidden_kits, self.settings.kit_templates):
+            if "::" not in value:
+                continue
+            hidden_truck, kit_name = value.split("::", 1)
+            if normalize_hidden_truck_number(hidden_truck).casefold() != truck_key:
+                continue
+            flow_name = map_explorer_kit_to_flow_kit(kit_name)
+            flow_key = flow_name.casefold()
+            if not flow_name or flow_key in seen:
+                continue
+            seen.add(flow_key)
+            hidden_flow_names.append(flow_name)
+        return tuple(sorted(hidden_flow_names, key=lambda item: item.casefold()))
+
+    def _flow_request_token(self, truck_number: str) -> str:
+        token = flow_probe_cache_token()
+        hidden_flow_names = self._hidden_flow_kit_names_for_truck(truck_number)
+        if not hidden_flow_names:
+            return token
+        hidden_signature = ",".join(name.casefold() for name in hidden_flow_names)
+        return f"{token}|hidden_gantt:{hidden_signature}"
 
     def _invalidate_status_for_truck(self, truck_number: str) -> None:
         truck_key = str(truck_number or "").strip().casefold()
@@ -1380,7 +1225,8 @@ class MainWindow(QMainWindow):
 
     def _load_flow_for_truck(self, truck_number: str, *, run_id: int) -> bool:
         truck_key = truck_number.casefold()
-        current_flow_token = flow_probe_cache_token()
+        current_flow_token = self._flow_request_token(truck_number)
+        hidden_flow_kit_names = self._hidden_flow_kit_names_for_truck(truck_number)
         flow_cache_key = self._flow_cache_key(truck_number, current_flow_token)
         hit, cached_flow = self._flow_cache_by_truck.get(flow_cache_key)
         if hit and cached_flow is not None:
@@ -1411,7 +1257,11 @@ class MainWindow(QMainWindow):
 
         self._current_flow_truck_insight = self._loading_flow_insight(truck_number)
         self._refresh_current_truck_heading()
-        future = self._flow_executor.submit(load_cached_flow_truck_insight, truck_number)
+        future = self._flow_executor.submit(
+            load_cached_flow_truck_insight,
+            truck_number,
+            hidden_flow_kit_names=hidden_flow_kit_names,
+        )
         self._pending_flow_by_truck[truck_key] = (
             truck_number,
             current_flow_token,
@@ -1486,7 +1336,7 @@ class MainWindow(QMainWindow):
             return
 
         current_key = self.current_truck_number().casefold()
-        current_token = flow_probe_cache_token()
+        current_token = self._flow_request_token(self.current_truck_number())
         for truck_key, truck_number, cache_token, run_id, future in completed:
             try:
                 insight = future.result()
@@ -1528,7 +1378,7 @@ class MainWindow(QMainWindow):
         truck_key = truck_number.casefold()
         if truck_key in self._pending_flow_by_truck:
             return
-        current_token = flow_probe_cache_token()
+        current_token = self._flow_request_token(truck_number)
         hit, cached_flow = self._flow_cache_by_truck.get(self._flow_cache_key(truck_number, current_token))
         if hit and cached_flow is not None and cached_flow[0] == current_token:
             return
@@ -1603,6 +1453,24 @@ class MainWindow(QMainWindow):
         for row in range(len(visible_statuses)):
             self.kit_table.setRowHeight(row, 26)
         self._refresh_hidden_action_labels()
+
+    def _on_show_hidden_kits_toggled(self) -> None:
+        self._render_current_statuses()
+        self._reload_current_flow_for_hidden_state()
+
+    def _reload_current_flow_for_hidden_state(self) -> None:
+        truck_number = self.current_truck_number().strip()
+        if not truck_number:
+            return
+        context = self._active_truck_switch
+        truck_key = truck_number.casefold()
+        run_id = (
+            context.run_id
+            if context is not None and context.truck_number.casefold() == truck_key
+            else self._truck_switch_run_id
+        )
+        if self._load_flow_for_truck(truck_number, run_id=run_id):
+            self._refresh_flow_dependent_status_cells()
 
     def _hidden_foreground_for_status(self, status: KitStatus) -> QColor | None:
         return QColor("#6C757D") if is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings) else None
@@ -1763,32 +1631,7 @@ class MainWindow(QMainWindow):
         self.log(f"Saved notes for {status.paths.display_name}.")
         self._refresh_details_pane()
 
-    def _on_kit_table_item_clicked(self, item: QTableWidgetItem) -> None:
-        row = item.row()
-        if row < 0 or row >= len(self._current_statuses):
-            return
-        status = self._current_statuses[row]
-        if item.column() == self.PROJECT_FILE_COLUMN:
-            if status.rpd_exists and status.paths.rpd_path is not None:
-                self._open_rpd_for_status(status)
-            return
-        if item.column() == self.NEST_SUMMARY_COLUMN:
-            if status.preview_pdf_match.chosen_path is not None:
-                self._open_nest_summary_for_status(status)
-            return
-        if item.column() == self.PRINT_PACKET_COLUMN:
-            if self._print_packet_match_for_status(status).chosen_path is not None:
-                self._open_print_packet_for_status(status)
-            return
-        if item.column() == self.ASSEMBLY_PACKET_COLUMN:
-            if self._assembly_packet_match_for_status(status).chosen_path is not None:
-                self._open_assembly_packet_for_status(status)
-            return
-        if item.column() == self.CUT_LIST_COLUMN:
-            if self._cut_list_match_for_status(status).chosen_path is not None:
-                self._open_cut_list_for_status(status)
-
-    def _on_kit_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+    def _on_kit_table_item_activated(self, item: QTableWidgetItem) -> None:
         row = item.row()
         if row < 0 or row >= len(self._current_statuses):
             return
@@ -2037,8 +1880,12 @@ class MainWindow(QMainWindow):
             "Show Kits" if selected_hidden else "Hide Kits"
         )
         self._refresh_details_pane()
-        self._refresh_packet_build_button_states()
-        self._refresh_send_blocks_button_state()
+        packet_build_controller = getattr(self, "packet_build_controller", None)
+        if packet_build_controller is not None:
+            packet_build_controller.refresh_button_states()
+        block_transfer_controller = getattr(self, "block_transfer_controller", None)
+        if block_transfer_controller is not None:
+            block_transfer_controller.refresh_button_state()
         full_flow_controller = getattr(self, "full_flow_controller", None)
         if full_flow_controller is not None:
             full_flow_controller.reapply_action_lock()
@@ -2082,7 +1929,6 @@ class MainWindow(QMainWindow):
     def _prewarm_visible_truck_caches(self) -> None:
         current_key = self.current_truck_number().casefold()
         settings_signature = self._settings_signature()
-        flow_token = flow_probe_cache_token()
         started_status = False
         started_flow = False
         for truck_number in self._visible_truck_numbers():
@@ -2099,6 +1945,8 @@ class MainWindow(QMainWindow):
                     self._status_executor.submit(collect_kit_statuses, truck_number, self.settings),
                 )
                 started_status = True
+            flow_token = self._flow_request_token(truck_number)
+            hidden_flow_kit_names = self._hidden_flow_kit_names_for_truck(truck_number)
             flow_key = self._flow_cache_key(truck_number, flow_token)
             flow_hit, _cached_flow = self._flow_cache_by_truck.get(flow_key)
             if not flow_hit and truck_key not in self._pending_flow_by_truck:
@@ -2106,7 +1954,11 @@ class MainWindow(QMainWindow):
                     truck_number,
                     flow_token,
                     0,
-                    self._flow_executor.submit(load_cached_flow_truck_insight, truck_number),
+                    self._flow_executor.submit(
+                        load_cached_flow_truck_insight,
+                        truck_number,
+                        hidden_flow_kit_names=hidden_flow_kit_names,
+                    ),
                 )
                 started_flow = True
             self._prewarm_truck_keys.add(truck_key)
@@ -2263,6 +2115,7 @@ class MainWindow(QMainWindow):
         self.settings.hidden_kits = canonical_hidden_kits
         self._save_hidden_state()
         self._render_current_statuses()
+        self._reload_current_flow_for_hidden_state()
 
         action_text = "Unhid" if should_unhide else "Hid"
         names = ", ".join(status.paths.display_name for status in selected_statuses)
@@ -2397,13 +2250,6 @@ class MainWindow(QMainWindow):
             return
         self._open_path_with_message(fabrication_truck_dir)
 
-    def open_selected_rpd(self) -> None:
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Open Project File", "Select a kit first.")
-            return
-        self._open_rpd_for_status(status)
-
     def _open_rpd_for_status(self, status: KitStatus) -> None:
         if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
             QMessageBox.warning(
@@ -2442,37 +2288,6 @@ class MainWindow(QMainWindow):
             )
             return
         self._open_path_with_message(spreadsheet_path)
-
-    def open_selected_flow_pdf(self) -> None:
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Open Flow Link", "Select a kit first.")
-            return
-
-        flow_insight = flow_kit_insight_for_explorer_kit(status.kit_name, self._current_flow_truck_insight)
-        if not flow_insight.flow_kit_name:
-            QMessageBox.information(
-                self,
-                "Open Flow Link",
-                "This kit is not tracked as its own scheduled flow kit in the fabrication flow dashboard.",
-            )
-            return
-
-        pdf_link = str(flow_insight.pdf_link or "").strip()
-        if not pdf_link:
-            QMessageBox.warning(
-                self,
-                "Open Flow Link",
-                f"No linked file or URL is set in the fabrication flow dashboard for {flow_insight.flow_kit_name}.",
-            )
-            return
-
-        try:
-            open_external_target(pdf_link)
-        except Exception as exc:
-            QMessageBox.warning(self, "Open Flow Link", str(exc))
-            return
-        self.log(f"Opened flow link {pdf_link}")
 
     def _open_nest_summary_for_status(self, status: KitStatus) -> None:
         summary_path = status.preview_pdf_match.chosen_path
@@ -2521,290 +2336,11 @@ class MainWindow(QMainWindow):
             return
         self._open_path_with_message(packet_path)
 
-    def open_selected_nest_summary(self) -> None:
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Open Nest Summary", "Select a kit first.")
-            return
-        self._open_nest_summary_for_status(status)
-
-    def open_selected_print_packet(self) -> None:
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Open Print Packet", "Select a kit first.")
-            return
-        self._open_print_packet_for_status(status)
-
-    def open_selected_assembly_packet(self) -> None:
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Open Assembly Packet", "Select a kit first.")
-            return
-        self._open_assembly_packet_for_status(status)
-
-    def open_selected_cut_list(self) -> None:
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, "Open Cut List", "Select a kit first.")
-            return
-        self._open_cut_list_for_status(status)
-
-    def _packet_build_guard_key(self, status: KitStatus, action_key: str) -> tuple[str, str]:
-        path_source = status.paths.rpd_path or status.paths.project_dir or status.paths.display_name
-        return (str(action_key or "").strip().casefold(), normalize_cache_path(path_source))
-
-    def _packet_build_is_running(self) -> bool:
-        with self._packet_build_lock:
-            return bool(self._packet_build_running or self._active_packet_build_keys)
-
-    def _begin_packet_build_guard(
-        self,
-        title: str,
-        status: KitStatus,
-        action_key: str,
-    ) -> PacketBuildGuard | None:
-        guard = PacketBuildGuard(
-            title=title,
-            action_key=str(action_key or "").strip().casefold(),
-            status=status,
-            lock_key=self._packet_build_guard_key(status, action_key),
-        )
-        with self._packet_build_lock:
-            if self._packet_build_running or self._active_packet_build_keys:
-                QMessageBox.information(
-                    self,
-                    title,
-                    "A packet build is already running. Let it finish before starting another one.",
-                )
-                return None
-            self._active_packet_build_keys.add(guard.lock_key)
-            self._packet_build_running = True
-        self._refresh_packet_build_button_states()
-        return guard
-
-    def _finish_packet_build_guard(self, guard: PacketBuildGuard | None) -> None:
-        if guard is None:
-            return
-        with self._packet_build_lock:
-            self._active_packet_build_keys.discard(guard.lock_key)
-            self._packet_build_running = bool(self._active_packet_build_keys)
-            if not self._packet_build_running:
-                self._packet_build_worker = None
-        self._refresh_packet_build_button_states()
-
-    def _packet_match_for_action(self, status: KitStatus, action_key: str, *, use_cache: bool) -> object:
-        cache = FILE_METADATA_CACHE if use_cache else None
-        normalized = str(action_key or "").strip().casefold()
-        if normalized in {"print", "part"}:
-            return detect_print_packet_pdf(status.paths, fs_cache=cache)
-        if normalized == "assembly":
-            return detect_assembly_packet_pdf(status.paths, fs_cache=cache)
-        if normalized == "cut_list":
-            return detect_cut_list_packet_pdf(status.paths, fs_cache=cache)
-        raise ValueError(f"Unknown packet build action: {action_key!r}")
-
-    def _packet_build_button_configs(self):
-        return (
-            (
-                "print",
-                self.build_print_packet_button,
-                "Build Print Packet",
-                "Print Packet Ready",
-                "Build the QTY print packet from the selected kit's saved RPD.",
-                "Print packet",
-                "",
-            ),
-            (
-                "assembly",
-                self.build_assembly_packet_button,
-                "Build Assembly Packet",
-                "Assembly Packet Ready",
-                "Build the .iam-backed assembly drawing packet from the selected kit's saved RPD.",
-                "Assembly packet",
-                self.ASSEMBLY_PACKET_DISABLED_REASON if not self.ASSEMBLY_PACKET_BUILD_ENABLED else "",
-            ),
-            (
-                "cut_list",
-                self.build_cut_list_button,
-                "Build Cut List",
-                "Cut List Ready",
-                "Build the non-laser cut list packet from the selected kit's saved RPD.",
-                "Cut list",
-                self.CUT_LIST_DISABLED_REASON if not self.CUT_LIST_BUILD_ENABLED else "",
-            ),
-        )
-
-    def _refresh_packet_build_button_states(self) -> None:
-        if not all(
-            hasattr(self, name)
-            for name in (
-                "build_print_packet_button",
-                "build_assembly_packet_button",
-                "build_cut_list_button",
-            )
-        ):
-            return
-        status = self._current_status()
-        with self._packet_build_lock:
-            active = bool(self._packet_build_running or self._active_packet_build_keys)
-            active_actions = {key[0] for key in self._active_packet_build_keys}
-        for action_key, button, default_text, ready_text, default_tooltip, packet_label, disabled_reason in (
-            self._packet_build_button_configs()
-        ):
-            button.setText(default_text)
-            button.setToolTip(default_tooltip)
-            button.setEnabled(status is not None)
-            if disabled_reason:
-                button.setEnabled(False)
-                button.setToolTip(disabled_reason)
-                continue
-            if status is None:
-                button.setEnabled(False)
-                button.setToolTip("Select a kit first.")
-                continue
-            if active:
-                button.setEnabled(False)
-                if action_key in active_actions:
-                    button.setText("Building...")
-                button.setToolTip("A packet build is already running.")
-                continue
-            match = self._packet_match_for_action(status, action_key, use_cache=True)
-            packet_path = getattr(match, "chosen_path", None)
-            if packet_path is not None:
-                button.setText(ready_text)
-                button.setEnabled(False)
-                button.setToolTip(
-                    f"{packet_label} already exists:\n{packet_path}\n\n"
-                    "Use the packet cell in the table to open it, or delete the packet file before rebuilding."
-                )
-
-    def _refresh_send_blocks_button_state(self) -> None:
-        button = getattr(self, "send_blocks_button", None)
-        if not isinstance(button, QPushButton):
-            return
-        if self._block_file_worker is not None:
-            button.setEnabled(False)
-            button.setText("Sending Blocks...")
-            button.setToolTip("Block files are being copied to the machine.")
-            return
-        status = self._current_status()
-        button.setText("Send Blocks")
-        if status is None:
-            button.setEnabled(False)
-            button.setToolTip("Select a kit first.")
-            return
-        if status.paths.project_dir is None or not status.paths.project_dir.exists():
-            button.setEnabled(False)
-            button.setToolTip("The selected kit does not have an L-side project folder yet.")
-            return
-        button.setEnabled(True)
-        button.setToolTip(
-            "Copy this project's matched block files to the mirrored A: machine folder, "
-            "write full DRG-based file names, then delete each source block file after the copy verifies."
-        )
-
-    def _show_existing_packet_feedback(
-        self,
-        *,
-        title: str,
-        status: KitStatus,
-        action_key: str,
-        match: object,
-    ) -> None:
-        packet_path = getattr(match, "chosen_path", None)
-        packet_label = {
-            "print": "Print packet",
-            "part": "Print packet",
-            "assembly": "Assembly packet",
-            "cut_list": "Cut list",
-        }.get(str(action_key or "").strip().casefold(), "Packet")
-        QMessageBox.information(
-            self,
-            title,
-            (
-                f"{packet_label} already exists for {status.paths.display_name}:\n"
-                f"{packet_path}\n\n"
-                "No new packet was generated."
-            ),
-        )
-        self.log(f"Skipped {title.lower()} for {status.paths.display_name}; existing packet: {packet_path}")
-        self._refresh_packet_statuses(status)
-
-    def _prepare_packet_build_context(
-        self,
-        title: str,
-        *,
-        action_key: str,
-        include_assembly_sources: bool = False,
-        include_cut_list_sources: bool = False,
-    ):
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, title, "Select a kit first.")
-            return None, None, None
-        if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
-            QMessageBox.warning(
-                self,
-                title,
-                "The L-side project file is missing for this kit.",
-            )
-            return None, None, None
-        running_import, _lock_path, lock_pid = radan_csv_import_lock_status(status.paths.rpd_path)
-        if running_import:
-            pid_text = f" PID {lock_pid}" if lock_pid is not None else ""
-            QMessageBox.warning(
-                self,
-                title,
-                "A RADAN CSV import is still running for this project.\n\n"
-                f"Let the import helper{pid_text} finish before building packets.",
-            )
-            return None, None, None
-        if status.paths.fabrication_kit_dir is None or not status.paths.fabrication_kit_dir.exists():
-            QMessageBox.warning(
-                self,
-                title,
-                "The W-side kit folder is missing for this kit.",
-            )
-            return None, None, None
-
-        guard = self._begin_packet_build_guard(title, status, action_key)
-        if guard is None:
-            return None, None, None
-
-        # Idempotency check: packet builds create timestamped artifacts. Before
-        # doing any RPD/PDF work, look for an existing generated packet with a
-        # fresh filesystem read so repeated clicks, restarts, or externally
-        # generated packets do not produce duplicate packet files.
-        existing_match = self._packet_match_for_action(status, action_key, use_cache=False)
-        if getattr(existing_match, "chosen_path", None) is not None:
-            self._show_existing_packet_feedback(
-                title=title,
-                status=status,
-                action_key=action_key,
-                match=existing_match,
-            )
-            self._finish_packet_build_guard(guard)
-            return None, None, None
-
-        try:
-            context = prepare_packet_build_context(
-                rpd_path=status.paths.rpd_path,
-                fabrication_dir=status.paths.fabrication_kit_dir,
-                settings=self.settings,
-                include_assembly_sources=include_assembly_sources,
-                include_cut_list_sources=include_cut_list_sources,
-            )
-        except Exception as exc:
-            self._finish_packet_build_guard(guard)
-            QMessageBox.critical(self, title, str(exc))
-            return None, None, None
-
-        return status, context, guard
 
     def _refresh_packet_statuses(self, status: KitStatus) -> None:
         if status.paths.truck_number.casefold() == self.current_truck_number().casefold():
             self._queue_status_refresh_for_truck(status.paths.truck_number)
-            self._refresh_packet_build_button_states()
+            self.packet_build_controller.refresh_button_states()
 
     def _queue_status_refresh_for_truck(self, truck_number: str) -> bool:
         truck_text = str(truck_number or "").strip()
@@ -2851,443 +2387,13 @@ class MainWindow(QMainWindow):
         self._queue_status_refresh_for_truck(self.current_truck_number())
 
     def build_selected_print_packet(self) -> None:
-        status, context, guard = self._prepare_packet_build_context("Build Print Packet", action_key="print")
-        if status is None or context is None or guard is None:
-            return
-        worker_started = False
-        try:
-            if not context.parts:
-                QMessageBox.information(
-                    self,
-                    "Build Print Packet",
-                    "No parts were found in the selected RPD.",
-                )
-                return
-
-            expected_csv_path = None
-            if status.spreadsheet_match.chosen_path is not None:
-                try:
-                    expected_csv_path = resolve_existing_inventor_csv(
-                        status.spreadsheet_match.chosen_path,
-                        status.paths.project_dir,
-                    )
-                except Exception:
-                    expected_csv_path = None
-            try:
-                readiness_warning = validate_print_packet_readiness(
-                    rpd_path=status.paths.rpd_path,
-                    parts=context.parts,
-                    expected_csv_path=expected_csv_path,
-                )
-            except PacketBuildReadinessError as exc:
-                QMessageBox.warning(self, "Build Print Packet", str(exc))
-                return
-            if readiness_warning:
-                choice = QMessageBox.question(
-                    self,
-                    "Build Print Packet",
-                    f"{readiness_warning}\n\nBuild the print packet from the current saved RPD anyway?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
-                )
-                if choice != QMessageBox.Yes:
-                    return
-
-            if not review_pdf_assets_for_action(
-                parent=self,
-                action_name="Build Print Packet",
-                context=context,
-                rpd_path=status.paths.rpd_path,
-            ):
-                self.log("Print packet build canceled during PDF asset review.")
-                return
-
-            total_steps = max(1, len(context.parts))
-            progress = QProgressDialog("Building print packet...", "Cancel", 0, total_steps, self)
-            progress.setWindowTitle("Build Print Packet")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setAutoClose(False)
-            progress.setAutoReset(False)
-
-            worker = create_main_packet_worker(
-                context=context,
-                rpd_path=status.paths.rpd_path,
-            )
-            self._packet_build_worker = worker
-
-            def _set_progress(done: int, status_text: str) -> None:
-                progress.setMaximum(total_steps)
-                progress.setValue(max(0, min(total_steps, int(done))))
-                progress.setLabelText(f"Building print packet...\n{status_text}")
-                QApplication.processEvents()
-
-            def _cleanup() -> None:
-                try:
-                    progress.close()
-                except Exception:
-                    pass
-                self._finish_packet_build_guard(guard)
-
-            def _on_progress(done: int, total: int, status_text: str) -> None:
-                _set_progress(int(done), status_text)
-
-            def _on_done(packet_path: str, pages: int, missing: int) -> None:
-                _cleanup()
-                self._refresh_packet_statuses(status)
-                try:
-                    open_path(Path(packet_path))
-                except Exception:
-                    pass
-                QMessageBox.information(
-                    self,
-                    "Build Print Packet",
-                    (
-                        f"Print packet pages: {int(pages)}\n"
-                        f"Missing part PDFs: {int(missing)}\n"
-                        f"Print packet: {packet_path}"
-                    ),
-                )
-                self.log(f"Built print packet for {status.paths.display_name}.")
-
-            def _on_canceled(pages: int, missing: int) -> None:
-                _cleanup()
-                self.log("Print packet build canceled.")
-
-            def _on_empty(message: str, pages: int, missing: int) -> None:
-                _cleanup()
-                QMessageBox.information(
-                    self,
-                    "Build Print Packet",
-                    f"{message}\n\nMissing part PDFs: {int(missing)}",
-                )
-
-            def _on_error(tb: str) -> None:
-                _cleanup()
-                QMessageBox.critical(
-                    self,
-                    "Build Print Packet",
-                    str(tb or "").strip() or "Packet build failed.",
-                )
-
-            worker.signals.progress.connect(_on_progress)
-            worker.signals.done.connect(_on_done)
-            worker.signals.canceled.connect(_on_canceled)
-            worker.signals.empty.connect(_on_empty)
-            worker.signals.error.connect(_on_error)
-            progress.canceled.connect(worker.request_stop)
-            _set_progress(0, "Starting")
-            QThreadPool.globalInstance().start(worker)
-            worker_started = True
-        finally:
-            if not worker_started:
-                self._finish_packet_build_guard(guard)
+        self.packet_build_controller.build_print_packet()
 
     def build_selected_assembly_packet(self) -> None:
-        if not self.ASSEMBLY_PACKET_BUILD_ENABLED:
-            QMessageBox.information(self, "Build Assembly Packet", self.ASSEMBLY_PACKET_DISABLED_REASON)
-            return
-        status, context, guard = self._prepare_packet_build_context("Build Assembly Packet", action_key="assembly")
-        if status is None or context is None or guard is None:
-            return
-        worker_started = False
-
-        progress = QProgressDialog("Searching for assembly drawing PDFs...", "Cancel", 0, 0, self)
-        progress.setWindowTitle("Build Assembly Packet")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-
-        def _job(worker: BackgroundJobWorker) -> dict[str, object]:
-            worker.emit_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
-            discovered_context = prepare_packet_build_context(
-                rpd_path=status.paths.rpd_path,
-                fabrication_dir=status.paths.fabrication_kit_dir,
-                settings=self.settings,
-                include_assembly_sources=True,
-                include_cut_list_sources=False,
-            )
-            if worker.should_cancel():
-                return {"state": "canceled", "context": discovered_context, "result": None}
-            if not discovered_context.assembly_source_pdfs:
-                return {"state": "empty", "context": discovered_context, "result": None}
-            context_result = scan_assembly_bom_context(
-                parts=discovered_context.parts,
-                source_pdfs=discovered_context.assembly_source_pdfs,
-                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
-                should_cancel_cb=worker.should_cancel,
-            )
-            worker.emit_progress(0, 0, "Assembly context | Updating part SYM comments")
-            sym_comment_result = apply_assembly_context_to_sym_comments(
-                parts=discovered_context.parts,
-                result=context_result,
-                backup_dir=status.paths.rpd_path.parent / "_bak" / "assembly_comments",
-            )
-            context_report_path = write_assembly_bom_context_csv(
-                rpd_path=status.paths.rpd_path,
-                result=context_result,
-            )
-            if worker.should_cancel():
-                return {
-                    "state": "canceled",
-                    "context": discovered_context,
-                    "result": None,
-                    "assembly_context": context_result,
-                    "assembly_context_report": context_report_path,
-                    "sym_comment_result": sym_comment_result,
-                }
-            result = build_assembly_packet(
-                rpd_path=status.paths.rpd_path,
-                source_pdfs=discovered_context.assembly_source_pdfs,
-                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
-                should_cancel_cb=worker.should_cancel,
-            )
-            return {
-                "state": "done",
-                "context": discovered_context,
-                "result": result,
-                "assembly_context": context_result,
-                "assembly_context_report": context_report_path,
-                "sym_comment_result": sym_comment_result,
-            }
-
-        worker = BackgroundJobWorker(_job)
-        self._packet_build_worker = worker
-
-        def _set_progress(done: int, total: int, status_text: str) -> None:
-            if int(total) <= 0:
-                progress.setRange(0, 0)
-            else:
-                progress.setRange(0, int(total))
-                progress.setValue(max(0, min(int(total), int(done))))
-            progress.setLabelText(f"Building assembly packet...\n{status_text}")
-
-        def _cleanup() -> None:
-            try:
-                progress.close()
-            except Exception:
-                pass
-            self._finish_packet_build_guard(guard)
-
-        def _on_progress(done: int, total: int, status_text: str) -> None:
-            _set_progress(int(done), int(total), status_text)
-
-        def _on_done(payload: object) -> None:
-            _cleanup()
-            data = payload if isinstance(payload, dict) else {}
-            result = data.get("result")
-            discovered_context = data.get("context")
-            assembly_context = data.get("assembly_context")
-            assembly_context_report = data.get("assembly_context_report")
-            sym_comment_result = data.get("sym_comment_result")
-            state = str(data.get("state") or "")
-            if state == "empty":
-                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
-                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
-                QMessageBox.information(
-                    self,
-                    "Build Assembly Packet",
-                    "No .iam-backed assembly drawing PDFs were found.\n\nSearched:\n" + searched,
-                )
-                return
-            if state == "canceled" or bool(getattr(result, "skipped", False)):
-                self.log("Assembly packet build canceled.")
-                return
-            if result is None:
-                QMessageBox.information(
-                    self,
-                    "Build Assembly Packet",
-                    "No .iam-backed assembly drawing PDFs were found.",
-                )
-                return
-
-            self._refresh_packet_statuses(status)
-
-            packet_path = str(getattr(result, "packet_path", "") or "")
-            context_report_text = str(assembly_context_report or "")
-            reference_count = len(getattr(assembly_context, "references", ()) or ())
-            read_error_count = len(getattr(assembly_context, "read_errors", ()) or ())
-            sym_comment_updated = int(getattr(sym_comment_result, "updated_count", 0) or 0)
-            sym_comment_skipped = int(getattr(sym_comment_result, "skipped_count", 0) or 0)
-            sym_comment_missing = int(getattr(sym_comment_result, "missing_count", 0) or 0)
-            sym_comment_errors = len(getattr(sym_comment_result, "errors", ()) or ())
-            if packet_path:
-                try:
-                    open_path(Path(packet_path))
-                except Exception:
-                    pass
-                QMessageBox.information(
-                    self,
-                    "Build Assembly Packet",
-                    (
-                        f"Assembly packet documents: {int(getattr(result, 'source_documents', 0))}\n"
-                        f"Assembly packet pages: {int(getattr(result, 'output_pages', 0))}\n"
-                        f"Assembly part references: {reference_count}\n"
-                        f"SYM assembly comments: {sym_comment_updated} updated, {sym_comment_skipped} skipped, {sym_comment_missing} missing, {sym_comment_errors} error(s)\n"
-                        f"Assembly context read errors: {read_error_count}\n"
-                        f"Assembly context: {context_report_text}\n"
-                        f"Assembly packet: {packet_path}"
-                    ),
-                )
-                self.log(f"Built assembly packet for {status.paths.display_name}.")
-                return
-
-            QMessageBox.information(
-                self,
-                "Build Assembly Packet",
-                "No drawing-size pages were found in the .iam-backed PDFs.",
-            )
-
-        def _on_error(tb: str) -> None:
-            _cleanup()
-            QMessageBox.critical(
-                self,
-                "Build Assembly Packet",
-                str(tb or "").strip() or "Assembly packet build failed.",
-            )
-
-        worker.signals.progress.connect(_on_progress)
-        worker.signals.done.connect(_on_done)
-        worker.signals.error.connect(_on_error)
-        progress.canceled.connect(worker.request_stop)
-        _set_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
-        try:
-            QThreadPool.globalInstance().start(worker)
-            worker_started = True
-        finally:
-            if not worker_started:
-                self._finish_packet_build_guard(guard)
+        self.packet_build_controller.build_assembly_packet()
 
     def build_selected_cut_list_packet(self) -> None:
-        if not self.CUT_LIST_BUILD_ENABLED:
-            QMessageBox.information(self, "Build Cut List", self.CUT_LIST_DISABLED_REASON)
-            return
-        status, context, guard = self._prepare_packet_build_context("Build Cut List", action_key="cut_list")
-        if status is None or context is None or guard is None:
-            return
-        worker_started = False
-
-        progress = QProgressDialog("Searching for non-laser cut list PDFs...", "Cancel", 0, 0, self)
-        progress.setWindowTitle("Build Cut List")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-
-        def _job(worker: BackgroundJobWorker) -> dict[str, object]:
-            worker.emit_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
-            discovered_context = prepare_packet_build_context(
-                rpd_path=status.paths.rpd_path,
-                fabrication_dir=status.paths.fabrication_kit_dir,
-                settings=self.settings,
-                include_assembly_sources=False,
-                include_cut_list_sources=True,
-            )
-            if worker.should_cancel():
-                return {"state": "canceled", "context": discovered_context, "result": None}
-            if not discovered_context.cut_list_source_pdfs:
-                return {"state": "empty", "context": discovered_context, "result": None}
-            result = build_cut_list_packet(
-                rpd_path=status.paths.rpd_path,
-                source_pdfs=discovered_context.cut_list_source_pdfs,
-                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
-                should_cancel_cb=worker.should_cancel,
-            )
-            return {"state": "done", "context": discovered_context, "result": result}
-
-        worker = BackgroundJobWorker(_job)
-        self._packet_build_worker = worker
-
-        def _set_progress(done: int, total: int, status_text: str) -> None:
-            if int(total) <= 0:
-                progress.setRange(0, 0)
-            else:
-                progress.setRange(0, int(total))
-                progress.setValue(max(0, min(int(total), int(done))))
-            progress.setLabelText(f"Building cut list...\n{status_text}")
-
-        def _cleanup() -> None:
-            try:
-                progress.close()
-            except Exception:
-                pass
-            self._finish_packet_build_guard(guard)
-
-        def _on_progress(done: int, total: int, status_text: str) -> None:
-            _set_progress(int(done), int(total), status_text)
-
-        def _on_done(payload: object) -> None:
-            _cleanup()
-            data = payload if isinstance(payload, dict) else {}
-            result = data.get("result")
-            discovered_context = data.get("context")
-            state = str(data.get("state") or "")
-            if state == "empty":
-                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
-                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
-                QMessageBox.information(
-                    self,
-                    "Build Cut List",
-                    "No non-laser cut list PDFs were found.\n\nSearched:\n" + searched,
-                )
-                return
-            if state == "canceled" or bool(getattr(result, "skipped", False)):
-                self.log("Cut list build canceled.")
-                return
-            if result is None:
-                QMessageBox.information(
-                    self,
-                    "Build Cut List",
-                    "No non-laser cut list PDFs were found.",
-                )
-                return
-
-            self._refresh_packet_statuses(status)
-
-            packet_path = str(getattr(result, "packet_path", "") or "")
-            if packet_path:
-                try:
-                    open_path(Path(packet_path))
-                except Exception:
-                    pass
-                QMessageBox.information(
-                    self,
-                    "Build Cut List",
-                    (
-                        f"Cut list documents: {int(getattr(result, 'source_documents', 0))}\n"
-                        f"Cut list pages: {int(getattr(result, 'output_pages', 0))}\n"
-                        f"Cut list: {packet_path}"
-                    ),
-                )
-                self.log(f"Built cut list for {status.paths.display_name}.")
-                return
-
-            QMessageBox.information(
-                self,
-                "Build Cut List",
-                "No pages were found in the non-laser cut list PDFs.",
-            )
-
-        def _on_error(tb: str) -> None:
-            _cleanup()
-            QMessageBox.critical(
-                self,
-                "Build Cut List",
-                str(tb or "").strip() or "Cut list build failed.",
-            )
-
-        worker.signals.progress.connect(_on_progress)
-        worker.signals.done.connect(_on_done)
-        worker.signals.error.connect(_on_error)
-        progress.canceled.connect(worker.request_stop)
-        _set_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
-        try:
-            QThreadPool.globalInstance().start(worker)
-            worker_started = True
-        finally:
-            if not worker_started:
-                self._finish_packet_build_guard(guard)
+        self.packet_build_controller.build_cut_list_packet()
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()
@@ -3309,439 +2415,14 @@ class MainWindow(QMainWindow):
     def run_selected_full_flow(self) -> None:
         self.full_flow_controller.start_selected()
 
-    def open_flow_app(self) -> None:
-        launcher_text = self.settings.dashboard_launcher.strip()
-        if not launcher_text:
-            QMessageBox.warning(self, "Open Flow App", "Flow app launcher is not configured.")
-            return
-        try:
-            launch_tool(Path(launcher_text))
-        except Exception as exc:
-            QMessageBox.critical(self, "Open Flow App", str(exc))
-            return
-        self.log("Launched fabrication flow app.")
-
-    def open_dashboard(self) -> None:
-        self.open_flow_app()
-
     def run_selected_inventor_flow(self) -> None:
         self.inventor_controller.start_selected()
 
     def send_selected_block_files_to_machine(self) -> None:
-        title = "Send Blocks"
-        if self._block_file_worker is not None:
-            QMessageBox.information(self, title, "Block files are already being sent to the machine.")
-            return
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, title, "Select a kit first.")
-            return
-        if status.paths.project_dir is None or not status.paths.project_dir.exists():
-            QMessageBox.warning(self, title, "The selected kit does not have an L-side project folder yet.")
-            return
-        try:
-            plan = build_project_block_transfer_plan(status.paths.project_dir, self.settings.release_root)
-        except Exception as exc:
-            QMessageBox.warning(self, title, str(exc))
-            return
-        if not plan.drg_paths:
-            QMessageBox.information(
-                self,
-                title,
-                f"No nest .drg files were found under:\n{status.paths.project_dir}",
-            )
-            return
-        if not plan.matches:
-            missing = "\n".join(path.name for path in plan.missing_drg_paths[:20])
-            if len(plan.missing_drg_paths) > 20:
-                missing += f"\n... (+{len(plan.missing_drg_paths) - 20} more)"
-            QMessageBox.information(
-                self,
-                title,
-                "No matching block .cnc files were found.\n\n"
-                f"Source:\n{plan.source_root}\n\n"
-                f"Missing for:\n{missing or '(none)'}",
-            )
-            return
-
-        matched_lines = [
-            f"- {match.source_path.name} -> {match.target_path.name}"
-            for match in plan.matches[:12]
-        ]
-        if len(plan.matches) > 12:
-            matched_lines.append(f"... (+{len(plan.matches) - 12} more)")
-        missing_text = ""
-        if plan.missing_drg_paths:
-            missing_lines = [path.name for path in plan.missing_drg_paths[:8]]
-            if len(plan.missing_drg_paths) > 8:
-                missing_lines.append(f"... (+{len(plan.missing_drg_paths) - 8} more)")
-            missing_text = (
-                "\n\nNo matching block file was found for these nest drawing(s):\n"
-                + "\n".join(missing_lines)
-            )
-        choice = QMessageBox.warning(
-            self,
-            title,
-            "Send matched block files to the machine?\n\n"
-            f"Destination:\n{plan.target_dir}\n\n"
-            "Each file will be copied using the full nest .drg name, verified, then deleted from "
-            f"{plan.source_root}. Existing machine files with the same names will be overwritten.\n\n"
-            + "\n".join(matched_lines)
-            + missing_text,
-            QMessageBox.Ok | QMessageBox.Cancel,
-            QMessageBox.Cancel,
-        )
-        if choice != QMessageBox.Ok:
-            self.log("Send Blocks cancelled before transfer.")
-            return
-
-        progress = QProgressDialog("Sending block files to the machine...", "Cancel", 0, len(plan.matches), self)
-        progress.setWindowTitle(title)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-
-        def _job(worker: BackgroundJobWorker):
-            return send_project_block_files_to_machine(
-                status.paths.project_dir,
-                self.settings.release_root,
-                progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
-                should_cancel_cb=worker.should_cancel,
-            )
-
-        worker = BackgroundJobWorker(_job)
-        self._block_file_worker = worker
-        self._refresh_send_blocks_button_state()
-
-        def _cleanup() -> None:
-            try:
-                progress.close()
-            except Exception:
-                pass
-            self._block_file_worker = None
-            self._refresh_send_blocks_button_state()
-
-        def _on_progress(done: int, total: int, status_text: str) -> None:
-            if int(total) <= 0:
-                progress.setRange(0, 0)
-            else:
-                progress.setRange(0, int(total))
-                progress.setValue(max(0, min(int(total), int(done))))
-            progress.setLabelText(f"Sending block files to the machine...\n{status_text}")
-
-        def _on_done(payload: object) -> None:
-            _cleanup()
-            result = payload
-            transferred_paths = tuple(getattr(result, "transferred_paths", ()) or ())
-            skipped_paths = tuple(getattr(result, "skipped_paths", ()) or ())
-            result_plan = getattr(result, "plan", plan)
-            if bool(getattr(result, "canceled", False)):
-                QMessageBox.information(
-                    self,
-                    title,
-                    f"Send Blocks was canceled.\n\nSent: {len(transferred_paths)}\nSkipped: {len(skipped_paths)}",
-                )
-                self.log(
-                    f"Send Blocks canceled for {status.paths.display_name}; "
-                    f"sent {len(transferred_paths)}, skipped {len(skipped_paths)}."
-                )
-                return
-            QMessageBox.information(
-                self,
-                title,
-                f"Sent {len(transferred_paths)} block file(s) to:\n{getattr(result_plan, 'target_dir', plan.target_dir)}",
-            )
-            self.log(
-                f"Sent {len(transferred_paths)} block file(s) for {status.paths.display_name} to "
-                f"{getattr(result_plan, 'target_dir', plan.target_dir)}."
-            )
-
-        def _on_error(traceback_text: str) -> None:
-            _cleanup()
-            message = str(traceback_text or "").strip() or "Send Blocks failed."
-            QMessageBox.critical(self, title, message)
-            self.log(f"Send Blocks failed for {status.paths.display_name}: {message}")
-
-        progress.canceled.connect(worker.request_stop)
-        worker.signals.progress.connect(_on_progress)
-        worker.signals.done.connect(_on_done)
-        worker.signals.error.connect(_on_error)
-        QThreadPool.globalInstance().start(worker)
+        self.block_transfer_controller.send_selected()
 
     def import_selected_csv_to_radan(self) -> None:
-        use_cleaned_dxf = (
-            getattr(self, "radan_dxf_source_slider", None) is not None
-            and self.radan_dxf_source_slider.value() == 1
-        )
-        use_lab_sym_writer = (
-            getattr(self, "radan_sym_writer_slider", None) is not None
-            and self.radan_sym_writer_slider.value() == 1
-        )
-        title = "Import CSV with Lab Writer" if use_lab_sym_writer else "Import CSV to RADAN"
-        project_update_method = "direct-xml"
-        if (
-            getattr(self, "radan_project_update_slider", None) is not None
-            and self.radan_project_update_slider.isEnabled()
-            and self.radan_project_update_slider.value() == 1
-        ):
-            project_update_method = "radan-nst"
-        status = self._current_status()
-        if status is None:
-            QMessageBox.information(self, title, "Select a kit first.")
-            return
-        spreadsheet_path = status.spreadsheet_match.chosen_path
-        if spreadsheet_path is None:
-            QMessageBox.warning(
-                self,
-                title,
-                "This kit does not have exactly one BOM candidate, so the expected _Radan.csv path is ambiguous.",
-            )
-            return
-        if status.paths.project_dir is None or not status.paths.project_dir.exists():
-            QMessageBox.warning(
-                self,
-                title,
-                "The L-side project folder is not available for this kit.",
-            )
-            return
-        if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
-            QMessageBox.warning(
-                self,
-                title,
-                "The L-side project file is missing for this kit.",
-            )
-            return
-        try:
-            csv_path = resolve_existing_inventor_csv(spreadsheet_path, status.paths.project_dir)
-        except Exception as exc:
-            QMessageBox.warning(self, title, str(exc))
-            return
-
-        output_folder = status.paths.release_kit_dir
-        if output_folder is None or not output_folder.exists():
-            QMessageBox.warning(
-                self,
-                title,
-                f"The expected RADAN symbol output folder is missing:\n{output_folder}",
-            )
-            return
-        running_import, lock_path, lock_pid = radan_csv_import_lock_status(status.paths.rpd_path)
-        if running_import:
-            QMessageBox.information(
-                self,
-                title,
-                "A RADAN CSV import is already running for this project.\n\n"
-                f"PID: {lock_pid}\nLock: {lock_path}",
-            )
-            self.log(f"RADAN CSV import already running for {status.paths.rpd_path} (PID {lock_pid}).")
-            return
-        allow_visible_radan = False
-        try:
-            missing_symbols = radan_csv_missing_symbols(csv_path, output_folder)
-        except Exception as exc:
-            QMessageBox.warning(self, title, f"Could not inspect CSV symbols:\n{exc}")
-            return
-        if use_lab_sym_writer:
-            if missing_symbols:
-                sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:20])
-                if len(missing_symbols) > 20:
-                    sample_symbols += f"\n... (+{len(missing_symbols) - 20} more)"
-                QMessageBox.warning(
-                    self,
-                    title,
-                    "The lab SYM writer needs an existing .sym template for every CSV row. "
-                    "Donor-created symbols are still blocked from this Explorer path.\n\n"
-                    f"Missing templates:\n{sample_symbols}",
-                )
-                return
-            try:
-                visible_sessions = visible_radan_sessions()
-            except Exception:
-                visible_sessions = ()
-            session_text = ""
-            if visible_sessions:
-                session_text = "\n\nOpen RADAN sessions:\n" + "\n".join(
-                    f"{pid}: {window_title}" for pid, window_title in visible_sessions[:8]
-                )
-                if len(visible_sessions) > 8:
-                    session_text += f"\n... (+{len(visible_sessions) - 8} more)"
-            choice = QMessageBox.warning(
-                self,
-                title,
-                "This is the experimental lab symbol writer path.\n\n"
-                "It will back up and overwrite the existing .sym files for every CSV row, using the current "
-                "heldout-context writer options including the D-record view height threshold guard. It does not use "
-                "oracle text or donor-created symbols, but it is still a lab candidate and must be verified before "
-                "production cutting.\n\n"
-                "The selected RPD will still be updated and sheet-refresh automation may open RADAN afterward. "
-                "If this project is already open in RADAN, reload it before saving that session."
-                f"{session_text}\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if choice != QMessageBox.Yes:
-                self.log("Lab symbol writer import cancelled before launch.")
-                return
-            allow_visible_radan = bool(visible_sessions)
-        elif missing_symbols or use_cleaned_dxf or project_update_method == "radan-nst":
-            try:
-                visible_sessions = visible_radan_sessions()
-            except Exception:
-                visible_sessions = ()
-            if visible_sessions:
-                if use_cleaned_dxf:
-                    sample_symbols = "All CSV symbols will be rebuilt from cleaned L-side DXF working copies."
-                else:
-                    sample_symbols = "\n".join(str(path.name) for path in missing_symbols[:12])
-                    if len(missing_symbols) > 12:
-                        sample_symbols += f"\n... (+{len(missing_symbols) - 12} more)"
-                    if not sample_symbols:
-                        sample_symbols = "No symbol conversion; project update will use RADAN NST."
-                session_text = "\n".join(f"{pid}: {title}" for pid, title in visible_sessions[:8])
-                if len(visible_sessions) > 8:
-                    session_text += f"\n... (+{len(visible_sessions) - 8} more)"
-                choice = QMessageBox.warning(
-                    self,
-                    "Visible RADAN Sessions Are Open",
-                    "This import still needs RADAN automation.\n\n"
-                    "During conversion or RADAN NST project update, RADAN COM automation can redraw or disturb already-open RADAN windows, "
-                    "and those sessions may not be safe to keep saving afterward.\n\n"
-                    f"Open RADAN sessions:\n{session_text}\n\n"
-                    f"Work requiring RADAN:\n{sample_symbols}\n\n"
-                    "Continue anyway?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if choice != QMessageBox.Yes:
-                    self.log(
-                        "RADAN CSV import cancelled before conversion because visible RADAN sessions were open."
-                    )
-                    return
-                allow_visible_radan = True
-        log_dir = self._runtime_dir / "_runtime"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = "".join(
-            character if character.isalnum() else "_"
-            for character in f"{status.paths.truck_number}_{status.paths.project_name}"
-        ).strip("_")
-        if use_lab_sym_writer:
-            log_prefix = "radan_csv_lab_sym_import"
-        elif use_cleaned_dxf:
-            log_prefix = "radan_csv_cleaned_import"
-        else:
-            log_prefix = "radan_csv_import"
-        log_path = log_dir / f"{log_prefix}_{safe_name}_{int(time.time())}.log"
-        log_dialog = self._show_radan_import_log(log_path)
-        try:
-            process = launch_radan_csv_import(
-                csv_path,
-                output_folder,
-                project_path=status.paths.rpd_path,
-                log_path=log_path,
-                allow_visible_radan=allow_visible_radan,
-                rebuild_symbols=use_cleaned_dxf or use_lab_sym_writer,
-                lab_symbol_writer=use_lab_sym_writer,
-                d_record_view_height_threshold_guard=use_lab_sym_writer,
-                preprocess_dxf_outer_profile=use_cleaned_dxf,
-                preprocess_dxf_tolerance=0.002 if use_cleaned_dxf else None,
-                project_update_method=project_update_method,
-                refresh_project_sheets=True,
-            )
-        except Exception as exc:
-            log_dialog.mark_launch_failed(str(exc))
-            QMessageBox.critical(self, title, str(exc))
-            return
-        self._write_radan_import_marker(
-            process=process,
-            log_path=log_path,
-            project_path=status.paths.rpd_path,
-        )
-        log_dialog.set_process(process)
-
-        if use_lab_sym_writer:
-            dxf_source_text = "cleaned L-side DXF working copies" if use_cleaned_dxf else "source DXFs"
-            self.log(
-                f"Launched CSV import with lab symbol writer for {csv_path.name} using {dxf_source_text}; "
-                f"output folder is {output_folder}; project_update={project_update_method}; "
-                "d_record_height_guard=on; sheet_refresh=on."
-            )
-        elif use_cleaned_dxf:
-            self.log(
-                f"Launched RADAN CSV import for {csv_path.name} using cleaned L-side DXF working copies; "
-                f"output folder is {output_folder}; project_update={project_update_method}; sheet_refresh=on."
-            )
-        else:
-            self.log(
-                f"Launched RADAN CSV import for {csv_path.name}; "
-                f"output folder is {output_folder}; "
-                f"project_update={project_update_method}; sheet_refresh=on."
-            )
-
-    def _show_radan_import_log(self, log_path: Path) -> ImportLogDialog:
-        self._radan_import_log_dialogs = [
-            dialog
-            for dialog in self._radan_import_log_dialogs
-            if not dialog.is_complete or dialog.isVisible()
-        ]
-        dialog = self._radan_import_log_dialog
-        if dialog is not None and dialog.is_complete:
-            try:
-                dialog.force_close()
-            except Exception:
-                pass
-        dialog = ImportLogDialog(log_path, self, completion_callback=self._on_radan_import_log_complete)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        self._radan_import_log_dialog = dialog
-        self._radan_import_log_dialogs.append(dialog)
-        return dialog
-
-    def _radan_import_marker_path(self) -> Path:
-        return self._runtime_dir / "_runtime" / "radan_import_active.json"
-
-    def _write_radan_import_marker(
-        self,
-        *,
-        process: subprocess.Popen[object],
-        log_path: Path,
-        project_path: Path,
-    ) -> None:
-        marker_path = self._radan_import_marker_path()
-        payload = {
-            "pid": int(process.pid),
-            "log_path": str(log_path),
-            "project_path": str(project_path),
-            "started_at_epoch": time.time(),
-        }
-        try:
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        except OSError as exc:
-            self.log(f"Could not write RADAN import active marker: {exc}")
-
-    def _clear_radan_import_marker(self, *, process_id: int | None = None) -> None:
-        marker_path = self._radan_import_marker_path()
-        if process_id is not None:
-            try:
-                payload = json.loads(marker_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = {}
-            try:
-                marker_pid = int(payload.get("pid", 0))
-            except (AttributeError, TypeError, ValueError):
-                marker_pid = 0
-            if marker_pid and marker_pid != int(process_id):
-                return
-        try:
-            marker_path.unlink(missing_ok=True)
-        except OSError as exc:
-            self.log(f"Could not clear RADAN import active marker: {exc}")
-
-    def _on_radan_import_log_complete(self, dialog: ImportLogDialog) -> None:
-        self._clear_radan_import_marker(process_id=dialog.process_id)
+        self.radan_import_controller.import_selected()
 
     def closeEvent(self, event) -> None:
         if not self.full_flow_controller.can_close():
@@ -3752,20 +2433,13 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
-        running_import_logs = [
-            dialog
-            for dialog in self._radan_import_log_dialogs
-            if not dialog.is_complete
-        ]
-        if running_import_logs:
-            dialog = running_import_logs[-1]
+        if not self.radan_import_controller.can_close():
             QMessageBox.warning(
                 self,
                 "RADAN Import Running",
                 "A RADAN CSV import helper is still running. The Explorer window will stay open until it finishes.",
             )
-            dialog.raise_()
-            dialog.activateWindow()
+            self.radan_import_controller.raise_running_dialog()
             event.ignore()
             return
         super().closeEvent(event)
