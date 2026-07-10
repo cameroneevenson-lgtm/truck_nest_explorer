@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -104,6 +104,9 @@ class TruckSwitchRunContext:
 
 
 class MainWindow(QMainWindow):
+    _status_future_ready = Signal()
+    _flow_future_ready = Signal()
+
     FLOW_GANTT_HEIGHT = 176
     ASSEMBLY_PACKET_BUILD_ENABLED = True
     CUT_LIST_BUILD_ENABLED = True
@@ -203,6 +206,13 @@ class MainWindow(QMainWindow):
         self._flow_watch_timer = QTimer(self)
         self._flow_watch_timer.setInterval(120)
         self._flow_watch_timer.timeout.connect(self._poll_pending_flow_future)
+        # Phase 6: the 120ms timers above remain as a correctness safety net (Phase 5
+        # measured them as the dominant source of perceived cold-switch latency versus
+        # the ~5ms of actual work they wait on). These signals let a background future
+        # trigger the same poll immediately on completion instead of waiting for the
+        # next tick; queued cross-thread emission is what makes it Qt-thread-safe.
+        self._status_future_ready.connect(self._poll_pending_status_future)
+        self._flow_future_ready.connect(self._poll_pending_flow_future)
         self._flow_cache_refresh_timer = QTimer(self)
         self._flow_cache_refresh_timer.setInterval(1500)
         self._flow_cache_refresh_timer.timeout.connect(self._check_current_flow_cache)
@@ -988,6 +998,7 @@ class MainWindow(QMainWindow):
             if pending_status is None:
                 self.log(f"Loading kit statuses for {truck_number}...")
                 future = self._status_executor.submit(collect_kit_statuses, truck_number, self.settings)
+                future.add_done_callback(self._notify_status_future_ready)
                 self._pending_status_by_truck[truck_key] = (
                     truck_number,
                     settings_signature,
@@ -1068,6 +1079,7 @@ class MainWindow(QMainWindow):
             truck_number,
             hidden_flow_kit_names=hidden_flow_kit_names,
         )
+        future.add_done_callback(self._notify_flow_future_ready)
         self._pending_flow_by_truck[truck_key] = (
             truck_number,
             current_flow_token,
@@ -1086,6 +1098,22 @@ class MainWindow(QMainWindow):
         if cache and truck_number:
             self._status_cache_by_truck.set(self._status_cache_key(truck_number), list(statuses), negative=not statuses)
         self._render_current_statuses()
+
+    def _notify_status_future_ready(self, _future: object = None) -> None:
+        # Runs as a concurrent.futures done-callback, i.e. on the executor's worker
+        # thread. Emitting a Signal is safe to do from any thread; Qt queues the
+        # connected slot onto this window's own thread. Guard against the window's
+        # C++ object already being torn down if a task finishes during shutdown.
+        try:
+            self._status_future_ready.emit()
+        except RuntimeError:
+            pass
+
+    def _notify_flow_future_ready(self, _future: object = None) -> None:
+        try:
+            self._flow_future_ready.emit()
+        except RuntimeError:
+            pass
 
     def _poll_pending_status_future(self) -> None:
         if not self._pending_status_by_truck:
@@ -1740,11 +1768,13 @@ class MainWindow(QMainWindow):
             status_key = self._status_cache_key(truck_number)
             status_hit, _cached_statuses = self._status_cache_by_truck.get(status_key)
             if not status_hit and truck_key not in self._pending_status_by_truck:
+                prewarm_status_future = self._status_executor.submit(collect_kit_statuses, truck_number, self.settings)
+                prewarm_status_future.add_done_callback(self._notify_status_future_ready)
                 self._pending_status_by_truck[truck_key] = (
                     truck_number,
                     settings_signature,
                     0,
-                    self._status_executor.submit(collect_kit_statuses, truck_number, self.settings),
+                    prewarm_status_future,
                 )
                 started_status = True
             flow_token = self._flow_request_token(truck_number)
@@ -1753,15 +1783,17 @@ class MainWindow(QMainWindow):
                 flow_key = self._flow_cache_key(truck_number, flow_token)
                 flow_hit, _cached_flow = self._flow_cache_by_truck.get(flow_key)
                 if not flow_hit and truck_key not in self._pending_flow_by_truck:
+                    prewarm_flow_future = self._flow_executor.submit(
+                        load_cached_flow_truck_insight,
+                        truck_number,
+                        hidden_flow_kit_names=hidden_flow_kit_names,
+                    )
+                    prewarm_flow_future.add_done_callback(self._notify_flow_future_ready)
                     self._pending_flow_by_truck[truck_key] = (
                         truck_number,
                         flow_token,
                         0,
-                        self._flow_executor.submit(
-                            load_cached_flow_truck_insight,
-                            truck_number,
-                            hidden_flow_kit_names=hidden_flow_kit_names,
-                        ),
+                        prewarm_flow_future,
                     )
                     started_flow = True
             self._prewarm_truck_keys.add(truck_key)
@@ -2174,11 +2206,13 @@ class MainWindow(QMainWindow):
             else self._truck_switch_run_id
         )
         settings_signature = self._settings_signature()
+        refresh_future = self._status_executor.submit(collect_kit_statuses, truck_text, self.settings, use_cache=False)
+        refresh_future.add_done_callback(self._notify_status_future_ready)
         self._pending_status_by_truck[truck_key] = (
             truck_text,
             settings_signature,
             run_id,
-            self._status_executor.submit(collect_kit_statuses, truck_text, self.settings, use_cache=False),
+            refresh_future,
         )
         self._status_watch_timer.start()
         return True
