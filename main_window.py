@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -30,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from background_job import BackgroundJobWorker
+from background_job import BackgroundJobWorker  # noqa: F401 - re-exported; asserted identical by tests/test_services.py
 from controllers.block_transfer_controller import BlockTransferController
 from controllers.full_flow_controller import FullFlowController
 from controllers.hot_reload_controller import HotReloadController
