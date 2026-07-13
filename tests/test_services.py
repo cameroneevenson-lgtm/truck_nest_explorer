@@ -62,7 +62,9 @@ from packet_build_service import (
     PacketBuildReadinessError,
     _configure_asset_lookup,
     apply_assembly_context_to_sym_comments,
+    apply_assembly_notes_to_parts,
     assembly_comment_shorthand,
+    assembly_notes_by_part,
     build_assembly_packet,
     build_cut_list_packet,
     prepare_packet_build_context,
@@ -1635,10 +1637,40 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertIn("part_name,assembly_name,assembly_pdf_path,page_number,bom_qty,evidence", text)
             self.assertIn("F55334-B-1001,F55334-BODY", text)
 
-    def test_assembly_comment_shorthand_uses_last_hyphen_token(self) -> None:
-        self.assertEqual(assembly_comment_shorthand("F55334-BODY"), "BODY")
-        self.assertEqual(assembly_comment_shorthand("F55334-DOOR R2"), "DOOR")
-        self.assertEqual(assembly_comment_shorthand("F55334-B-100"), "100")
+    def test_assembly_comment_shorthand_returns_the_full_raw_name(self) -> None:
+        self.assertEqual(assembly_comment_shorthand("F55334-BODY"), "F55334-BODY")
+        self.assertEqual(assembly_comment_shorthand("F55334-DOOR R2"), "F55334-DOOR R2")
+        self.assertEqual(assembly_comment_shorthand("F55334-B-100"), "F55334-B-100")
+        self.assertEqual(assembly_comment_shorthand("  F55334-BODY  "), "F55334-BODY")
+        self.assertEqual(assembly_comment_shorthand(""), "")
+
+    def test_assembly_notes_by_part_joins_multiple_matches_for_the_same_part(self) -> None:
+        parts = [SimpleNamespace(sym="F55334-B-1001.sym", part="F55334-B-1001")]
+        context = SimpleNamespace(
+            references=(
+                SimpleNamespace(part_name="F55334-B-1001", assembly_name="F55334-BODY"),
+                SimpleNamespace(part_name="F55334-B-1001", assembly_name="F55334-DOOR"),
+            )
+        )
+        notes = assembly_notes_by_part(parts, context)
+        self.assertEqual(notes, {"f55334-b-1001": "F55334-BODY, F55334-DOOR"})
+
+    def test_assembly_notes_by_part_omits_parts_with_no_match(self) -> None:
+        parts = [SimpleNamespace(sym="F55334-B-9999.sym", part="F55334-B-9999")]
+        context = SimpleNamespace(references=())
+        self.assertEqual(assembly_notes_by_part(parts, context), {})
+
+    def test_apply_assembly_notes_to_parts_sets_the_field_in_place(self) -> None:
+        matched = SimpleNamespace(sym="F55334-B-1001.sym", part="F55334-B-1001", assembly_note="")
+        unmatched = SimpleNamespace(sym="F55334-B-9999.sym", part="F55334-B-9999", assembly_note="")
+        no_field = SimpleNamespace(sym="F55334-B-8888.sym", part="F55334-B-8888")
+        context = SimpleNamespace(
+            references=(SimpleNamespace(part_name="F55334-B-1001", assembly_name="F55334-BODY"),)
+        )
+        apply_assembly_notes_to_parts([matched, unmatched, no_field], context)
+        self.assertEqual(matched.assembly_note, "F55334-BODY")
+        self.assertEqual(unmatched.assembly_note, "")
+        self.assertFalse(hasattr(no_field, "assembly_note"))
 
     def test_apply_assembly_context_to_sym_comments_appends_shorthands(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -1683,7 +1715,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             text = sym_path.read_text(encoding="utf-8")
             self.assertEqual(result.updated_count, 1)
             self.assertEqual(second_result.updated_count, 0)
-            self.assertIn('value="Walls | ASM: BODY, DOOR"', text)
+            self.assertIn('value="Walls | ASM: F55334-BODY, F55334-DOOR"', text)
             self.assertIn('value="Walls"', (backup_dir / sym_path.name).read_text(encoding="utf-8"))
 
     def test_apply_assembly_context_to_sym_comments_uses_scan_result(self) -> None:
@@ -1706,7 +1738,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             result = apply_assembly_context_to_sym_comments(parts=parts, result=context)
 
             self.assertEqual(result.updated_count, 1)
-            self.assertIn('value="ASM: BODY"', sym_path.read_text(encoding="utf-8"))
+            self.assertIn('value="ASM: F55334-BODY"', sym_path.read_text(encoding="utf-8"))
 
     def test_build_cut_list_packet_combines_one_copy_of_each_source_pdf(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -3055,6 +3087,53 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
         sym_mock.assert_called_once()
         self.assertEqual(result.sym_comment_updated_count, 1)
+
+    def test_full_flow_packet_build_stamps_assembly_note_before_print_packet(self) -> None:
+        status = SimpleNamespace(
+            spreadsheet_match=SimpleNamespace(chosen_path=None),
+            paths=SimpleNamespace(
+                rpd_path=Path("paint.rpd"),
+                fabrication_kit_dir=Path("fab"),
+            ),
+        )
+        part = SimpleNamespace(sym="F55334-B-01.sym", part="F55334-B-01", assembly_note="")
+        context = SimpleNamespace(
+            parts=[part],
+            resolve_asset_fn=lambda sym, suffix: None,
+            assembly_source_pdfs=(),
+            cut_list_source_pdfs=(),
+        )
+        assembly_context = SimpleNamespace(
+            references=(SimpleNamespace(part_name="F55334-B-01", assembly_name="F55334-EXTERIOR PACK"),),
+            read_errors=(),
+        )
+        sym_result = SimpleNamespace(updated_count=1)
+        seen_notes: list[str] = []
+
+        def _fake_build_packet(parts, **kwargs):
+            seen_notes.append(list(parts)[0].assembly_note)
+            return (Path("print.pdf"), 3, 0)
+
+        assembly_result = SimpleNamespace(packet_path=Path("assembly.pdf"), output_pages=2)
+        cut_list_result = SimpleNamespace(packet_path=Path("cut.pdf"), output_pages=1)
+
+        with (
+            patch.object(Path, "exists", return_value=True),
+            patch("full_flow_service.prepare_packet_build_context", return_value=context),
+            patch("full_flow_service.validate_print_packet_readiness", return_value=""),
+            patch(
+                "full_flow_service._load_radan_kitter_modules",
+                return_value={"packet_service": SimpleNamespace(build_packet=_fake_build_packet)},
+            ),
+            patch("full_flow_service.scan_assembly_bom_context", return_value=assembly_context),
+            patch("full_flow_service.apply_assembly_context_to_sym_comments", return_value=sym_result),
+            patch("full_flow_service.write_assembly_bom_context_csv", return_value=Path("assembly_context.csv")),
+            patch("full_flow_service.build_assembly_packet", return_value=assembly_result),
+            patch("full_flow_service.build_cut_list_packet", return_value=cut_list_result),
+        ):
+            full_flow_service.build_all_packets_for_status(status, ExplorerSettings())
+
+        self.assertEqual(seen_notes, ["F55334-EXTERIOR PACK"])
 
     def test_full_flow_import_progress_prefers_log_detail(self) -> None:
         with workspace_tempdir() as temp_root:

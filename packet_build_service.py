@@ -261,12 +261,10 @@ def _quantity_from_bom_evidence(evidence: str, alias: str) -> int:
 
 
 def assembly_comment_shorthand(assembly_name: str) -> str:
-    stem = Path(str(assembly_name or "").strip()).stem.strip()
-    if not stem:
-        return ""
-    stem = REVISION_SUFFIX_PATTERN.sub("", stem).strip()
-    token = stem.rsplit("-", 1)[-1].strip()
-    return token or stem
+    # Full raw assembly name (the source drawing PDF's filename stem) -
+    # deliberately not shortened to a last-hyphen token or revision-stripped
+    # anymore, so the .sym comment and packet note both show the real name.
+    return str(assembly_name or "").strip()
 
 
 def _read_text_fallback(path: Path) -> str:
@@ -335,6 +333,44 @@ def _append_assembly_shorthands_to_comment(existing_comment: str, shorthands: Se
     return f"{base_comment} | {assembly_text}"
 
 
+def _shorthands_by_part(result: AssemblyBomContextResult) -> dict[str, list[str]]:
+    shorthands_by_part: dict[str, list[str]] = {}
+    for ref in result.references:
+        shorthand = assembly_comment_shorthand(ref.assembly_name)
+        if shorthand:
+            shorthands_by_part.setdefault(ref.part_name.casefold(), []).append(shorthand)
+    return shorthands_by_part
+
+
+def assembly_notes_by_part(parts: Sequence[object], result: AssemblyBomContextResult) -> dict[str, str]:
+    """Per-part assembly note text (joined, comma-separated), keyed by
+    _part_display_name(part).casefold() - the same matching used by
+    apply_assembly_context_to_sym_comments, exposed separately so callers
+    can also stamp the note on the print packet (PartRow.assembly_note)
+    without re-scanning or duplicating the .sym comment write."""
+    shorthands_by_part = _shorthands_by_part(result)
+    notes: dict[str, str] = {}
+    for part in parts:
+        part_key = _part_display_name(part).casefold()
+        shorthands = shorthands_by_part.get(part_key)
+        if shorthands:
+            notes[part_key] = ", ".join(shorthands)
+    return notes
+
+
+def apply_assembly_notes_to_parts(parts: Sequence[object], result: AssemblyBomContextResult) -> None:
+    """Set part.assembly_note in place for each part with a match, so the
+    print packet build (packet_service.build_packet -> PartRow.assembly_note)
+    picks it up. Must run before the print packet is built, since building
+    it also un-annotated is what leaves the note off today."""
+    notes_by_part = assembly_notes_by_part(parts, result)
+    for part in parts:
+        if not hasattr(part, "assembly_note"):
+            continue
+        part_key = _part_display_name(part).casefold()
+        part.assembly_note = notes_by_part.get(part_key, "")
+
+
 def apply_assembly_context_to_sym_comments(
     *,
     parts: Sequence[object],
@@ -349,11 +385,7 @@ def apply_assembly_context_to_sym_comments(
         if part_name and sym_path is not None:
             sym_by_part.setdefault(part_name.casefold(), sym_path)
 
-    shorthands_by_part: dict[str, list[str]] = {}
-    for ref in result.references:
-        shorthand = assembly_comment_shorthand(ref.assembly_name)
-        if shorthand:
-            shorthands_by_part.setdefault(ref.part_name.casefold(), []).append(shorthand)
+    shorthands_by_part = _shorthands_by_part(result)
 
     updated = 0
     skipped = 0

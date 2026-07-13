@@ -14,6 +14,7 @@ from inventor_service import InventorRunResult
 from models import ExplorerSettings, KitStatus
 from packet_build_service import (
     apply_assembly_context_to_sym_comments,
+    apply_assembly_notes_to_parts,
     build_assembly_packet,
     build_cut_list_packet,
     prepare_packet_build_context,
@@ -474,6 +475,16 @@ def build_all_packets_for_status(
     def _packet_progress(done: int, total: int, status_text: str) -> None:
         _emit(progress_cb, f"Packets: print {done}/{total} {status_text}")
 
+    _emit(progress_cb, "Packets: scanning assembly context")
+    assembly_context = scan_assembly_bom_context(
+        parts=context.parts,
+        source_pdfs=context.assembly_source_pdfs,
+        progress_cb=lambda done, total, text: _emit(progress_cb, f"Packets: assembly context {done}/{total} {text}"),
+    )
+    # Must run before the print packet is built - the print packet stamps
+    # each part's assembly_note (if any) under its QTY box.
+    apply_assembly_notes_to_parts(context.parts, assembly_context)
+
     _emit(progress_cb, "Packets: building print packet")
     print_packet_path, print_pages, print_missing = rk_packet_service.build_packet(
         list(context.parts),
@@ -485,12 +496,6 @@ def build_all_packets_for_status(
     )
     packet_paths.append(Path(print_packet_path))
 
-    _emit(progress_cb, "Packets: scanning assembly context")
-    assembly_context = scan_assembly_bom_context(
-        parts=context.parts,
-        source_pdfs=context.assembly_source_pdfs,
-        progress_cb=lambda done, total, text: _emit(progress_cb, f"Packets: assembly context {done}/{total} {text}"),
-    )
     sym_comment_result = apply_assembly_context_to_sym_comments(
         parts=context.parts,
         result=assembly_context,

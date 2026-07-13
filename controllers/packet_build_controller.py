@@ -12,6 +12,7 @@ from models import KitStatus
 from packet_build_service import (
     PacketBuildReadinessError,
     apply_assembly_context_to_sym_comments,
+    apply_assembly_notes_to_parts,
     build_assembly_packet,
     build_cut_list_packet,
     create_main_packet_worker,
@@ -278,7 +279,9 @@ class PacketBuildController:
 
     def build_print_packet(self) -> None:
         window = self.window
-        status, context, guard = self.prepare_context("Build Print Packet", action_key="print")
+        status, context, guard = self.prepare_context(
+            "Build Print Packet", action_key="print", include_assembly_sources=True
+        )
         if status is None or context is None or guard is None:
             return
         worker_started = False
@@ -328,6 +331,25 @@ class PacketBuildController:
             ):
                 window.log("Print packet build canceled during PDF asset review.")
                 return
+
+            if context.assembly_source_pdfs:
+                window.log("Build Print Packet: scanning assembly context...")
+                assembly_context = scan_assembly_bom_context(
+                    parts=context.parts,
+                    source_pdfs=context.assembly_source_pdfs,
+                )
+                # Must run before the worker is created - the print packet
+                # stamps each part's assembly_note (if any) under its QTY box.
+                apply_assembly_notes_to_parts(context.parts, assembly_context)
+                sym_comment_result = apply_assembly_context_to_sym_comments(
+                    parts=context.parts,
+                    result=assembly_context,
+                    backup_dir=status.paths.rpd_path.parent / "_bak" / "assembly_comments",
+                )
+                window.log(
+                    f"Build Print Packet: assembly context updated {sym_comment_result.updated_count} "
+                    f".sym comment(s)."
+                )
 
             total_steps = max(1, len(context.parts))
             progress = QProgressDialog("Building print packet...", "Cancel", 0, total_steps, window)
