@@ -632,7 +632,7 @@ class PacketBuildController:
                 rpd_path=status.paths.rpd_path,
                 fabrication_dir=status.paths.fabrication_kit_dir,
                 settings=window.settings,
-                include_assembly_sources=False,
+                include_assembly_sources=True,
                 include_cut_list_sources=True,
             )
             if worker.should_cancel():
@@ -642,6 +642,7 @@ class PacketBuildController:
             result = build_cut_list_packet(
                 rpd_path=status.paths.rpd_path,
                 source_pdfs=discovered_context.cut_list_source_pdfs,
+                assembly_source_pdfs=discovered_context.assembly_source_pdfs,
                 progress_cb=lambda done, total, status_text: worker.emit_progress(done, total, status_text),
                 should_cancel_cb=worker.should_cancel,
             )

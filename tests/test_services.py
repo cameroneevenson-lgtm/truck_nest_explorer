@@ -1770,6 +1770,58 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 self.assertIn("AST CUT PAGE 1", doc[1].get_text())
                 self.assertIn("AST CUT PAGE 2", doc[2].get_text())
 
+    def test_build_cut_list_packet_stamps_assembly_note_when_matched(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
+            rpd_path.parent.mkdir(parents=True, exist_ok=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+
+            # Cut list items have no PartRow/.sym - the source PDF's own
+            # filename stem is what gets matched against assembly BOM text.
+            matched_cut_pdf = temp_root / "fab" / "SAW-BRACKET-100.pdf"
+            unmatched_cut_pdf = temp_root / "fab" / "SAW-BRACKET-200.pdf"
+            write_pdf(matched_cut_pdf, text="BRACKET DETAIL", width=1584, height=1224)
+            write_pdf(unmatched_cut_pdf, text="OTHER BRACKET DETAIL", width=1584, height=1224)
+
+            assembly_pdf = temp_root / "fab" / "F55334-EXTERIOR PACK.pdf"
+            write_pdf(
+                assembly_pdf,
+                text="1 SAW-BRACKET-100 STEEL BRACKET 4",
+                width=2448,
+                height=1584,
+            )
+
+            result = build_cut_list_packet(
+                rpd_path=rpd_path,
+                source_pdfs=(matched_cut_pdf, unmatched_cut_pdf),
+                assembly_source_pdfs=(assembly_pdf,),
+            )
+
+            self.assertEqual(result.output_pages, 2)
+            with fitz.open(result.packet_path) as doc:
+                matched_text = doc[0].get_text()
+                unmatched_text = doc[1].get_text()
+                self.assertIn("BRACKET DETAIL", matched_text)
+                self.assertIn("ASM: F55334-EXTERIOR PACK", matched_text)
+                self.assertIn("OTHER BRACKET DETAIL", unmatched_text)
+                self.assertNotIn("ASM:", unmatched_text)
+
+    def test_build_cut_list_packet_without_assembly_sources_has_no_notes(self) -> None:
+        with workspace_tempdir() as temp_root:
+            rpd_path = temp_root / "release" / "F55334 PAINT PACK.rpd"
+            rpd_path.parent.mkdir(parents=True, exist_ok=True)
+            rpd_path.write_text("<Project />", encoding="utf-8")
+            cut_pdf = temp_root / "fab" / "SAW-BRACKET-100.pdf"
+            write_pdf(cut_pdf, text="BRACKET DETAIL", width=1584, height=1224)
+
+            result = build_cut_list_packet(
+                rpd_path=rpd_path,
+                source_pdfs=(cut_pdf,),
+            )
+
+            with fitz.open(result.packet_path) as doc:
+                self.assertNotIn("ASM:", doc[0].get_text())
+
     def test_move_inventor_outputs_to_project_places_files_in_l_project_folder(self) -> None:
         with workspace_tempdir() as temp_root:
             w_folder = temp_root / "W" / "F55334" / "PAINT PACK"

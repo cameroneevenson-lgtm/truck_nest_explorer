@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import sys
+from types import SimpleNamespace
 from typing import Callable, Optional, Sequence
 import xml.etree.ElementTree as ET
 
@@ -1167,10 +1168,66 @@ def build_assembly_packet(
     )
 
 
+_CUT_LIST_NOTE_COLOR = (0.25, 1.00, 0.25)  # same fluorescent green as the print packet's QTY/ASM boxes
+_CUT_LIST_NOTE_TEXT_COLOR = (0, 0, 0)
+_CUT_LIST_NOTE_FONT_SIZE = 22.0
+_CUT_LIST_NOTE_STROKE_WIDTH = 4.0
+_CUT_LIST_NOTE_MARGIN = 18.0
+_CUT_LIST_NOTE_PAD_X = 12.0
+_CUT_LIST_NOTE_BOX_H = 36.0
+
+
+def _cut_list_assembly_notes(
+    valid_sources: Sequence[Path],
+    assembly_source_pdfs: Sequence[Path],
+) -> dict[str, str]:
+    """Cut list items have no PartRow/.sym - each source PDF's own filename
+    stem stands in for its part identity, matched the same way laser parts
+    are (BOM text search across the assembly drawing PDFs)."""
+    if not assembly_source_pdfs:
+        return {}
+    pseudo_parts = [SimpleNamespace(sym=str(path), part=path.stem) for path in valid_sources]
+    assembly_context = scan_assembly_bom_context(parts=pseudo_parts, source_pdfs=assembly_source_pdfs)
+    return assembly_notes_by_part(pseudo_parts, assembly_context)
+
+
+def _stamp_cut_list_assembly_note(page, note_text: str, *, fitz_module) -> None:
+    # No QTY box exists on cut list pages (unlike the print packet) to
+    # position beside, so this note stands alone in the same bottom-left
+    # corner QTY normally occupies.
+    text = f"ASM: {note_text}"
+    rect = page.rect
+    x1 = _CUT_LIST_NOTE_MARGIN
+    y1 = rect.height - _CUT_LIST_NOTE_MARGIN - _CUT_LIST_NOTE_BOX_H
+    y2 = y1 + _CUT_LIST_NOTE_BOX_H
+    font_size = _CUT_LIST_NOTE_FONT_SIZE
+    text_w = fitz_module.get_text_length(text, fontname="helv", fontsize=font_size)
+    max_text_w = max(20.0, rect.width - x1 - _CUT_LIST_NOTE_MARGIN - (2 * _CUT_LIST_NOTE_PAD_X))
+    if text_w > max_text_w:
+        font_size = max(7.0, font_size * (max_text_w / text_w))
+        text_w = fitz_module.get_text_length(text, fontname="helv", fontsize=font_size)
+    x2 = x1 + text_w + (2 * _CUT_LIST_NOTE_PAD_X)
+    page.draw_rect(
+        fitz_module.Rect(x1, y1, x2, y2),
+        color=_CUT_LIST_NOTE_COLOR,
+        fill=None,
+        width=_CUT_LIST_NOTE_STROKE_WIDTH,
+        stroke_opacity=0.94,
+    )
+    page.insert_text(
+        fitz_module.Point(x1 + _CUT_LIST_NOTE_PAD_X, y1 + _CUT_LIST_NOTE_BOX_H * 0.72),
+        text,
+        fontsize=font_size,
+        color=_CUT_LIST_NOTE_TEXT_COLOR,
+        fontname="helv",
+    )
+
+
 def build_cut_list_packet(
     *,
     rpd_path: Path,
     source_pdfs: Sequence[Path],
+    assembly_source_pdfs: Sequence[Path] = (),
     out_dirname: str = DEFAULT_PACKET_OUT_DIR,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     should_cancel_cb: Optional[Callable[[], bool]] = None,
@@ -1212,6 +1269,7 @@ def build_cut_list_packet(
     out_dir = rpd_path.parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{CUT_LIST_PACKET_PREFIX}_{_make_stamp()}.pdf"
+    notes_by_part = _cut_list_assembly_notes(valid_sources, assembly_source_pdfs)
 
     output_pages = 0
     dst = fitz.open()
@@ -1233,8 +1291,16 @@ def build_cut_list_packet(
                 with fitz.open(str(pdf_path)) as src:
                     if src.page_count <= 0:
                         continue
+                    note = notes_by_part.get(pdf_path.stem.casefold())
+                    first_new_index = dst.page_count
                     dst.insert_pdf(src)
                     output_pages += int(src.page_count)
+                    if note:
+                        for page_index in range(first_new_index, dst.page_count):
+                            try:
+                                _stamp_cut_list_assembly_note(dst[page_index], note, fitz_module=fitz)
+                            except Exception:
+                                pass
             except Exception:
                 continue
 

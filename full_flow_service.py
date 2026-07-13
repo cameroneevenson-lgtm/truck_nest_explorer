@@ -519,6 +519,7 @@ def build_all_packets_for_status(
     cut_list_result = build_cut_list_packet(
         rpd_path=status.paths.rpd_path,
         source_pdfs=context.cut_list_source_pdfs,
+        assembly_source_pdfs=context.assembly_source_pdfs,
         progress_cb=lambda done, total, text: _emit(progress_cb, f"Packets: cut list {done}/{total} {text}"),
     )
     if cut_list_result.packet_path:
