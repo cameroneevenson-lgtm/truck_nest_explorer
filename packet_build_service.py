@@ -14,8 +14,6 @@ import xml.etree.ElementTree as ET
 from models import DEFAULT_P_RELEASE_ROOT, ExplorerSettings
 
 DEFAULT_PACKET_OUT_DIR = "_out"
-ASSEMBLY_PACKET_PREFIX = "AssemblyPacket_TABLOID"
-CUT_LIST_PACKET_PREFIX = "CutList"
 TABLOID_WIDTH_POINTS = 11.0 * 72.0
 TABLOID_HEIGHT_POINTS = 17.0 * 72.0
 ARCH_D_WIDTH_POINTS = 34.0 * 72.0
@@ -126,6 +124,10 @@ def _make_stamp() -> str:
     from datetime import datetime
 
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _kit_packet_stem(rpd_path: Path) -> str:
+    return str(rpd_path.stem or "").strip() or "KIT"
 
 
 def _normalize_path_key(path: Path | str) -> str:
@@ -1114,7 +1116,7 @@ def build_assembly_packet(
     fitz = _fitz_module()
     out_dir = rpd_path.parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{ASSEMBLY_PACKET_PREFIX}_{_make_stamp()}.pdf"
+    out_path = out_dir / f"{_kit_packet_stem(rpd_path)} ASSEMBLY PACKET.pdf"
 
     output_pages = 0
     dst = fitz.open()
@@ -1268,7 +1270,7 @@ def build_cut_list_packet(
     fitz = _fitz_module()
     out_dir = rpd_path.parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{CUT_LIST_PACKET_PREFIX}_{_make_stamp()}.pdf"
+    out_path = out_dir / f"{_kit_packet_stem(rpd_path)} CUT LIST.pdf"
     notes_by_part = _cut_list_assembly_notes(valid_sources, assembly_source_pdfs)
 
     output_pages = 0

@@ -171,20 +171,20 @@ class PacketBuildController:
             packet_path = getattr(match, "chosen_path", None)
             if packet_path is not None:
                 button.setText(ready_text)
-                button.setEnabled(False)
+                button.setEnabled(True)
                 button.setToolTip(
                     f"{packet_label} already exists:\n{packet_path}\n\n"
-                    "Use the packet cell in the table to open it, or delete the packet file before rebuilding."
+                    "Use the packet cell in the table to open it, or click again to rebuild it."
                 )
 
-    def _show_existing_packet_feedback(
+    def _confirm_rebuild(
         self,
         *,
         title: str,
         status: KitStatus,
         action_key: str,
         match: object,
-    ) -> None:
+    ) -> bool:
         window = self.window
         packet_path = getattr(match, "chosen_path", None)
         packet_label = {
@@ -193,17 +193,29 @@ class PacketBuildController:
             "assembly": "Assembly packet",
             "cut_list": "Cut list",
         }.get(str(action_key or "").strip().casefold(), "Packet")
-        QMessageBox.information(
+        choice = QMessageBox.question(
             window,
             title,
             (
                 f"{packet_label} already exists for {status.paths.display_name}:\n"
                 f"{packet_path}\n\n"
-                "No new packet was generated."
+                "Rebuild it anyway? The existing file will be replaced."
             ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
-        window.log(f"Skipped {title.lower()} for {status.paths.display_name}; existing packet: {packet_path}")
-        window._refresh_packet_statuses(status)
+        if choice != QMessageBox.Yes:
+            window.log(f"Skipped {title.lower()} for {status.paths.display_name}; existing packet: {packet_path}")
+            window._refresh_packet_statuses(status)
+            return False
+        try:
+            Path(packet_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        window.log(
+            f"Rebuilding {title.lower()} for {status.paths.display_name}; replacing existing packet: {packet_path}"
+        )
+        return True
 
     def prepare_context(
         self,
@@ -253,14 +265,14 @@ class PacketBuildController:
         # generated packets do not produce duplicate packet files.
         existing_match = self._match_for_action(status, action_key, use_cache=False)
         if getattr(existing_match, "chosen_path", None) is not None:
-            self._show_existing_packet_feedback(
+            if not self._confirm_rebuild(
                 title=title,
                 status=status,
                 action_key=action_key,
                 match=existing_match,
-            )
-            self._finish_guard(guard)
-            return None, None, None
+            ):
+                self._finish_guard(guard)
+                return None, None, None
 
         try:
             context = prepare_packet_build_context(

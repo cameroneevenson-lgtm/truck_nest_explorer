@@ -1761,7 +1761,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 source_pdfs=(cut_pdf_a, cut_pdf_b),
             )
 
-            self.assertTrue(Path(result.packet_path).name.startswith("CutList_"))
+            self.assertEqual(Path(result.packet_path).name, "F55334 PAINT PACK CUT LIST.pdf")
             self.assertEqual(result.source_documents, 2)
             self.assertEqual(result.output_pages, 3)
             with fitz.open(result.packet_path) as doc:
@@ -3691,7 +3691,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                     window.close()
                     app.processEvents()
 
-    def test_packet_build_buttons_disable_when_packets_already_exist(self) -> None:
+    def test_packet_build_buttons_stay_enabled_when_packets_already_exist(self) -> None:
         from PySide6.QtWidgets import QApplication
         import main_window
 
@@ -3711,9 +3711,9 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 window.truck_list.blockSignals(False)
                 window._set_current_statuses([status], cache=False)
 
-                self.assertFalse(window.build_print_packet_button.isEnabled())
-                self.assertFalse(window.build_assembly_packet_button.isEnabled())
-                self.assertFalse(window.build_cut_list_button.isEnabled())
+                self.assertTrue(window.build_print_packet_button.isEnabled())
+                self.assertTrue(window.build_assembly_packet_button.isEnabled())
+                self.assertTrue(window.build_cut_list_button.isEnabled())
                 self.assertEqual(window.build_print_packet_button.text(), "Print Packet Ready")
                 self.assertEqual(window.build_assembly_packet_button.text(), "Assembly Packet Ready")
                 self.assertEqual(window.build_cut_list_button.text(), "Cut List Ready")
@@ -3746,16 +3746,63 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
                 with (
                     patch("controllers.packet_build_controller.prepare_packet_build_context") as prepare_mock,
-                    patch.object(QMessageBox, "information") as information_mock,
+                    patch.object(QMessageBox, "question", return_value=QMessageBox.No) as question_mock,
                 ):
                     window.build_selected_print_packet()
                     window.build_selected_assembly_packet()
                     window.build_selected_cut_list_packet()
 
                 prepare_mock.assert_not_called()
-                self.assertEqual(information_mock.call_count, 3)
+                self.assertEqual(question_mock.call_count, 3)
                 self.assertFalse(window.packet_build_controller._running)
                 self.assertFalse(window.packet_build_controller._active_keys)
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_packet_build_prepare_context_rebuilds_when_user_confirms(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        settings = ExplorerSettings(kit_templates=["PAINT PACK"])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=settings),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            status = self._make_packet_button_status(temp_root, create_packets=True)
+            try:
+                window.truck_list.blockSignals(True)
+                window.truck_list.addItem("F55334")
+                window.truck_list.setCurrentRow(0)
+                window.truck_list.blockSignals(False)
+                window._set_current_statuses([status], cache=False)
+
+                old_packet = status.paths.project_dir / "PrintPacket_QTY_20260417_101500.pdf"
+                self.assertTrue(old_packet.exists())
+
+                with (
+                    patch(
+                        "controllers.packet_build_controller.prepare_packet_build_context",
+                        return_value=SimpleNamespace(parts=()),
+                    ) as prepare_mock,
+                    patch.object(QMessageBox, "question", return_value=QMessageBox.Yes) as question_mock,
+                ):
+                    controller = window.packet_build_controller
+                    status_out, context, guard = controller.prepare_context("Build Print Packet", action_key="print")
+
+                question_mock.assert_called_once()
+                prepare_mock.assert_called_once()
+                self.assertIsNotNone(status_out)
+                self.assertIsNotNone(context)
+                self.assertIsNotNone(guard)
+                self.assertFalse(old_packet.exists())
+                controller._finish_guard(guard)
             finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)
