@@ -262,10 +262,6 @@ def clear_performance_caches() -> None:
     KIT_STATUS_CACHE.clear()
 
 
-def normalize_kit_templates(values: list[str]) -> list[str]:
-    return [mapping.display_name for mapping in build_kit_mappings(values)]
-
-
 def configured_kit_mappings(settings: ExplorerSettings) -> list[KitMapping]:
     return build_kit_mappings(settings.kit_templates)
 
@@ -1006,37 +1002,6 @@ def create_kit_scaffold(
     )
 
 
-def ensure_rpd_exists(paths: KitPaths, settings: ExplorerSettings) -> tuple[Path, ...]:
-    if paths.release_truck_dir is None or paths.release_kit_dir is None or paths.project_dir is None:
-        return ()
-    if paths.rpd_path is None or paths.rpd_path.exists():
-        return ()
-
-    created: list[Path] = []
-    for folder in (paths.release_truck_dir, paths.release_kit_dir, paths.project_dir):
-        if not folder.exists():
-            folder.mkdir(parents=True, exist_ok=True)
-            created.append(folder)
-
-    template_path = _path_from_setting(settings.rpd_template_path)
-    if template_path is not None and template_path.exists():
-        _write_template_clone(
-            template_path,
-            paths.rpd_path,
-            truck_number=paths.truck_number,
-            kit_name=paths.kit_name,
-            project_name=paths.project_name,
-            replacements_text=settings.template_replacements_text,
-        )
-        _clone_template_subfolders(template_path.parent, paths.project_dir)
-    else:
-        _write_minimal_rpd(paths.rpd_path, project_name=paths.project_name)
-    created.append(paths.rpd_path)
-    invalidate_status_cache_for_truck(paths.truck_number)
-    invalidate_filesystem_cache_for_paths(tuple(created))
-    return tuple(created)
-
-
 def inventor_output_paths(spreadsheet_path: Path, project_dir: Path | None) -> InventorOutputPaths:
     source_csv_path = spreadsheet_path.with_name(f"{spreadsheet_path.stem}_Radan.csv")
     source_report_path = spreadsheet_path.with_name(f"{spreadsheet_path.stem}_report.txt")
@@ -1668,32 +1633,6 @@ def radan_csv_import_lock_status(project_path: Path | str) -> tuple[bool, Path, 
     return _process_exists(process_id), lock_path, process_id
 
 
-def launch_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.Popen[object]:
-    entry = Path(str(entry_path))
-    spreadsheet = Path(str(spreadsheet_path))
-    if not entry.exists():
-        raise FileNotFoundError(str(entry))
-    if not spreadsheet.exists():
-        raise FileNotFoundError(str(spreadsheet))
-
-    suffix = entry.suffix.casefold()
-    if suffix == ".py":
-        command = [_python_executable(), str(entry), str(spreadsheet)]
-    elif suffix in {".bat", ".cmd"}:
-        command = ["cmd.exe", "/c", str(entry), str(spreadsheet)]
-    else:
-        command = [str(entry), str(spreadsheet)]
-
-    popen_kwargs: dict[str, object] = {
-        "cwd": str(entry.parent),
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        **_hidden_process_kwargs(),
-    }
-    return subprocess.Popen(command, **popen_kwargs)
-
-
 def launch_radan_csv_import(
     csv_path: Path | str,
     output_folder: Path | str,
@@ -1782,32 +1721,6 @@ def launch_radan_csv_import(
         stderr=subprocess.DEVNULL,
         **_hidden_process_kwargs(),
     )
-
-
-def run_inventor_to_radan(entry_path: Path | str, spreadsheet_path: Path | str) -> subprocess.CompletedProcess[str]:
-    entry = Path(str(entry_path))
-    spreadsheet = Path(str(spreadsheet_path))
-    if not entry.exists():
-        raise FileNotFoundError(str(entry))
-    if not spreadsheet.exists():
-        raise FileNotFoundError(str(spreadsheet))
-
-    suffix = entry.suffix.casefold()
-    if suffix == ".py":
-        command = [_python_executable(), str(entry), str(spreadsheet)]
-    elif suffix in {".bat", ".cmd"}:
-        command = ["cmd.exe", "/c", str(entry), str(spreadsheet)]
-    else:
-        command = [str(entry), str(spreadsheet)]
-
-    run_kwargs = {
-        "cwd": str(entry.parent),
-        "text": True,
-        "stdin": subprocess.DEVNULL,
-        "capture_output": True,
-        **_hidden_process_kwargs(),
-    }
-    return subprocess.run(command, **run_kwargs)
 
 
 def _move_or_replace(
