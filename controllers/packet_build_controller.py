@@ -6,22 +6,26 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt, QThreadPool
-from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog, QPushButton
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QProgressDialog, QPushButton
 
 from background_job import BackgroundJobWorker
 from models import KitStatus
 from packet_build_service import (
+    DEFAULT_PACKET_OUT_DIR,
     PacketBuildReadinessError,
     apply_assembly_context_to_sym_comments,
     apply_assembly_notes_to_parts,
+    apply_title_block_descriptions_from_csv,
     build_assembly_packet,
     build_cut_list_packet,
     create_main_packet_worker,
     prepare_packet_build_context,
     review_pdf_assets_for_action,
     scan_assembly_bom_context,
+    scan_title_block_descriptions,
     validate_print_packet_readiness,
     write_assembly_bom_context_csv,
+    write_title_block_descriptions_csv,
 )
 from performance_metrics import normalize_cache_path
 from services import (
@@ -52,11 +56,15 @@ class PacketBuildController:
         print_button: QPushButton,
         assembly_button: QPushButton,
         cut_list_button: QPushButton,
+        title_scan_button: QPushButton | None = None,
+        title_apply_button: QPushButton | None = None,
     ) -> None:
         self.window = window
         self._print_button = print_button
         self._assembly_button = assembly_button
         self._cut_list_button = cut_list_button
+        self._title_scan_button = title_scan_button
+        self._title_apply_button = title_apply_button
         self._lock = threading.RLock()
         self._active_keys: set[tuple[str, str]] = set()
         self._running = False
@@ -178,6 +186,11 @@ class PacketBuildController:
                     f"{packet_label} already exists:\n{packet_path}\n\n"
                     "Use the packet cell in the table to open it, or click again to rebuild it."
                 )
+
+        for button in (self._title_scan_button, self._title_apply_button):
+            if button is None:
+                continue
+            button.setEnabled(status is not None and not active)
 
     def _confirm_rebuild(
         self,
@@ -732,4 +745,129 @@ class PacketBuildController:
             canceled_log_message="Cut list build canceled.",
             failure_message="Cut list build failed.",
             on_success=_on_success,
+        )
+
+    def scan_title_descriptions(self) -> None:
+        """Scan every part's source PDF for the description printed under
+        its title-block "TITLE" label and write a CSV pairing it with that
+        part's current .sym comment (RADAN attribute 109) for review. Does
+        NOT touch any .sym file - apply_title_descriptions_from_csv is the
+        separate, explicit step that writes the (possibly hand-edited) CSV
+        back, since the comment field already carries real shop notes like
+        "Weld" that a scan alone should never overwrite."""
+        window = self.window
+        title = "Scan Title Descriptions"
+        status = window._current_status()
+        if status is None:
+            QMessageBox.information(window, title, "Select a kit first.")
+            return
+        if status.paths.rpd_path is None or not status.paths.rpd_path.exists():
+            QMessageBox.warning(window, title, "The L-side project file is missing for this kit.")
+            return
+
+        try:
+            context = prepare_packet_build_context(
+                rpd_path=status.paths.rpd_path,
+                fabrication_dir=status.paths.fabrication_kit_dir,
+                settings=window.settings,
+                include_assembly_sources=False,
+                include_cut_list_sources=False,
+            )
+        except Exception as exc:
+            QMessageBox.critical(window, title, str(exc))
+            return
+        if not context.parts:
+            QMessageBox.information(window, title, "No parts were found in the selected RPD.")
+            return
+
+        try:
+            result = scan_title_block_descriptions(
+                parts=context.parts,
+                resolve_asset_fn=context.resolve_asset_fn,
+            )
+        except Exception as exc:
+            QMessageBox.critical(window, title, str(exc))
+            return
+
+        report_path = write_title_block_descriptions_csv(rpd_path=status.paths.rpd_path, result=result)
+        try:
+            open_path(report_path)
+        except Exception:
+            pass
+
+        titles_found = sum(1 for row in result.rows if row.extracted_title)
+        pending_changes = sum(1 for row in result.rows if row.proposed_comment != row.current_comment)
+        QMessageBox.information(
+            window,
+            title,
+            (
+                f"Parts checked: {result.checked_part_count}\n"
+                f"Source PDFs matched: {result.matched_pdf_count}\n"
+                f"Titles found: {titles_found}\n"
+                f"Proposed comment changes: {pending_changes}\n"
+                f"Read errors: {len(result.read_errors)}\n\n"
+                "Review (and edit if needed) the proposed_comment column, then use "
+                "'Apply Title Descriptions' to push it into each part's .sym comment:\n"
+                f"{report_path}"
+            ),
+        )
+        window.log(f"Scanned title-block descriptions for {status.paths.display_name}: {report_path}")
+
+    def apply_title_descriptions_from_csv(self) -> None:
+        window = self.window
+        title = "Apply Title Descriptions"
+        status = window._current_status()
+        if status is None:
+            QMessageBox.information(window, title, "Select a kit first.")
+            return
+        if status.paths.rpd_path is None:
+            QMessageBox.warning(window, title, "The L-side project file is missing for this kit.")
+            return
+
+        out_dir = status.paths.rpd_path.parent / DEFAULT_PACKET_OUT_DIR
+        start_dir = str(out_dir) if out_dir.exists() else str(status.paths.rpd_path.parent)
+        csv_path_text, _selected_filter = QFileDialog.getOpenFileName(
+            window,
+            title,
+            start_dir,
+            "Title Description CSV (TitleBlockDescriptions_*.csv);;CSV Files (*.csv);;All Files (*)",
+        )
+        if not csv_path_text:
+            return
+
+        choice = QMessageBox.question(
+            window,
+            title,
+            (
+                f"Apply proposed_comment from:\n{csv_path_text}\n\n"
+                "to each row's .sym file? This overwrites the RADAN part comment field "
+                "(a backup of each changed .sym is kept first)."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+
+        try:
+            result = apply_title_block_descriptions_from_csv(
+                csv_path=Path(csv_path_text),
+                backup_dir=status.paths.rpd_path.parent / "_bak" / "title_block_comments",
+            )
+        except Exception as exc:
+            QMessageBox.critical(window, title, str(exc))
+            return
+
+        QMessageBox.information(
+            window,
+            title,
+            (
+                f"SYM comments updated: {result.updated_count}\n"
+                f"Skipped (blank/unchanged): {result.skipped_count}\n"
+                f"Missing .sym files: {result.missing_count}\n"
+                f"Errors: {len(result.errors)}"
+            ),
+        )
+        window.log(
+            f"Applied title-block descriptions from {csv_path_text}: {result.updated_count} .sym comment(s) updated."
         )

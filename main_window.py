@@ -244,6 +244,8 @@ class MainWindow(QMainWindow):
             "build_print_packet_button",
             "build_assembly_packet_button",
             "build_cut_list_button",
+            "scan_title_descriptions_button",
+            "apply_title_descriptions_button",
             "launch_kitter_button",
             "send_blocks_button",
             "launch_inventor_button",
@@ -267,6 +269,8 @@ class MainWindow(QMainWindow):
             print_button=self.build_print_packet_button,
             assembly_button=self.build_assembly_packet_button,
             cut_list_button=self.build_cut_list_button,
+            title_scan_button=self.scan_title_descriptions_button,
+            title_apply_button=self.apply_title_descriptions_button,
         )
         self._apply_dashboard_style()
         self._load_settings_into_form()
@@ -485,6 +489,18 @@ class MainWindow(QMainWindow):
             "Build the non-laser cut list packet from the selected kit's saved RPD."
         )
         self.build_cut_list_button.clicked.connect(self.build_selected_cut_list_packet)
+        self.scan_title_descriptions_button = QPushButton("Scan Title Descriptions")
+        self.scan_title_descriptions_button.setToolTip(
+            "Read each part's source PDF title block and write a CSV pairing its TITLE "
+            "description with the part's current .sym comment, for review before applying."
+        )
+        self.scan_title_descriptions_button.clicked.connect(self.scan_selected_title_descriptions)
+        self.apply_title_descriptions_button = QPushButton("Apply Title Descriptions")
+        self.apply_title_descriptions_button.setToolTip(
+            "Push a reviewed Scan Title Descriptions CSV's proposed_comment column into each "
+            "part's .sym comment (RADAN attribute 109)."
+        )
+        self.apply_title_descriptions_button.clicked.connect(self.apply_selected_title_descriptions)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
@@ -515,6 +531,8 @@ class MainWindow(QMainWindow):
             self.build_print_packet_button,
             self.build_assembly_packet_button,
             self.build_cut_list_button,
+            self.scan_title_descriptions_button,
+            self.apply_title_descriptions_button,
         ):
             kit_row.addWidget(button)
         kit_row.addStretch(1)
@@ -2270,6 +2288,12 @@ class MainWindow(QMainWindow):
 
     def build_selected_cut_list_packet(self) -> None:
         self.packet_build_controller.build_cut_list_packet()
+
+    def scan_selected_title_descriptions(self) -> None:
+        self.packet_build_controller.scan_title_descriptions()
+
+    def apply_selected_title_descriptions(self) -> None:
+        self.packet_build_controller.apply_title_descriptions_from_csv()
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()

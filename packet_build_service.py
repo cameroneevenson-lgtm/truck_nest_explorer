@@ -429,6 +429,261 @@ def apply_assembly_context_to_sym_comments(
     )
 
 
+_TITLE_BLOCK_STOP_LABELS = {
+    "size",
+    "dwg no",
+    "scale",
+    "rev",
+    "material",
+    "gauge",
+    "qty",
+    "checked",
+    "drawn",
+    "last update",
+    "tolerances:",
+}
+
+
+@dataclass(frozen=True)
+class TitleBlockDescriptionRow:
+    part_name: str
+    sym_path: str
+    source_pdf: str
+    extracted_title: str
+    current_comment: str
+    proposed_comment: str
+    issue: str
+
+
+@dataclass(frozen=True)
+class TitleBlockScanResult:
+    rows: tuple[TitleBlockDescriptionRow, ...]
+    checked_part_count: int
+    matched_pdf_count: int
+    read_errors: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class TitleBlockApplyResult:
+    updated_count: int
+    skipped_count: int
+    missing_count: int
+    errors: tuple[tuple[str, str], ...] = ()
+
+
+def _extract_title_block_description(pdf_path: Path, *, fitz) -> str:
+    """Pull the description printed directly under the "TITLE" label in a
+    drawing's title block (e.g. "RG5 STORAGE COMPARTMENT" under P56112-99-R1's
+    TITLE, several lines above its DWG NO). Only page 1 is checked - the title
+    block is always on the first sheet. Returns "" if the label is missing or
+    the drawing was released with that field left blank (the very next line
+    is another title-block label like "SIZE" instead of description text)."""
+    with fitz.open(str(pdf_path)) as doc:
+        if doc.page_count <= 0:
+            return ""
+        text = str(doc[0].get_text("text") or "")
+    lines = [line.strip() for line in text.splitlines()]
+    for index, line in enumerate(lines):
+        if line.casefold() != "title":
+            continue
+        for candidate in lines[index + 1 :]:
+            if not candidate:
+                continue
+            if candidate.casefold() in _TITLE_BLOCK_STOP_LABELS:
+                return ""
+            return candidate
+        return ""
+    return ""
+
+
+def _merge_title_block_comment(extracted_title: str, current_comment: str) -> str:
+    title = str(extracted_title or "").strip()
+    current = str(current_comment or "").strip()
+    if not title:
+        return current
+    if not current:
+        return title
+    return f"{title}\n{current}"
+
+
+def scan_title_block_descriptions(
+    *,
+    parts: Sequence[object],
+    resolve_asset_fn: Callable[[str, str], Optional[str]],
+) -> TitleBlockScanResult:
+    """Scan each part's source PDF for its title-block description and pair
+    it with the part's current .sym comment (RADAN attribute 109), so the
+    result can be written to a CSV for human review *before* anything is
+    written back to a .sym file - the comment field already carries real
+    shop-floor notes (e.g. "Weld", "Flat Parts"), so this never writes on
+    its own; see apply_title_block_descriptions_from_csv."""
+    rk_sym_io = _load_radan_kitter_sym_io()
+    fitz = _fitz_module()
+    rows: list[TitleBlockDescriptionRow] = []
+    read_errors: list[tuple[str, str]] = []
+    matched_pdf_count = 0
+    seen_parts: set[str] = set()
+    for part in parts:
+        part_name = _part_display_name(part)
+        if not part_name:
+            continue
+        key = part_name.casefold()
+        if key in seen_parts:
+            continue
+        seen_parts.add(key)
+
+        sym_path = _part_sym_path(part)
+        sym_path_text = str(sym_path or "")
+        current_comment = ""
+        if sym_path is not None and sym_path.exists():
+            try:
+                current_comment = rk_sym_io.part_comment_from_text(_read_text_fallback(sym_path))
+            except Exception:
+                current_comment = ""
+
+        sym_text = str(getattr(part, "sym", "") or "").strip()
+        pdf_path_text = resolve_asset_fn(sym_text, ".pdf") if sym_text else None
+        if not pdf_path_text or not os.path.exists(pdf_path_text):
+            rows.append(
+                TitleBlockDescriptionRow(
+                    part_name=part_name,
+                    sym_path=sym_path_text,
+                    source_pdf="",
+                    extracted_title="",
+                    current_comment=current_comment,
+                    proposed_comment=current_comment,
+                    issue="pdf_missing",
+                )
+            )
+            continue
+
+        matched_pdf_count += 1
+        try:
+            extracted_title = _extract_title_block_description(Path(pdf_path_text), fitz=fitz)
+        except Exception as exc:
+            read_errors.append((pdf_path_text, str(exc)))
+            rows.append(
+                TitleBlockDescriptionRow(
+                    part_name=part_name,
+                    sym_path=sym_path_text,
+                    source_pdf=pdf_path_text,
+                    extracted_title="",
+                    current_comment=current_comment,
+                    proposed_comment=current_comment,
+                    issue=f"read_error: {exc}",
+                )
+            )
+            continue
+
+        rows.append(
+            TitleBlockDescriptionRow(
+                part_name=part_name,
+                sym_path=sym_path_text,
+                source_pdf=pdf_path_text,
+                extracted_title=extracted_title,
+                current_comment=current_comment,
+                proposed_comment=_merge_title_block_comment(extracted_title, current_comment),
+                issue="" if extracted_title else "blank_title_in_drawing",
+            )
+        )
+
+    rows.sort(key=lambda row: _natural_sort_key(row.part_name))
+    return TitleBlockScanResult(
+        rows=tuple(rows),
+        checked_part_count=len(seen_parts),
+        matched_pdf_count=matched_pdf_count,
+        read_errors=tuple(read_errors),
+    )
+
+
+def write_title_block_descriptions_csv(
+    *,
+    rpd_path: Path,
+    result: TitleBlockScanResult,
+    out_dirname: str = DEFAULT_PACKET_OUT_DIR,
+) -> Path:
+    out_dir = Path(rpd_path).parent / str(out_dirname or DEFAULT_PACKET_OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / f"TitleBlockDescriptions_{_make_stamp()}.csv"
+    with report_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "part_name",
+                "sym_path",
+                "source_pdf",
+                "extracted_title",
+                "current_comment",
+                "proposed_comment",
+                "issue",
+            ]
+        )
+        for row in result.rows:
+            writer.writerow(
+                [
+                    row.part_name,
+                    row.sym_path,
+                    row.source_pdf,
+                    row.extracted_title,
+                    row.current_comment,
+                    row.proposed_comment,
+                    row.issue,
+                ]
+            )
+    return report_path
+
+
+def apply_title_block_descriptions_from_csv(
+    *,
+    csv_path: Path,
+    backup_dir: Path | None = None,
+) -> TitleBlockApplyResult:
+    """Push proposed_comment from a (possibly hand-edited) audit CSV back
+    into each row's sym_path as RADAN attribute 109. A row is skipped, not
+    an error, when sym_path or proposed_comment is blank (the reviewer
+    deliberately left it that way in the CSV) or when proposed_comment
+    already matches what's on disk."""
+    rk_sym_io = _load_radan_kitter_sym_io()
+    updated = 0
+    skipped = 0
+    missing = 0
+    errors: list[tuple[str, str]] = []
+    with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            sym_path_text = str(row.get("sym_path") or "").strip()
+            proposed_comment = str(row.get("proposed_comment") or "")
+            if not sym_path_text or not proposed_comment.strip():
+                skipped += 1
+                continue
+            sym_path = Path(sym_path_text)
+            if not sym_path.exists():
+                missing += 1
+                continue
+            try:
+                text = _read_text_fallback(sym_path)
+                if rk_sym_io.part_comment_from_text(text).strip() == proposed_comment.strip():
+                    skipped += 1
+                    continue
+                updated_text, found_comment = rk_sym_io.set_part_comment_text(text, proposed_comment)
+                if not found_comment:
+                    skipped += 1
+                    continue
+                if updated_text != text:
+                    _backup_sym_before_comment_update(sym_path, backup_dir)
+                    _write_text_utf8(sym_path, updated_text)
+                    updated += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                errors.append((sym_path_text, str(exc)))
+    return TitleBlockApplyResult(
+        updated_count=updated,
+        skipped_count=skipped,
+        missing_count=missing,
+        errors=tuple(errors),
+    )
+
+
 def _aggregate_quantities(rows: Sequence[tuple[str, int]]) -> dict[str, int]:
     totals: dict[str, int] = {}
     for part_key, quantity in rows:
