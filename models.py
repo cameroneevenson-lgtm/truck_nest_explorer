@@ -386,6 +386,7 @@ class ExplorerSettings:
     truck_order: list[str] = field(default_factory=list)
     hidden_trucks: list[str] = field(default_factory=list)
     hidden_kits: list[str] = field(default_factory=list)
+    lab_symbol_writer_enabled: bool = False
 
 
 def truck_number_has_tracked_data(settings: ExplorerSettings, truck_number: object) -> bool:

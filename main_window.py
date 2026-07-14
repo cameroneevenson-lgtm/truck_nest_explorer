@@ -519,6 +519,14 @@ class MainWindow(QMainWindow):
             "Import the selected kit's generated _Radan.csv into the matching RADAN project."
         )
         self.import_csv_button.clicked.connect(lambda _checked=False: self.import_selected_csv_to_radan())
+        self.lab_symbol_writer_checkbox = QCheckBox("Use experimental symbol writer")
+        self.lab_symbol_writer_checkbox.setToolTip(
+            "Generate symbols with the experimental native DXF-to-SYM writer (radan_automation's lab symbol "
+            "writer) instead of real RADAN conversion. Proven only on the F54410 paint pack; known to fail "
+            "nesting validation on other jobs. You will be asked to confirm before each import that uses it."
+        )
+        self.lab_symbol_writer_checkbox.setChecked(bool(self.settings.lab_symbol_writer_enabled))
+        self.lab_symbol_writer_checkbox.toggled.connect(self._on_lab_symbol_writer_toggled)
         self.toggle_selected_kits_hidden_button = QPushButton("Hide Selected Kits")
         self.toggle_selected_kits_hidden_button.setToolTip(
             "Hide or unhide the selected kits in the explorer without deleting anything."
@@ -548,6 +556,7 @@ class MainWindow(QMainWindow):
 
         radan_row = QHBoxLayout()
         radan_row.addWidget(self.import_csv_button)
+        radan_row.addWidget(self.lab_symbol_writer_checkbox)
         radan_row.addStretch(1)
 
         layout.addWidget(self.current_truck_label)
@@ -1314,6 +1323,10 @@ class MainWindow(QMainWindow):
     def _on_show_hidden_kits_toggled(self) -> None:
         self._render_current_statuses()
         self._reload_current_flow_for_hidden_state()
+
+    def _on_lab_symbol_writer_toggled(self, checked: bool) -> None:
+        self.settings.lab_symbol_writer_enabled = bool(checked)
+        save_settings(self.settings)
 
     def _reload_current_flow_for_hidden_state(self) -> None:
         truck_number = self.current_truck_number().strip()

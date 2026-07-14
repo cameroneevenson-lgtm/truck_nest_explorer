@@ -3014,6 +3014,20 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             )
             self.assertEqual(loaded.odd_jobs_by_truck, {"F55334": ["Loose Brackets"]})
 
+    def test_save_and_load_settings_round_trip_lab_symbol_writer_enabled(self) -> None:
+        with workspace_tempdir() as temp_root:
+            runtime_dir = temp_root / "runtime"
+            settings_path = runtime_dir / "settings.json"
+
+            with patch("settings_store.RUNTIME_DIR", runtime_dir), patch("settings_store.SETTINGS_PATH", settings_path):
+                save_settings(ExplorerSettings(lab_symbol_writer_enabled=True))
+                loaded_enabled = load_settings()
+                save_settings(ExplorerSettings(lab_symbol_writer_enabled=False))
+                loaded_disabled = load_settings()
+
+            self.assertTrue(loaded_enabled.lab_symbol_writer_enabled)
+            self.assertFalse(loaded_disabled.lab_symbol_writer_enabled)
+
     def test_odd_jobs_are_truck_specific_extra_kit_rows(self) -> None:
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "release"
@@ -3597,6 +3611,126 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 self.assertEqual(window.kit_table.rowCount(), 1)
                 self.assertEqual(window.kit_table.item(0, window.RELEASE_COLUMN).text(), "Complete")
                 self.assertEqual(window.kit_table.item(0, window.FLOW_COLUMN).text(), "Complete")
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def _build_import_selected_fixture(self, temp_root: Path):
+        rpd_path = temp_root / "TEST.rpd"
+        rpd_path.write_text("", encoding="utf-8")
+        csv_path = temp_root / "TEST-BOM_Radan.csv"
+        csv_path.write_text("", encoding="utf-8")
+        release_kit_dir = temp_root / "release_kit"
+        release_kit_dir.mkdir()
+        status = KitStatus(
+            kit_name="PAINT PACK",
+            paths=KitPaths(
+                truck_number="F00000",
+                display_name="F00000 PAINT PACK",
+                kit_name="PAINT PACK",
+                fabrication_relative_path="PAINT PACK",
+                project_name="F00000 PAINT PACK",
+                release_truck_dir=None,
+                release_kit_dir=release_kit_dir,
+                project_dir=temp_root,
+                rpd_path=rpd_path,
+                support_dirs=(),
+                fabrication_truck_dir=None,
+                fabrication_kit_dir=None,
+            ),
+            release_folder_exists=True,
+            project_folder_exists=True,
+            rpd_exists=True,
+            rpd_size_bytes=0,
+            fabrication_folder_exists=True,
+            fabrication_has_files=True,
+            spreadsheet_match=SpreadsheetMatch(chosen_path=csv_path, candidates=(csv_path,)),
+            preview_pdf_match=PdfMatch(chosen_path=None, candidates=()),
+            inventor_outputs=None,
+            status_summary="Released",
+        )
+        return status, csv_path
+
+    def test_import_selected_lab_symbol_writer_confirmation_cancelled_skips_launch(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            try:
+                status, csv_path = self._build_import_selected_fixture(temp_root)
+                window._current_status = lambda: status
+                window.lab_symbol_writer_checkbox.setChecked(True)
+                controller = window.radan_import_controller
+                controller._show_log = lambda log_path: SimpleNamespace(set_process=lambda process: None)
+
+                with (
+                    patch("controllers.radan_import_controller.resolve_existing_inventor_csv", return_value=csv_path),
+                    patch(
+                        "controllers.radan_import_controller.radan_csv_import_lock_status",
+                        return_value=(False, temp_root / "lock", None),
+                    ),
+                    patch("controllers.radan_import_controller.radan_csv_missing_symbols", return_value=None),
+                    patch("controllers.radan_import_controller.visible_radan_sessions", return_value=()),
+                    patch("controllers.radan_import_controller.launch_radan_csv_import") as launch_mock,
+                    patch.object(QMessageBox, "warning", return_value=QMessageBox.No) as warning_mock,
+                ):
+                    controller.import_selected()
+
+                warning_mock.assert_called_once()
+                launch_mock.assert_not_called()
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_import_selected_lab_symbol_writer_confirmed_threads_flag_into_launch(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            try:
+                status, csv_path = self._build_import_selected_fixture(temp_root)
+                window._current_status = lambda: status
+                window.lab_symbol_writer_checkbox.setChecked(True)
+                controller = window.radan_import_controller
+                controller._show_log = lambda log_path: SimpleNamespace(set_process=lambda process: None)
+
+                with (
+                    patch("controllers.radan_import_controller.resolve_existing_inventor_csv", return_value=csv_path),
+                    patch(
+                        "controllers.radan_import_controller.radan_csv_import_lock_status",
+                        return_value=(False, temp_root / "lock", None),
+                    ),
+                    patch("controllers.radan_import_controller.radan_csv_missing_symbols", return_value=None),
+                    patch("controllers.radan_import_controller.visible_radan_sessions", return_value=()),
+                    patch(
+                        "controllers.radan_import_controller.launch_radan_csv_import",
+                        return_value=SimpleNamespace(pid=12345),
+                    ) as launch_mock,
+                    patch.object(QMessageBox, "warning", return_value=QMessageBox.Yes) as warning_mock,
+                ):
+                    controller.import_selected()
+
+                warning_mock.assert_called_once()
+                launch_mock.assert_called_once()
+                self.assertTrue(launch_mock.call_args.kwargs["lab_symbol_writer"])
             finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)

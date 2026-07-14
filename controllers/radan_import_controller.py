@@ -98,6 +98,26 @@ class RadanImportController:
         except Exception as exc:
             QMessageBox.warning(window, title, f"Could not inspect CSV symbols:\n{exc}")
             return
+        lab_symbol_writer = bool(window.lab_symbol_writer_checkbox.isChecked())
+        if lab_symbol_writer:
+            choice = QMessageBox.warning(
+                window,
+                "Experimental Symbol Writer Selected",
+                "This import will use the experimental native DXF-to-SYM writer instead of real RADAN "
+                "conversion.\n\n"
+                "This path is proven only on the F54410 paint pack and is known to fail nesting validation "
+                "on other jobs (radan_automation's held-out validation on F55334 and F56724 both failed). "
+                "Generated symbols may not nest correctly.\n\n"
+                "Continue with the experimental writer anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                window.log(
+                    "RADAN CSV import cancelled before conversion because the experimental symbol writer "
+                    "was selected but not confirmed."
+                )
+                return
         allow_visible_radan = False
         try:
             visible_sessions = visible_radan_sessions()
@@ -141,6 +161,7 @@ class RadanImportController:
                 log_path=log_path,
                 allow_visible_radan=allow_visible_radan,
                 rebuild_symbols=True,
+                lab_symbol_writer=lab_symbol_writer,
                 preprocess_dxf_outer_profile=True,
                 preprocess_dxf_tolerance=0.002,
                 project_update_method=project_update_method,

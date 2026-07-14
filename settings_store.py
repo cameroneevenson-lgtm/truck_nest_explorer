@@ -62,6 +62,7 @@ def load_settings() -> ExplorerSettings:
         truck_order=normalize_truck_order_entries(payload.get("truck_order")),
         hidden_trucks=normalize_hidden_truck_entries(payload.get("hidden_trucks")),
         hidden_kits=canonicalize_hidden_kit_entries(payload.get("hidden_kits"), kit_templates),
+        lab_symbol_writer_enabled=bool(payload.get("lab_symbol_writer_enabled", False)),
     )
 
 
