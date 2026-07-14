@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog, QPushButton
@@ -290,6 +291,115 @@ class PacketBuildController:
 
         return status, context, guard
 
+    def _close_progress_and_finish(self, progress: QProgressDialog, guard: PacketBuildGuard) -> None:
+        try:
+            progress.close()
+        except Exception:
+            pass
+        self._finish_guard(guard)
+
+    def _run_dict_payload_build(
+        self,
+        *,
+        title: str,
+        guard: PacketBuildGuard,
+        status: KitStatus,
+        initial_message: str,
+        progress_label_prefix: str,
+        job_fn: Callable[[BackgroundJobWorker], dict[str, object]],
+        no_sources_message: str,
+        canceled_log_message: str,
+        failure_message: str,
+        on_success: Callable[[dict[str, object], object], None],
+    ) -> None:
+        """Shared shape for build_assembly_packet and build_cut_list_packet.
+
+        Both discover their source PDFs and build the packet on a
+        background thread via a `_job(worker) -> dict` closure that
+        returns `{"state": "done"|"empty"|"canceled", "context": ..., "result": ...}`,
+        show an indeterminate QProgressDialog while it runs, and dispatch
+        the completed payload the same way: "empty" -> a "no source PDFs
+        found" message with the searched folders, canceled (by flag or by
+        `result.skipped`) -> a log line, `result is None` -> the same
+        "no sources" message, otherwise refresh the packet-status cells
+        and hand off to `on_success(data, result)` for the action-specific
+        stats/opening/logging.
+
+        build_print_packet does NOT use this: it runs synchronous
+        pre-work (readiness checks, assembly-context PDF stamping) before
+        the worker even starts, knows its total step count upfront (a
+        determinate progress bar rather than a busy indicator), and uses
+        create_main_packet_worker, which has a different signal contract
+        (separate done/canceled/empty signals with positional arguments
+        instead of one done signal carrying a state dict). Forcing it
+        into this same template would mean either changing that worker's
+        signal contract or bolting on enough parameters/branches that the
+        template would be harder to follow than the duplication it
+        replaced.
+        """
+        window = self.window
+        progress = QProgressDialog(initial_message, "Cancel", 0, 0, window)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = BackgroundJobWorker(job_fn)
+        self._worker = worker
+
+        def _set_progress(done: int, total: int, status_text: str) -> None:
+            if int(total) <= 0:
+                progress.setRange(0, 0)
+            else:
+                progress.setRange(0, int(total))
+                progress.setValue(max(0, min(int(total), int(done))))
+            progress.setLabelText(f"{progress_label_prefix}\n{status_text}")
+
+        def _cleanup() -> None:
+            self._close_progress_and_finish(progress, guard)
+
+        def _on_progress(done: int, total: int, status_text: str) -> None:
+            _set_progress(int(done), int(total), status_text)
+
+        def _on_done(payload: object) -> None:
+            _cleanup()
+            data = payload if isinstance(payload, dict) else {}
+            result = data.get("result")
+            discovered_context = data.get("context")
+            state = str(data.get("state") or "")
+            if state == "empty":
+                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
+                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
+                QMessageBox.information(window, title, f"{no_sources_message}\n\nSearched:\n{searched}")
+                return
+            if state == "canceled" or bool(getattr(result, "skipped", False)):
+                window.log(canceled_log_message)
+                return
+            if result is None:
+                QMessageBox.information(window, title, no_sources_message)
+                return
+
+            window._refresh_packet_statuses(status)
+            on_success(data, result)
+
+        def _on_error(tb: str) -> None:
+            _cleanup()
+            QMessageBox.critical(window, title, str(tb or "").strip() or failure_message)
+
+        worker.signals.progress.connect(_on_progress)
+        worker.signals.done.connect(_on_done)
+        worker.signals.error.connect(_on_error)
+        progress.canceled.connect(worker.request_stop)
+        _set_progress(0, 0, initial_message)
+        worker_started = False
+        try:
+            QThreadPool.globalInstance().start(worker)
+            worker_started = True
+        finally:
+            if not worker_started:
+                self._finish_guard(guard)
+
     def build_print_packet(self) -> None:
         window = self.window
         status, context, guard = self.prepare_context(
@@ -385,11 +495,7 @@ class PacketBuildController:
                 QApplication.processEvents()
 
             def _cleanup() -> None:
-                try:
-                    progress.close()
-                except Exception:
-                    pass
-                self._finish_guard(guard)
+                self._close_progress_and_finish(progress, guard)
 
             def _on_progress(done: int, total: int, status_text: str) -> None:
                 _set_progress(int(done), status_text)
@@ -453,14 +559,6 @@ class PacketBuildController:
         status, context, guard = self.prepare_context("Build Assembly Packet", action_key="assembly")
         if status is None or context is None or guard is None:
             return
-        worker_started = False
-
-        progress = QProgressDialog("Searching for assembly drawing PDFs...", "Cancel", 0, 0, window)
-        progress.setWindowTitle("Build Assembly Packet")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
 
         def _job(worker: BackgroundJobWorker) -> dict[str, object]:
             worker.emit_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
@@ -515,58 +613,10 @@ class PacketBuildController:
                 "sym_comment_result": sym_comment_result,
             }
 
-        worker = BackgroundJobWorker(_job)
-        self._worker = worker
-
-        def _set_progress(done: int, total: int, status_text: str) -> None:
-            if int(total) <= 0:
-                progress.setRange(0, 0)
-            else:
-                progress.setRange(0, int(total))
-                progress.setValue(max(0, min(int(total), int(done))))
-            progress.setLabelText(f"Building assembly packet...\n{status_text}")
-
-        def _cleanup() -> None:
-            try:
-                progress.close()
-            except Exception:
-                pass
-            self._finish_guard(guard)
-
-        def _on_progress(done: int, total: int, status_text: str) -> None:
-            _set_progress(int(done), int(total), status_text)
-
-        def _on_done(payload: object) -> None:
-            _cleanup()
-            data = payload if isinstance(payload, dict) else {}
-            result = data.get("result")
-            discovered_context = data.get("context")
+        def _on_success(data: dict[str, object], result: object) -> None:
             assembly_context = data.get("assembly_context")
             assembly_context_report = data.get("assembly_context_report")
             sym_comment_result = data.get("sym_comment_result")
-            state = str(data.get("state") or "")
-            if state == "empty":
-                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
-                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
-                QMessageBox.information(
-                    window,
-                    "Build Assembly Packet",
-                    "No .iam-backed assembly drawing PDFs were found.\n\nSearched:\n" + searched,
-                )
-                return
-            if state == "canceled" or bool(getattr(result, "skipped", False)):
-                window.log("Assembly packet build canceled.")
-                return
-            if result is None:
-                QMessageBox.information(
-                    window,
-                    "Build Assembly Packet",
-                    "No .iam-backed assembly drawing PDFs were found.",
-                )
-                return
-
-            window._refresh_packet_statuses(status)
-
             packet_path = str(getattr(result, "packet_path", "") or "")
             context_report_text = str(assembly_context_report or "")
             reference_count = len(getattr(assembly_context, "references", ()) or ())
@@ -602,25 +652,18 @@ class PacketBuildController:
                 "No drawing-size pages were found in the .iam-backed PDFs.",
             )
 
-        def _on_error(tb: str) -> None:
-            _cleanup()
-            QMessageBox.critical(
-                window,
-                "Build Assembly Packet",
-                str(tb or "").strip() or "Assembly packet build failed.",
-            )
-
-        worker.signals.progress.connect(_on_progress)
-        worker.signals.done.connect(_on_done)
-        worker.signals.error.connect(_on_error)
-        progress.canceled.connect(worker.request_stop)
-        _set_progress(0, 0, "Searching W/L folders for .iam-backed drawing PDFs")
-        try:
-            QThreadPool.globalInstance().start(worker)
-            worker_started = True
-        finally:
-            if not worker_started:
-                self._finish_guard(guard)
+        self._run_dict_payload_build(
+            title="Build Assembly Packet",
+            guard=guard,
+            status=status,
+            initial_message="Searching for assembly drawing PDFs...",
+            progress_label_prefix="Building assembly packet...",
+            job_fn=_job,
+            no_sources_message="No .iam-backed assembly drawing PDFs were found.",
+            canceled_log_message="Assembly packet build canceled.",
+            failure_message="Assembly packet build failed.",
+            on_success=_on_success,
+        )
 
     def build_cut_list_packet(self) -> None:
         window = self.window
@@ -630,14 +673,6 @@ class PacketBuildController:
         status, context, guard = self.prepare_context("Build Cut List", action_key="cut_list")
         if status is None or context is None or guard is None:
             return
-        worker_started = False
-
-        progress = QProgressDialog("Searching for non-laser cut list PDFs...", "Cancel", 0, 0, window)
-        progress.setWindowTitle("Build Cut List")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
 
         def _job(worker: BackgroundJobWorker) -> dict[str, object]:
             worker.emit_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
@@ -661,55 +696,7 @@ class PacketBuildController:
             )
             return {"state": "done", "context": discovered_context, "result": result}
 
-        worker = BackgroundJobWorker(_job)
-        self._worker = worker
-
-        def _set_progress(done: int, total: int, status_text: str) -> None:
-            if int(total) <= 0:
-                progress.setRange(0, 0)
-            else:
-                progress.setRange(0, int(total))
-                progress.setValue(max(0, min(int(total), int(done))))
-            progress.setLabelText(f"Building cut list...\n{status_text}")
-
-        def _cleanup() -> None:
-            try:
-                progress.close()
-            except Exception:
-                pass
-            self._finish_guard(guard)
-
-        def _on_progress(done: int, total: int, status_text: str) -> None:
-            _set_progress(int(done), int(total), status_text)
-
-        def _on_done(payload: object) -> None:
-            _cleanup()
-            data = payload if isinstance(payload, dict) else {}
-            result = data.get("result")
-            discovered_context = data.get("context")
-            state = str(data.get("state") or "")
-            if state == "empty":
-                searched_roots = getattr(discovered_context, "assembly_search_roots", ()) or ()
-                searched = "\n".join(str(path) for path in searched_roots) or "(none)"
-                QMessageBox.information(
-                    window,
-                    "Build Cut List",
-                    "No non-laser cut list PDFs were found.\n\nSearched:\n" + searched,
-                )
-                return
-            if state == "canceled" or bool(getattr(result, "skipped", False)):
-                window.log("Cut list build canceled.")
-                return
-            if result is None:
-                QMessageBox.information(
-                    window,
-                    "Build Cut List",
-                    "No non-laser cut list PDFs were found.",
-                )
-                return
-
-            window._refresh_packet_statuses(status)
-
+        def _on_success(data: dict[str, object], result: object) -> None:
             packet_path = str(getattr(result, "packet_path", "") or "")
             if packet_path:
                 try:
@@ -734,22 +721,15 @@ class PacketBuildController:
                 "No pages were found in the non-laser cut list PDFs.",
             )
 
-        def _on_error(tb: str) -> None:
-            _cleanup()
-            QMessageBox.critical(
-                window,
-                "Build Cut List",
-                str(tb or "").strip() or "Cut list build failed.",
-            )
-
-        worker.signals.progress.connect(_on_progress)
-        worker.signals.done.connect(_on_done)
-        worker.signals.error.connect(_on_error)
-        progress.canceled.connect(worker.request_stop)
-        _set_progress(0, 0, "Searching W/L folders for non-laser part PDFs")
-        try:
-            QThreadPool.globalInstance().start(worker)
-            worker_started = True
-        finally:
-            if not worker_started:
-                self._finish_guard(guard)
+        self._run_dict_payload_build(
+            title="Build Cut List",
+            guard=guard,
+            status=status,
+            initial_message="Searching for non-laser cut list PDFs...",
+            progress_label_prefix="Building cut list...",
+            job_fn=_job,
+            no_sources_message="No non-laser cut list PDFs were found.",
+            canceled_log_message="Cut list build canceled.",
+            failure_message="Cut list build failed.",
+            on_success=_on_success,
+        )
