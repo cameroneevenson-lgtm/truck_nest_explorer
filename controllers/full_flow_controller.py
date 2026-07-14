@@ -40,6 +40,34 @@ class FullFlowPhase(Enum):
 
 @dataclass
 class FullFlowRunContext:
+    """Mutable state for one "Run Full Flow" invocation.
+
+    `phase` advances through a fixed chain of background-worker steps, each
+    started by a `_start_*` method and completed by an `_on_*_done` Qt-signal
+    callback (dispatched via `_start_worker`/`FullFlowController._on_done`).
+    Every callback re-checks `_is_active_run(run_id)` before touching
+    `self._context`, since a stale callback from a superseded/cancelled run
+    can still fire after the fact.
+
+    Phase transition chain (method that sets the phase -> what runs next):
+
+        FullFlowPhase.INVENTOR     _start_inventor      -> _on_inventor_done
+        FullFlowPhase.REPORT_REVIEW _review_report       -> (blocking dialog; no worker)
+        FullFlowPhase.POST_REVIEW  _start_post_review    -> _on_post_review_done
+        FullFlowPhase.NESTER       _start_nester         -> _on_nester_done (only if
+                                                             the operator opted into the
+                                                             headless nester and confirmed
+                                                             closing RADAN)
+        FullFlowPhase.FINALIZING   _finalize             -> opens the RPD and ends the run
+        FullFlowPhase.IDLE         _finish_run            -> terminal state; `finished=True`
+                                                             and `self._context` is cleared
+
+    `_finish_run` is the single exit point (success, user cancel, or error)
+    and is idempotent - it returns False if the run already finished, so
+    every `_on_*_done`/`_finalize` call site guards its follow-up dialog on
+    `_finish_run(...)`'s return value rather than assuming it always fires.
+    """
+
     run_id: int
     status: KitStatus
     run_nester: bool
