@@ -870,6 +870,22 @@ def resolve_existing_inventor_csv(spreadsheet_path: Path, project_dir: Path | No
     raise FileNotFoundError(f"Inventor-to-RADAN CSV was not found. Expected one of:\n{expected}")
 
 
+def fabrication_kit_dir_ready(fabrication_kit_dir: Path | None) -> bool:
+    """Is the W-side fabrication kit folder present on disk right now?
+
+    This is the single readiness predicate for "can we build/open packets
+    for this kit" - it used to be reimplemented independently as the same
+    inline expression in main_window.py (four times, across
+    _recommended_action_for_status/_available_actions_for_status) and in
+    controllers/packet_build_controller.py's prepare_context (negated, as
+    a pre-build guard). A deliberately live filesystem check (not the
+    cached KitStatus.fabrication_folder_exists field) so callers that are
+    about to act on the folder - or a UI rendering pass right after an
+    action - see the current state.
+    """
+    return fabrication_kit_dir is not None and fabrication_kit_dir.exists()
+
+
 def fabrication_folder_has_files(
     folder: Path | None,
     *,

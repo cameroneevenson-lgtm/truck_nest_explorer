@@ -28,6 +28,7 @@ from services import (
     detect_assembly_packet_pdf,
     detect_cut_list_packet_pdf,
     detect_print_packet_pdf,
+    fabrication_kit_dir_ready,
     open_path,
     radan_csv_import_lock_status,
     resolve_existing_inventor_csv,
@@ -247,7 +248,7 @@ class PacketBuildController:
                 f"Let the import helper{pid_text} finish before building packets.",
             )
             return None, None, None
-        if status.paths.fabrication_kit_dir is None or not status.paths.fabrication_kit_dir.exists():
+        if not fabrication_kit_dir_ready(status.paths.fabrication_kit_dir):
             QMessageBox.warning(
                 window,
                 title,

@@ -68,6 +68,7 @@ from services import (
     detect_cut_list_packet_pdf,
     detect_print_packet_pdf,
     discover_trucks,
+    fabrication_kit_dir_ready,
     filter_kit_statuses,
     filter_truck_numbers,
     find_fabrication_truck_dir,
@@ -616,6 +617,7 @@ class MainWindow(QMainWindow):
         print_packet_match = self._print_packet_match_for_status(status)
         assembly_packet_match = self._assembly_packet_match_for_status(status)
         cut_list_match = self._cut_list_match_for_status(status)
+        fab_kit_dir_ready = fabrication_kit_dir_ready(status.paths.fabrication_kit_dir)
         if not status.project_folder_exists or not status.rpd_exists:
             return "Repair Selected: the L-side project setup is incomplete."
         if status.spreadsheet_match.issue == "multiple_spreadsheets":
@@ -626,34 +628,26 @@ class MainWindow(QMainWindow):
             return "BOM: Inventor launcher is not configured."
         if status.preview_pdf_match.chosen_path is None:
             return "Open Project: review the kit because the Nest Summary is still missing."
-        if (
-            status.rpd_exists
-            and status.paths.fabrication_kit_dir is not None
-            and status.paths.fabrication_kit_dir.exists()
-            and print_packet_match.chosen_path is None
-        ):
+        if status.rpd_exists and fab_kit_dir_ready and print_packet_match.chosen_path is None:
             return "Build Print Packet: generate the QTY packet from Explorer."
         if (
             self.ASSEMBLY_PACKET_BUILD_ENABLED
             and status.rpd_exists
-            and status.paths.fabrication_kit_dir is not None
-            and status.paths.fabrication_kit_dir.exists()
+            and fab_kit_dir_ready
             and assembly_packet_match.chosen_path is None
         ):
             return "Build Assembly Packet: generate the .iam-backed assembly drawing packet from Explorer."
         if (
             self.CUT_LIST_BUILD_ENABLED
             and status.rpd_exists
-            and status.paths.fabrication_kit_dir is not None
-            and status.paths.fabrication_kit_dir.exists()
+            and fab_kit_dir_ready
             and cut_list_match.chosen_path is None
         ):
             return "Build Cut List: generate the non-laser first-token PDF packet from Explorer."
         if (
             status.rpd_exists
             and self.settings.radan_kitter_launcher.strip()
-            and status.paths.fabrication_kit_dir is not None
-            and status.paths.fabrication_kit_dir.exists()
+            and fab_kit_dir_ready
             and (assembly_packet_match.chosen_path is None or cut_list_match.chosen_path is None)
         ):
             return "Run Kitter: packet side-flows are paused in Explorer; use Kitter for assembly packets for now."
@@ -684,7 +678,7 @@ class MainWindow(QMainWindow):
             actions.append("Open Assembly Packet")
         if cut_list_match.chosen_path is not None:
             actions.append("Open Cut List")
-        if status.rpd_exists and status.paths.fabrication_kit_dir is not None and status.paths.fabrication_kit_dir.exists():
+        if status.rpd_exists and fabrication_kit_dir_ready(status.paths.fabrication_kit_dir):
             actions.append("Build Print Packet")
             if self.ASSEMBLY_PACKET_BUILD_ENABLED:
                 actions.append("Build Assembly Packet")
