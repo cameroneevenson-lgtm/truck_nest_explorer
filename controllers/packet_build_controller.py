@@ -48,6 +48,20 @@ class PacketBuildGuard:
     lock_key: tuple[str, str]
 
 
+# Kits made up of standalone structural/mechanical hardware rather than body
+# panels - their parts don't turn up referenced in other kits' .iam assembly
+# drawings, so scanning for assembly context (and stamping "ASM: ..." notes)
+# is just wasted search time and noise, not a missing feature.
+ASSEMBLY_CONTEXT_EXEMPT_KIT_NAMES = frozenset({"pump house", "pump mounts", "pump brackets"})
+
+
+def _kit_wants_assembly_context(status: KitStatus | None) -> bool:
+    if status is None:
+        return True
+    kit_name = str(getattr(status.paths, "kit_name", "") or "").strip().casefold()
+    return kit_name not in ASSEMBLY_CONTEXT_EXEMPT_KIT_NAMES
+
+
 class PacketBuildController:
     def __init__(
         self,
@@ -415,8 +429,9 @@ class PacketBuildController:
 
     def build_print_packet(self) -> None:
         window = self.window
+        include_assembly_sources = _kit_wants_assembly_context(window._current_status())
         status, context, guard = self.prepare_context(
-            "Build Print Packet", action_key="print", include_assembly_sources=True
+            "Build Print Packet", action_key="print", include_assembly_sources=include_assembly_sources
         )
         if status is None or context is None or guard is None:
             return
@@ -693,7 +708,7 @@ class PacketBuildController:
                 rpd_path=status.paths.rpd_path,
                 fabrication_dir=status.paths.fabrication_kit_dir,
                 settings=window.settings,
-                include_assembly_sources=True,
+                include_assembly_sources=_kit_wants_assembly_context(status),
                 include_cut_list_sources=True,
             )
             if worker.should_cancel():
