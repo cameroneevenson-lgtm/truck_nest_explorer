@@ -380,7 +380,6 @@ def main(argv: list[str]) -> int:
             x_label_size=6.0,
             x_label_text="",
             legend_size=7.0,
-            dark_mode=False,
         )
         if gantt_png is not None:
             gantt_png_base64 = base64.b64encode(gantt_png).decode("ascii")
