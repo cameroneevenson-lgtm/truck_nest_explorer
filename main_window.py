@@ -46,6 +46,7 @@ from flow_bridge import (
     load_cached_flow_truck_insight,
     map_explorer_kit_to_flow_kit,
     normalize_flow_insight_for_local_release,
+    rename_truck_number_in_dashboard,
 )
 from models import (
     canonicalize_client_numbers_by_truck,
@@ -57,7 +58,9 @@ from models import (
     normalize_hidden_truck_entries,
     normalize_hidden_truck_number,
     normalize_truck_order_entries,
+    rename_truck_number_in_settings,
     resolve_punch_code_text,
+    truck_number_has_tracked_data,
 )
 from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, settings_cache_signature
 from services import (
@@ -436,6 +439,12 @@ class MainWindow(QMainWindow):
         self.edit_truck_client_button = QPushButton("Client")
         self.edit_truck_client_button.setToolTip("Store or update the client number for the selected truck.")
         self.edit_truck_client_button.clicked.connect(self.edit_current_truck_client_number)
+        self.rename_truck_button = QPushButton("Rename Truck #")
+        self.rename_truck_button.setToolTip(
+            "Relabel the selected truck's number in this app's settings (and the fabrication "
+            "dashboard's record, if it has one). Never renames L:/W: folders."
+        )
+        self.rename_truck_button.clicked.connect(self.rename_current_truck_number)
         self.toggle_truck_hidden_button = QPushButton("Hide Truck")
         self.toggle_truck_hidden_button.setToolTip(
             "Hide or unhide the selected truck in the explorer without deleting anything."
@@ -446,6 +455,7 @@ class MainWindow(QMainWindow):
         truck_row.addWidget(self.open_truck_release_button)
         truck_row.addWidget(self.open_truck_fabrication_button)
         truck_row.addWidget(self.edit_truck_client_button)
+        truck_row.addWidget(self.rename_truck_button)
         truck_row.addWidget(self.toggle_truck_hidden_button)
         truck_row.addStretch(1)
 
@@ -1845,6 +1855,81 @@ class MainWindow(QMainWindow):
         self._select_truck(truck_number)
         self._refresh_current_truck_heading()
         self.log(action_text)
+
+    def rename_current_truck_number(self) -> None:
+        truck_number = self.current_truck_number()
+        if not truck_number:
+            QMessageBox.information(self, "Rename Truck #", "Select a truck first.")
+            return
+
+        self._ensure_saved_settings()
+        new_truck_number, ok = QInputDialog.getText(
+            self,
+            "Rename Truck #",
+            f"New truck number for {truck_number}:",
+        )
+        if not ok:
+            return
+
+        new_key = normalize_hidden_truck_number(new_truck_number)
+        if not new_key:
+            QMessageBox.warning(
+                self,
+                "Rename Truck #",
+                "Enter a job number in the F##### or P##### format, for example F55985 or P56113.",
+            )
+            return
+
+        old_key = normalize_hidden_truck_number(truck_number)
+        if new_key == old_key:
+            return
+
+        if truck_number_has_tracked_data(self.settings, new_key):
+            QMessageBox.warning(
+                self,
+                "Rename Truck #",
+                f"{new_key} already has data tracked in this app (client, notes, punch codes, or "
+                "hidden state). Renaming onto it would merge the two trucks' settings together, so "
+                "this was not done.",
+            )
+            return
+
+        confirmed = QMessageBox.question(
+            self,
+            "Rename Truck #",
+            f"Rename {truck_number} to {new_key}?\n\n"
+            "This relabels this app's own settings (client, notes, punch codes, hidden state, order) "
+            "and, if the fabrication dashboard already tracks this truck, its record there too. "
+            "L:/W: folders are never renamed.",
+        )
+        if confirmed != QMessageBox.Yes:
+            return
+
+        self.settings = rename_truck_number_in_settings(self.settings, old_key, new_key)
+        save_settings(self.settings)
+
+        try:
+            dashboard_result = rename_truck_number_in_dashboard(old_key, new_key)
+        except Exception:
+            dashboard_result = "unavailable"
+
+        dashboard_messages = {
+            "updated": "fabrication dashboard record updated to match.",
+            "not_found": "fabrication dashboard does not track this truck; nothing to update there.",
+            "conflict": (
+                f"WARNING: {new_key} is already used by a different truck in the fabrication "
+                "dashboard - its record there was left unchanged and now differs from this app."
+            ),
+            "unavailable": "fabrication dashboard was not reachable; its record (if any) was not updated.",
+        }
+        dashboard_message = dashboard_messages.get(dashboard_result, dashboard_result)
+
+        self._pending_truck_selection = new_key
+        self.search_edit.clear()
+        self.refresh_trucks()
+        self.log(f"Renamed truck {truck_number} to {new_key}; {dashboard_message}")
+        if dashboard_result == "conflict":
+            QMessageBox.warning(self, "Rename Truck #", f"Renamed to {new_key} here, but {dashboard_message}")
 
     def toggle_selected_kits_hidden(self) -> None:
         selected_statuses = self._selected_statuses()

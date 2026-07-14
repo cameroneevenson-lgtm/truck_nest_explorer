@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 
@@ -386,6 +386,91 @@ class ExplorerSettings:
     truck_order: list[str] = field(default_factory=list)
     hidden_trucks: list[str] = field(default_factory=list)
     hidden_kits: list[str] = field(default_factory=list)
+
+
+def truck_number_has_tracked_data(settings: ExplorerSettings, truck_number: object) -> bool:
+    """Whether this truck number appears anywhere in settings - trucks have
+    no other persisted identity in this app (see explicit_truck_numbers in
+    services.py, which draws from the same fields), so this is the
+    collision check for rename_truck_number_in_settings: renaming onto a
+    truck number that already has data here would silently merge two
+    trucks' settings together."""
+    key = normalize_hidden_truck_number(truck_number)
+    if not key:
+        return False
+    if key in {normalize_hidden_truck_number(entry) for entry in settings.truck_order}:
+        return True
+    if key in {normalize_hidden_truck_number(entry) for entry in settings.hidden_trucks}:
+        return True
+    if key in {normalize_hidden_truck_number(k) for k in settings.client_numbers_by_truck}:
+        return True
+    if key in {normalize_hidden_truck_number(k) for k in settings.odd_jobs_by_truck}:
+        return True
+    for mapping in (settings.punch_codes_by_kit, settings.notes_by_kit, settings.hidden_kits):
+        entries = mapping.keys() if isinstance(mapping, dict) else mapping
+        for entry in entries:
+            entry_text = str(entry or "")
+            if HIDDEN_KIT_SEPARATOR not in entry_text:
+                continue
+            truck_part, _kit_part = entry_text.split(HIDDEN_KIT_SEPARATOR, 1)
+            if normalize_hidden_truck_number(truck_part) == key:
+                return True
+    return False
+
+
+def rename_truck_number_in_settings(
+    settings: ExplorerSettings,
+    old_truck_number: object,
+    new_truck_number: object,
+) -> ExplorerSettings:
+    """Relabels every truck-number-keyed entry in settings from
+    old_truck_number to new_truck_number - trucks are renumbered upstream
+    of this app before release, for reasons outside its control, and this
+    app's own tracked data (client, notes, punch codes, hidden state,
+    order) needs to follow the new number. Never touches the filesystem -
+    this app must never rename L:/W: folders. Returns settings unchanged
+    if old/new are equal or either fails to normalize; callers should use
+    truck_number_has_tracked_data(settings, new_truck_number) beforehand to
+    guard against silently merging two trucks' data together."""
+    old_key = normalize_hidden_truck_number(old_truck_number)
+    new_key = normalize_hidden_truck_number(new_truck_number)
+    if not old_key or not new_key or old_key == new_key:
+        return settings
+
+    def _rename_direct_key(values: dict[str, object]) -> dict[str, object]:
+        renamed = dict(values)
+        for existing_key in list(renamed.keys()):
+            if normalize_hidden_truck_number(existing_key) == old_key:
+                renamed[new_key] = renamed.pop(existing_key)
+        return renamed
+
+    def _rename_in_list(values: list[str]) -> list[str]:
+        return [new_key if normalize_hidden_truck_number(v) == old_key else v for v in values]
+
+    def _rename_composite_key(key_text: str) -> str:
+        if HIDDEN_KIT_SEPARATOR not in key_text:
+            return key_text
+        truck_part, kit_part = key_text.split(HIDDEN_KIT_SEPARATOR, 1)
+        if normalize_hidden_truck_number(truck_part) != old_key:
+            return key_text
+        return build_hidden_kit_key(new_key, kit_part) or key_text
+
+    def _rename_composite_dict(values: dict[str, str]) -> dict[str, str]:
+        return {_rename_composite_key(key): value for key, value in values.items()}
+
+    def _rename_composite_list(values: list[str]) -> list[str]:
+        return [_rename_composite_key(entry) for entry in values]
+
+    return replace(
+        settings,
+        client_numbers_by_truck=_rename_direct_key(settings.client_numbers_by_truck),
+        odd_jobs_by_truck=_rename_direct_key(settings.odd_jobs_by_truck),
+        truck_order=_rename_in_list(settings.truck_order),
+        hidden_trucks=_rename_in_list(settings.hidden_trucks),
+        punch_codes_by_kit=_rename_composite_dict(settings.punch_codes_by_kit),
+        notes_by_kit=_rename_composite_dict(settings.notes_by_kit),
+        hidden_kits=_rename_composite_list(settings.hidden_kits),
+    )
 
 
 @dataclass(frozen=True)

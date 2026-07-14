@@ -41,6 +41,7 @@ from flow_bridge import (
     normalize_flow_kit_names,
     normalize_flow_insight_for_local_release,
     parse_flow_probe_payload,
+    rename_truck_number_in_dashboard,
 )
 from flow_schedule_probe import include_kit_in_embedded_gantt, split_overlay_rows_for_embedded_gantt
 from models import (
@@ -55,7 +56,9 @@ from models import (
     canonicalize_hidden_kit_entries,
     canonicalize_punch_codes_by_kit,
     materialize_legacy_punch_codes_for_kit,
+    rename_truck_number_in_settings,
     resolve_punch_code_text,
+    truck_number_has_tracked_data,
 )
 from performance_metrics import BoundedTTLCache, performance_snapshot, reset_performance_metrics
 from packet_build_service import (
@@ -490,6 +493,51 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         self.assertTrue(insight.available)
         self.assertEqual(normalize_flow_kit_names(("Console", "Body", "body")), ("Body", "Console"))
         self.assertEqual(captured_command[-4:], ["--hide-kit", "Body", "--hide-kit", "Console"])
+
+    def test_rename_truck_number_in_dashboard_updates_matching_truck(self) -> None:
+        flow_app_dir = Path(__file__).resolve().parents[2] / "fabrication_flow_dashboard"
+        real_db_path = flow_app_dir / "fabrication_flow.db"
+        if not real_db_path.exists():
+            self.skipTest("fabrication_flow_dashboard has no database available in this environment")
+
+        import sqlite3
+
+        with workspace_tempdir() as temp_root:
+            scratch_db = temp_root / "fabrication_flow.db"
+            shutil.copyfile(real_db_path, scratch_db)
+
+            conn = sqlite3.connect(str(scratch_db))
+            existing_row = conn.execute("SELECT truck_number FROM Truck LIMIT 1").fetchone()
+            other_row = conn.execute(
+                "SELECT truck_number FROM Truck WHERE truck_number != ? LIMIT 1",
+                (existing_row[0] if existing_row else "",),
+            ).fetchone()
+            conn.close()
+            if existing_row is None or other_row is None:
+                self.skipTest("scratch database needs at least two trucks for this test")
+            existing_truck_number, other_truck_number = existing_row[0], other_row[0]
+
+            with patch("flow_bridge.FLOW_DB_PATH", scratch_db):
+                self.assertEqual(
+                    rename_truck_number_in_dashboard(existing_truck_number, "Z99999"), "updated"
+                )
+                self.assertEqual(
+                    rename_truck_number_in_dashboard("Z00000-does-not-exist", "Z00001"), "not_found"
+                )
+                self.assertEqual(
+                    rename_truck_number_in_dashboard("Z99999", other_truck_number), "conflict"
+                )
+
+            conn = sqlite3.connect(str(scratch_db))
+            renamed_row = conn.execute(
+                "SELECT id FROM Truck WHERE truck_number = 'Z99999'"
+            ).fetchone()
+            still_present_row = conn.execute(
+                "SELECT id FROM Truck WHERE truck_number = ?", (other_truck_number,)
+            ).fetchone()
+            conn.close()
+            self.assertIsNotNone(renamed_row)
+            self.assertIsNotNone(still_present_row)
 
     def test_normalize_flow_insight_for_local_release_prefers_local_unreleased_signal(self) -> None:
         truck_insight = parse_flow_probe_payload(
@@ -2854,6 +2902,60 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 "F55334": "12345",
                 "F55335": "67890",
             },
+        )
+
+    def test_rename_truck_number_relabels_every_tracked_field(self) -> None:
+        settings = ExplorerSettings(
+            client_numbers_by_truck={"F55334": "Fort Erie"},
+            odd_jobs_by_truck={"F55334": ["Extra bracket"]},
+            truck_order=["F55334", "F56724"],
+            hidden_trucks=["F55334"],
+            punch_codes_by_kit={"F55334::PAINT PACK": "1234"},
+            notes_by_kit={"F55334::PAINT PACK": "note text"},
+            hidden_kits=["F55334::CHASSIS PACK"],
+        )
+
+        renamed = rename_truck_number_in_settings(settings, "F55334", "F56000")
+
+        self.assertEqual(renamed.client_numbers_by_truck, {"F56000": "Fort Erie"})
+        self.assertEqual(renamed.odd_jobs_by_truck, {"F56000": ["Extra bracket"]})
+        self.assertEqual(renamed.truck_order, ["F56000", "F56724"])
+        self.assertEqual(renamed.hidden_trucks, ["F56000"])
+        self.assertEqual(renamed.punch_codes_by_kit, {"F56000::PAINT PACK": "1234"})
+        self.assertEqual(renamed.notes_by_kit, {"F56000::PAINT PACK": "note text"})
+        self.assertEqual(renamed.hidden_kits, ["F56000::CHASSIS PACK"])
+
+    def test_rename_truck_number_leaves_other_trucks_untouched(self) -> None:
+        settings = ExplorerSettings(
+            client_numbers_by_truck={"F55334": "Fort Erie", "F56724": "Martin River"},
+            truck_order=["F55334", "F56724"],
+        )
+
+        renamed = rename_truck_number_in_settings(settings, "F55334", "F56000")
+
+        self.assertEqual(
+            renamed.client_numbers_by_truck,
+            {"F56000": "Fort Erie", "F56724": "Martin River"},
+        )
+        self.assertEqual(renamed.truck_order, ["F56000", "F56724"])
+
+    def test_rename_truck_number_is_a_no_op_for_invalid_or_unchanged_input(self) -> None:
+        settings = ExplorerSettings(truck_order=["F55334"])
+        self.assertIs(rename_truck_number_in_settings(settings, "F55334", "F55334"), settings)
+        self.assertIs(rename_truck_number_in_settings(settings, "F55334", "not-a-truck"), settings)
+        self.assertIs(rename_truck_number_in_settings(settings, "not-a-truck", "F56000"), settings)
+
+    def test_truck_number_has_tracked_data_checks_every_field(self) -> None:
+        self.assertTrue(
+            truck_number_has_tracked_data(ExplorerSettings(truck_order=["F55334"]), "F55334")
+        )
+        self.assertTrue(
+            truck_number_has_tracked_data(
+                ExplorerSettings(hidden_kits=["F55334::PAINT PACK"]), "F55334"
+            )
+        )
+        self.assertFalse(
+            truck_number_has_tracked_data(ExplorerSettings(truck_order=["F55334"]), "F56000")
         )
 
     def test_filter_kit_statuses_hides_persisted_completed_kits(self) -> None:

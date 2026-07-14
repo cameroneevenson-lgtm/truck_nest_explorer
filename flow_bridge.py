@@ -485,3 +485,82 @@ def normalize_flow_insight_for_local_release(
         tooltip_text="\n".join(tooltip_lines),
         status_key=local_status_key,
     )
+
+
+# fabrication_flow_dashboard has its own database.py/models.py, same names
+# as (unrelated) modules this app already has loaded - swapped out of
+# sys.modules for the duration of the import below, then restored, so this
+# app's own imports are never affected. Mirrors that dashboard's own
+# nest_release_sync.py, which solves the identical collision in reverse
+# (it reaches into this app's services.py/settings_store.py).
+_FLOW_DB_MODULE_NAMES = ("models", "services", "settings_store", "database")
+
+
+def _load_flow_database_module() -> object | None:
+    if not FLOW_APP_DIR.exists():
+        return None
+
+    previous: dict[str, object] = {}
+    for name in _FLOW_DB_MODULE_NAMES:
+        existing = sys.modules.pop(name, None)
+        if existing is not None:
+            previous[name] = existing
+
+    old_path = list(sys.path)
+    sys.path.insert(0, str(FLOW_APP_DIR))
+    captured = None
+    try:
+        import database as flow_database  # type: ignore[import-not-found]
+
+        captured = flow_database
+    except ImportError:
+        captured = None
+    finally:
+        sys.path[:] = old_path
+        for name in _FLOW_DB_MODULE_NAMES:
+            sys.modules.pop(name, None)
+        for name, module in previous.items():
+            sys.modules[name] = module
+
+    return captured
+
+
+def rename_truck_number_in_dashboard(old_truck_number: str, new_truck_number: str) -> str:
+    """Best-effort: updates fabrication_flow_dashboard's own Truck.truck_number
+    column to match a rename made here, so the two apps' independently-keyed
+    truck identifiers stay in sync - companion to this app's own
+    rename_truck_number_in_settings (models.py).
+
+    Returns one of: "updated" (a matching truck was found and renamed),
+    "not_found" (no truck with old_truck_number in the dashboard - not an
+    error, the dashboard tracking a given truck is optional), "unavailable"
+    (dashboard app/db not reachable), or "conflict" (new_truck_number is
+    already taken by a different truck in the dashboard - the rename was
+    NOT applied, unlike this app's own settings rename, since
+    Truck.truck_number has a UNIQUE constraint there)."""
+    old_key = str(old_truck_number or "").strip().upper()
+    new_key = str(new_truck_number or "").strip().upper()
+    if not old_key or not new_key or old_key == new_key:
+        return "not_found"
+    if not FLOW_DB_PATH.exists():
+        return "unavailable"
+
+    flow_database = _load_flow_database_module()
+    if flow_database is None:
+        return "unavailable"
+
+    try:
+        database = flow_database.FabricationDatabase(FLOW_DB_PATH)
+        matching_truck = None
+        for truck in database.load_trucks_with_kits(active_only=False):
+            if str(truck.truck_number or "").strip().upper() == old_key and truck.id is not None:
+                matching_truck = truck
+                break
+        if matching_truck is None:
+            return "not_found"
+        database.set_truck_number(truck_id=int(matching_truck.id), truck_number=new_key)
+        return "updated"
+    except Exception as exc:
+        if "UNIQUE" in str(exc).upper():
+            return "conflict"
+        return "unavailable"
