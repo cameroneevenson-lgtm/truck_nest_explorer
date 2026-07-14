@@ -963,6 +963,46 @@ def review_pdf_assets_for_action(
     )
 
 
+def _scan_pdf_for_assembly_references(
+    pdf_path: Path,
+    aliases: Sequence[_PartAlias],
+    seen_refs: set[tuple[str, str, int]],
+    fitz,
+) -> list[AssemblyBomReference]:
+    """Find every alias hit in one assembly PDF, page by page.
+
+    `seen_refs` is the caller's dedup set (shared across every PDF in a
+    scan) - keyed on (part, pdf, page) - and is mutated in place so a
+    second call for a different PDF still sees earlier hits. Any failure
+    here (corrupt PDF, fitz error, etc.) is left to propagate; the caller
+    is responsible for catching it and recording a read error, since a
+    single bad PDF should not abort the rest of the scan.
+    """
+    found: list[AssemblyBomReference] = []
+    with fitz.open(str(pdf_path)) as doc:
+        for page_index in range(doc.page_count):
+            text = str(doc[page_index].get_text("text") or "")
+            for alias in aliases:
+                if not alias.pattern.search(text):
+                    continue
+                key = (alias.part_name.casefold(), _normalize_path_key(pdf_path), page_index + 1)
+                if key in seen_refs:
+                    continue
+                evidence = _text_line_evidence(text, alias.pattern)
+                found.append(
+                    AssemblyBomReference(
+                        part_name=alias.part_name,
+                        assembly_name=pdf_path.stem,
+                        assembly_pdf_path=str(pdf_path),
+                        page_number=page_index + 1,
+                        bom_qty=_quantity_from_bom_evidence(evidence, alias.alias),
+                        evidence=evidence,
+                    )
+                )
+                seen_refs.add(key)
+    return found
+
+
 def scan_assembly_bom_context(
     *,
     parts: Sequence[object],
@@ -991,27 +1031,7 @@ def scan_assembly_bom_context(
         if _should_cancel():
             break
         try:
-            with fitz.open(str(pdf_path)) as doc:
-                for page_index in range(doc.page_count):
-                    text = str(doc[page_index].get_text("text") or "")
-                    for alias in aliases:
-                        if not alias.pattern.search(text):
-                            continue
-                        key = (alias.part_name.casefold(), _normalize_path_key(pdf_path), page_index + 1)
-                        if key in seen_refs:
-                            continue
-                        evidence = _text_line_evidence(text, alias.pattern)
-                        references.append(
-                            AssemblyBomReference(
-                                part_name=alias.part_name,
-                                assembly_name=pdf_path.stem,
-                                assembly_pdf_path=str(pdf_path),
-                                page_number=page_index + 1,
-                                bom_qty=_quantity_from_bom_evidence(evidence, alias.alias),
-                                evidence=evidence,
-                            )
-                        )
-                        seen_refs.add(key)
+            references.extend(_scan_pdf_for_assembly_references(pdf_path, aliases, seen_refs, fitz))
         except Exception as exc:
             read_errors.append((str(pdf_path), str(exc)))
         if progress_cb is not None:
