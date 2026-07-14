@@ -1486,6 +1486,20 @@ class MainWindow(QMainWindow):
             if self._cut_list_match_for_status(status).chosen_path is not None:
                 self._open_cut_list_for_status(status)
 
+    @staticmethod
+    def _status_color(match, *, green: QColor, yellow: QColor, red: QColor) -> QColor:
+        """Pick the traffic-light color for a PdfMatch-shaped status field.
+
+        Green: exactly one candidate was found and chosen. Yellow: a
+        candidate was chosen from multiple, or candidates exist but none
+        was chosen. Red: nothing was found at all.
+        """
+        if match.chosen_path is not None:
+            return green if len(match.candidates) == 1 else yellow
+        if match.candidates:
+            return yellow
+        return red
+
     def _populate_status_row(self, row: int, status: KitStatus) -> None:
         green = QColor("#D8F3DC")
         yellow = QColor("#FFF3BF")
@@ -1493,29 +1507,13 @@ class MainWindow(QMainWindow):
         hidden = is_hidden_kit(status.paths.truck_number, status.kit_name, self.settings)
         hidden_foreground = self._hidden_foreground_for_status(status)
 
-        nest_summary_color = red
-        if status.preview_pdf_match.chosen_path is not None:
-            nest_summary_color = green if len(status.preview_pdf_match.candidates) == 1 else yellow
-        elif status.preview_pdf_match.candidates:
-            nest_summary_color = yellow
+        nest_summary_color = self._status_color(status.preview_pdf_match, green=green, yellow=yellow, red=red)
         packet_match = self._print_packet_match_for_status(status)
         assembly_packet_match = self._assembly_packet_match_for_status(status)
         cut_list_match = self._cut_list_match_for_status(status)
-        print_packet_color = red
-        if packet_match.chosen_path is not None:
-            print_packet_color = green if len(packet_match.candidates) == 1 else yellow
-        elif packet_match.candidates:
-            print_packet_color = yellow
-        assembly_packet_color = red
-        if assembly_packet_match.chosen_path is not None:
-            assembly_packet_color = green if len(assembly_packet_match.candidates) == 1 else yellow
-        elif assembly_packet_match.candidates:
-            assembly_packet_color = yellow
-        cut_list_color = red
-        if cut_list_match.chosen_path is not None:
-            cut_list_color = green if len(cut_list_match.candidates) == 1 else yellow
-        elif cut_list_match.candidates:
-            cut_list_color = yellow
+        print_packet_color = self._status_color(packet_match, green=green, yellow=yellow, red=red)
+        assembly_packet_color = self._status_color(assembly_packet_match, green=green, yellow=yellow, red=red)
+        cut_list_color = self._status_color(cut_list_match, green=green, yellow=yellow, red=red)
 
         punch_code_item = self._make_item(
             self._punch_code_text_for_status(status),
