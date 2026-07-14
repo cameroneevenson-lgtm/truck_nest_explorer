@@ -36,6 +36,7 @@ from controllers.hot_reload_controller import HotReloadController
 from controllers.inventor_controller import InventorController
 from controllers.packet_build_controller import PacketBuildController
 from controllers.radan_import_controller import RadanImportController
+from controllers.truck_ordering_controller import TruckOrderingController
 from flow_bridge import (
     FlowTruckInsight,
     empty_flow_truck_insight,
@@ -224,6 +225,7 @@ class MainWindow(QMainWindow):
         self._kitter_status_refresh_timer.timeout.connect(self._poll_kitter_status_refresh)
 
         self._build_ui()
+        self.truck_ordering_controller = TruckOrderingController(self)
         self.inventor_controller = InventorController(self)
         full_flow_lock_widgets: list[QWidget] = []
         for widget_name in (
@@ -1712,33 +1714,10 @@ class MainWindow(QMainWindow):
             full_flow_controller.reapply_action_lock()
 
     def _refresh_show_hidden_trucks_button(self) -> None:
-        hidden_count = len(normalize_hidden_truck_entries(self.settings.hidden_trucks))
-        showing_hidden = self.show_hidden_trucks_button.isChecked()
-        if hidden_count == 0 and showing_hidden:
-            self.show_hidden_trucks_button.blockSignals(True)
-            self.show_hidden_trucks_button.setChecked(False)
-            self.show_hidden_trucks_button.blockSignals(False)
-            showing_hidden = False
-        label_prefix = "Hide Hidden" if showing_hidden else "Show Hidden"
-        self.show_hidden_trucks_button.setText(f"{label_prefix} ({hidden_count})")
-        if hidden_count:
-            self.show_hidden_trucks_button.setEnabled(True)
-            self.show_hidden_trucks_button.setToolTip(
-                f"{hidden_count} hidden truck(s). Toggle to {'hide' if showing_hidden else 'show'} them in the truck list."
-            )
-            return
-        if showing_hidden:
-            self.show_hidden_trucks_button.setEnabled(True)
-            self.show_hidden_trucks_button.setToolTip("No trucks are hidden right now.")
-            return
-        self.show_hidden_trucks_button.setEnabled(False)
-        self.show_hidden_trucks_button.setToolTip("No trucks are hidden right now.")
+        self.truck_ordering_controller.refresh_show_hidden_button()
 
     def _refresh_truck_order_buttons(self) -> None:
-        row = self.truck_list.currentRow()
-        count = self.truck_list.count()
-        self.move_truck_up_button.setEnabled(count > 0 and row > 0)
-        self.move_truck_down_button.setEnabled(count > 0 and 0 <= row < count - 1)
+        self.truck_ordering_controller.refresh_order_buttons()
 
     def _visible_truck_numbers(self) -> list[str]:
         return [
@@ -1794,40 +1773,10 @@ class MainWindow(QMainWindow):
             self._flow_watch_timer.start()
 
     def _persist_truck_order(self) -> None:
-        self.settings.truck_order = normalize_truck_order_entries(self._all_trucks)
-        save_settings(self.settings)
+        self.truck_ordering_controller.persist_truck_order()
 
     def _move_selected_truck(self, direction: int) -> None:
-        current_row = self.truck_list.currentRow()
-        if current_row < 0:
-            return
-        target_row = current_row + direction
-        visible_trucks = self._visible_truck_numbers()
-        if target_row < 0 or target_row >= len(visible_trucks):
-            return
-
-        current_truck = visible_trucks[current_row]
-        target_truck = visible_trucks[target_row]
-        try:
-            all_current_index = next(
-                index for index, truck_number in enumerate(self._all_trucks)
-                if truck_number.casefold() == current_truck.casefold()
-            )
-            all_target_index = next(
-                index for index, truck_number in enumerate(self._all_trucks)
-                if truck_number.casefold() == target_truck.casefold()
-            )
-        except StopIteration:
-            return
-
-        self._all_trucks[all_current_index], self._all_trucks[all_target_index] = (
-            self._all_trucks[all_target_index],
-            self._all_trucks[all_current_index],
-        )
-        self._persist_truck_order()
-        self._apply_truck_filter()
-        self._select_truck(current_truck)
-        self.log(f"Updated fabrication truck order: {current_truck}")
+        self.truck_ordering_controller.move_selected_truck(direction)
 
     def _save_hidden_state(self) -> None:
         self.settings.hidden_trucks = normalize_hidden_truck_entries(self.settings.hidden_trucks)
