@@ -12,6 +12,7 @@ from typing import Callable, Optional, Sequence
 import xml.etree.ElementTree as ET
 
 from models import DEFAULT_P_RELEASE_ROOT, ExplorerSettings
+from packet_pdf_detection import is_generated_packet_pdf_artifact
 
 DEFAULT_PACKET_OUT_DIR = "_out"
 TABLOID_WIDTH_POINTS = 11.0 * 72.0
@@ -546,28 +547,13 @@ def _natural_sort_key(value: str) -> list[object]:
     return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value)]
 
 
-def _normalize_pdf_name_words(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
-
-
 def _looks_generated_pdf_artifact(path: Path) -> bool:
-    stem_words = _normalize_pdf_name_words(path.stem)
-    return (
-        stem_words.startswith("print packet")
-        or stem_words.startswith("printpacket")
-        or stem_words.startswith("assembly packet")
-        or stem_words.startswith("assemblypacket")
-        or stem_words.startswith("cut list")
-        or stem_words.startswith("cutlist")
-        or stem_words.endswith("nest summary")
-        or " print packet " in f" {stem_words} "
-        or " printpacket " in f" {stem_words} "
-        or " assembly packet " in f" {stem_words} "
-        or " assemblypacket " in f" {stem_words} "
-        or " cut list " in f" {stem_words} "
-        or " cutlist " in f" {stem_words} "
-        or " nest summary " in f" {stem_words} "
-    )
+    # Delegates to the single source of truth for "is this PDF a packet this
+    # app generates" in packet_pdf_detection.py. This used to be a separate,
+    # slightly-out-of-sync reimplementation of the same rules (it was missing
+    # the "assembly drawings" naming variant that services.py's classifier
+    # already recognized).
+    return is_generated_packet_pdf_artifact(path)
 
 
 def _sorted_relative_key(path: Path, root: Path) -> tuple[int, list[object]]:
