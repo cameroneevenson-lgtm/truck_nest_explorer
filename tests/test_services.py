@@ -1963,16 +1963,16 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             source_path = source_root / "P1 F57524 CONSOLE PA.cnc"
             source_path.write_text("block content", encoding="utf-8")
 
-            import services
+            import w_block_transfer
 
-            real_copy_verified = services._copy_verified
+            real_copy_verified = w_block_transfer._copy_verified
 
             def fail_l_side_copy(source_path_arg, target_path_arg, **kwargs):
                 if Path(target_path_arg).parent == project_dir.parent:
                     raise RuntimeError("simulated L-side archive failure")
                 return real_copy_verified(source_path_arg, target_path_arg, **kwargs)
 
-            with patch("services._copy_verified", side_effect=fail_l_side_copy):
+            with patch("w_block_transfer._copy_verified", side_effect=fail_l_side_copy):
                 with self.assertRaisesRegex(RuntimeError, "simulated L-side archive failure"):
                     send_project_block_files_to_machine(
                         project_dir,
@@ -2422,7 +2422,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             lock_path = Path(os.environ.get("TEMP", str(project_path.parent))) / f"radan_csv_import_{digest}.lock"
             lock_path.write_text("1234", encoding="ascii")
             try:
-                with patch("services._process_exists", return_value=True):
+                with patch("inventor_bridge._process_exists", return_value=True):
                     running, found_lock_path, process_id = radan_csv_import_lock_status(project_path)
             finally:
                 lock_path.unlink(missing_ok=True)

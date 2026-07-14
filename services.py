@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 import csv
-import ctypes
-from dataclasses import dataclass
-import hashlib
-import importlib.util
-import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path, PureWindowsPath
 
 from models import (
@@ -21,9 +15,7 @@ from models import (
     KitMapping,
     KitPaths,
     KitStatus,
-    PdfMatch,
     ScaffoldResult,
-    SpreadsheetMatch,
     build_hidden_kit_key,
     build_kit_mappings,
     canonicalize_kit_name,
@@ -34,17 +26,62 @@ from models import (
     normalize_hidden_truck_entries,
     normalize_truck_order_entries,
 )
-from performance_metrics import (
-    BoundedTTLCache,
-    GLOBAL_METRICS,
-    normalize_cache_path,
-    settings_cache_signature,
+from performance_metrics import BoundedTTLCache, GLOBAL_METRICS, normalize_cache_path, settings_cache_signature
+
+# fs_cache.py holds the generic filesystem-metadata caching primitives so
+# packet_pdf_detection.py and w_block_transfer.py can use them without
+# importing services.py (which would create a circular import, since this
+# module imports from both of those for re-export). Several names below are
+# re-exported for backward compatibility with existing
+# `from services import ...` call sites (tests, controllers, other modules)
+# even though services.py itself no longer calls them directly - noqa'd
+# rather than dropped, per the established convention in this repo (see
+# commit "Remove unused threading import; keep BackgroundJobWorker
+# re-export").
+from fs_cache import (
+    FILE_METADATA_CACHE,
+    FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS,
+    FILESYSTEM_CACHE_POSITIVE_TTL_SECONDS,  # noqa: F401 - re-exported
+    cached_path_exists,
+    cached_path_size,
+    clean_text,
+    invalidate_filesystem_cache_for_path,  # noqa: F401 - re-exported
+    invalidate_filesystem_cache_for_paths,
+    natural_sort_key,
+)
+from packet_pdf_detection import (
+    IGNORED_SPREADSHEET_PATTERNS,  # noqa: F401 - re-exported
+    MAX_NEST_SUMMARY_DEPTH,  # noqa: F401 - re-exported
+    SUPPORTED_PREVIEW_SUFFIXES,  # noqa: F401 - re-exported
+    SUPPORTED_SPREADSHEET_SUFFIXES,  # noqa: F401 - re-exported
+    detect_assembly_packet_pdf,  # noqa: F401 - re-exported; used by main_window.py/packet_build_controller.py
+    detect_cut_list_packet_pdf,  # noqa: F401 - re-exported; used by main_window.py/packet_build_controller.py
+    detect_preview_pdf,
+    detect_print_packet_pdf,  # noqa: F401 - re-exported; used by main_window.py/packet_build_controller.py
+    detect_spreadsheet,
+)
+from inventor_bridge import (
+    DEFAULT_RADAN_CSV_IMPORT_ENTRY,  # noqa: F401 - re-exported; used by tests/test_services.py
+    InventorToRadanInlineNeedsUi,  # noqa: F401 - re-exported; used by inventor_service.py
+    launch_radan_csv_import,  # noqa: F401 - re-exported; used by radan_import_controller.py
+    radan_csv_import_lock_status,  # noqa: F401 - re-exported; used by full_flow_service.py etc.
+    radan_csv_missing_symbols,  # noqa: F401 - re-exported; used by radan_import_controller.py
+    run_inventor_to_radan_inline,  # noqa: F401 - re-exported; used by inventor_service.py
+    visible_radan_sessions,  # noqa: F401 - re-exported; used by full_flow_controller.py
+)
+from w_block_transfer import (
+    BlockFileMatch,  # noqa: F401 - re-exported (public return-type surface)
+    BlockFileTransferPlan,  # noqa: F401 - re-exported (public return-type surface)
+    BlockFileTransferResult,  # noqa: F401 - re-exported (public return-type surface)
+    DEFAULT_BLOCK_FILES_ROOT,  # noqa: F401 - re-exported
+    DEFAULT_MACHINE_EIA_ROOT,  # noqa: F401 - re-exported
+    DEFAULT_P_MACHINE_EIA_ROOT,  # noqa: F401 - re-exported
+    build_project_block_transfer_plan,  # noqa: F401 - re-exported; used by block_transfer_controller.py
+    machine_block_project_dir,  # noqa: F401 - re-exported (public return-type surface)
+    machine_block_root_for_release_root,  # noqa: F401 - re-exported; used by tests/test_services.py
+    send_project_block_files_to_machine,  # noqa: F401 - re-exported; used by block_transfer_controller.py
 )
 
-SUPPORTED_SPREADSHEET_SUFFIXES = {".xlsx", ".xls", ".csv"}
-IGNORED_SPREADSHEET_PATTERNS = ("_radan.csv",)
-SUPPORTED_PREVIEW_SUFFIXES = {".pdf"}
-MAX_NEST_SUMMARY_DEPTH = 2
 MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://www.radan.com/ns/project">
   <Name>{project_name}</Name>
@@ -52,68 +89,17 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 </Project>
 """
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
-DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
-DEFAULT_BLOCK_FILES_ROOT = Path(r"L:\BATTLESHIELD\BLOCK FILES")
-DEFAULT_MACHINE_EIA_ROOT = Path(r"A:\EiaFiles\Battleshield\F-LARGE FLEET")
-DEFAULT_P_MACHINE_EIA_ROOT = DEFAULT_MACHINE_EIA_ROOT.parent / PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name
 FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
 TRUCK_FOLDER_PATTERN = re.compile(r"^[A-Z]\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
-FILESYSTEM_CACHE_POSITIVE_TTL_SECONDS = 5.0
-FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS = 2.0
 KIT_STATUS_CACHE_TTL_SECONDS = 30.0
 
-FILE_METADATA_CACHE: BoundedTTLCache[object] = BoundedTTLCache(
-    "filesystem_metadata",
-    max_size=4096,
-    positive_ttl_seconds=FILESYSTEM_CACHE_POSITIVE_TTL_SECONDS,
-    negative_ttl_seconds=FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS,
-)
 KIT_STATUS_CACHE: BoundedTTLCache[tuple[KitStatus, ...]] = BoundedTTLCache(
     "kit_status",
     max_size=128,
     positive_ttl_seconds=KIT_STATUS_CACHE_TTL_SECONDS,
     negative_ttl_seconds=FILESYSTEM_CACHE_NEGATIVE_TTL_SECONDS,
 )
-
-
-class InventorToRadanInlineNeedsUi(RuntimeError):
-    def __init__(self, message: str, *, missing_dxf_count: int = 0, missing_rule_count: int = 0) -> None:
-        self.missing_dxf_count = missing_dxf_count
-        self.missing_rule_count = missing_rule_count
-        super().__init__(message)
-
-
-@dataclass(frozen=True)
-class BlockFileMatch:
-    drg_path: Path
-    source_path: Path
-    target_path: Path
-    local_target_path: Path
-    match_reason: str
-
-
-@dataclass(frozen=True)
-class BlockFileTransferPlan:
-    project_dir: Path
-    source_root: Path
-    machine_root: Path
-    target_dir: Path
-    local_target_dir: Path
-    drg_paths: tuple[Path, ...]
-    matches: tuple[BlockFileMatch, ...]
-    already_sent_paths: tuple[Path, ...]
-    missing_drg_paths: tuple[Path, ...]
-
-
-@dataclass(frozen=True)
-class BlockFileTransferResult:
-    plan: BlockFileTransferPlan
-    operation: str
-    transferred_paths: tuple[Path, ...]
-    skipped_paths: tuple[Path, ...]
-    local_transferred_paths: tuple[Path, ...] = ()
-    canceled: bool = False
 
 
 def is_w_drive_path(path: Path | str) -> bool:
@@ -156,90 +142,8 @@ def assert_w_drive_write_allowed(
     )
 
 
-def clean_text(value: object) -> str:
-    return str(value or "").strip()
-
-
-def natural_sort_key(value: str) -> list[object]:
-    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value)]
-
-
 def _status_cache_key(truck_number: str, settings: ExplorerSettings) -> tuple[str, str, str]:
     return ("kit_status", settings_cache_signature(settings), clean_text(truck_number).casefold())
-
-
-def _filesystem_cache() -> BoundedTTLCache[object]:
-    return FILE_METADATA_CACHE
-
-
-def _cache_negative(value: object) -> bool:
-    if isinstance(value, bool):
-        return not value
-    if isinstance(value, (SpreadsheetMatch, PdfMatch)):
-        return value.chosen_path is None
-    return value is None
-
-
-def cached_path_exists(path: Path | None, *, cache: BoundedTTLCache[object] | None = None) -> bool:
-    if path is None:
-        return False
-    if cache is None:
-        GLOBAL_METRICS.record_filesystem_check()
-        return path.exists()
-    cache_obj = cache
-    key = ("exists", normalize_cache_path(path))
-    hit, value = cache_obj.get(key)
-    if hit:
-        return bool(value)
-    GLOBAL_METRICS.record_filesystem_check()
-    exists = path.exists()
-    cache_obj.set(key, exists, negative=not exists)
-    return exists
-
-
-def cached_path_size(path: Path | None, *, cache: BoundedTTLCache[object] | None = None) -> int:
-    if path is None:
-        return 0
-    if cache is None:
-        GLOBAL_METRICS.record_filesystem_check()
-        try:
-            return int(path.stat().st_size)
-        except OSError:
-            return 0
-    cache_obj = cache
-    key = ("stat_size", normalize_cache_path(path))
-    hit, value = cache_obj.get(key)
-    if hit:
-        return int(value or 0)
-    GLOBAL_METRICS.record_filesystem_check()
-    try:
-        size = int(path.stat().st_size)
-    except OSError:
-        size = 0
-    cache_obj.set(key, size, negative=size == 0)
-    return size
-
-
-def invalidate_filesystem_cache_for_path(path: Path | str | None) -> None:
-    if path is None:
-        return
-    target_key = normalize_cache_path(path)
-    FILE_METADATA_CACHE.invalidate_where(
-        lambda key, _value: isinstance(key, tuple)
-        and any(isinstance(part, str) and (part == target_key or part.startswith(f"{target_key}\\")) for part in key)
-    )
-
-
-def invalidate_filesystem_cache_for_paths(paths: tuple[Path, ...] | list[Path]) -> None:
-    seen: set[str] = set()
-    for path in paths:
-        current = Path(path)
-        for candidate in (current, current.parent):
-            key = normalize_cache_path(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            invalidate_filesystem_cache_for_path(candidate)
 
 
 def invalidate_status_cache_for_truck(truck_number: str, settings: ExplorerSettings | None = None) -> None:
@@ -764,69 +668,6 @@ def discovered_fabrication_kit_names_for_job(
     return sorted(names, key=natural_sort_key)
 
 
-def _is_generated_spreadsheet(path: Path) -> bool:
-    name = path.name.casefold()
-    return any(name.endswith(pattern) for pattern in IGNORED_SPREADSHEET_PATTERNS)
-
-
-def detect_spreadsheet(
-    folder: Path | None,
-    *,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> SpreadsheetMatch:
-    if folder is None:
-        return SpreadsheetMatch(chosen_path=None, candidates=(), issue="root_not_configured")
-    cache_obj = fs_cache
-    key = ("spreadsheet", normalize_cache_path(folder))
-    if cache_obj is not None:
-        hit, value = cache_obj.get(key)
-        if hit and isinstance(value, SpreadsheetMatch):
-            return value
-    if not cached_path_exists(folder, cache=cache_obj):
-        result = SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
-        if cache_obj is not None:
-            cache_obj.set(key, result, negative=True)
-        return result
-
-    discovered: list[Path] = []
-    try:
-        GLOBAL_METRICS.record_filesystem_check()
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                try:
-                    if not entry.is_file():
-                        continue
-                except OSError:
-                    continue
-                path = Path(entry.path)
-                if path.suffix.casefold() not in SUPPORTED_SPREADSHEET_SUFFIXES:
-                    continue
-                if _is_generated_spreadsheet(path):
-                    continue
-                discovered.append(path)
-    except OSError:
-        result = SpreadsheetMatch(chosen_path=None, candidates=(), issue="folder_missing")
-        if cache_obj is not None:
-            cache_obj.set(key, result, negative=True)
-        return result
-
-    candidates = tuple(sorted(discovered, key=lambda path: natural_sort_key(path.name)))
-    if len(candidates) == 1:
-        result = SpreadsheetMatch(chosen_path=candidates[0], candidates=candidates)
-        if cache_obj is not None:
-            cache_obj.set(key, result, negative=False)
-        return result
-    if not candidates:
-        result = SpreadsheetMatch(chosen_path=None, candidates=(), issue="spreadsheet_missing")
-        if cache_obj is not None:
-            cache_obj.set(key, result, negative=True)
-        return result
-    result = SpreadsheetMatch(chosen_path=None, candidates=candidates, issue="multiple_spreadsheets")
-    if cache_obj is not None:
-        cache_obj.set(key, result, negative=True)
-    return result
-
-
 def parse_replacement_rules(raw_text: str) -> list[tuple[str, str]]:
     rules: list[tuple[str, str]] = []
     for line in str(raw_text or "").splitlines():
@@ -1029,204 +870,6 @@ def resolve_existing_inventor_csv(spreadsheet_path: Path, project_dir: Path | No
     raise FileNotFoundError(f"Inventor-to-RADAN CSV was not found. Expected one of:\n{expected}")
 
 
-def _normalize_pdf_name_words(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
-
-
-def _shallow_descendant_files(
-    root: Path,
-    *,
-    max_depth: int,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> list[tuple[Path, int]]:
-    cache_obj = fs_cache
-    key = ("shallow_descendant_files", normalize_cache_path(root), int(max_depth))
-    if cache_obj is not None:
-        hit, value = cache_obj.get(key)
-        if hit and isinstance(value, tuple):
-            return list(value)
-    if not cached_path_exists(root, cache=cache_obj):
-        if cache_obj is not None:
-            cache_obj.set(key, tuple(), negative=True)
-        return []
-
-    discovered: list[tuple[Path, int]] = []
-    stack: list[tuple[Path, int]] = [(root, 0)]
-    while stack:
-        folder, depth = stack.pop()
-        try:
-            GLOBAL_METRICS.record_filesystem_check()
-            with os.scandir(folder) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_file():
-                            discovered.append((Path(entry.path), depth))
-                            continue
-                        if entry.is_dir() and depth < max_depth:
-                            stack.append((Path(entry.path), depth + 1))
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-    if cache_obj is not None:
-        cache_obj.set(key, tuple(discovered), negative=not discovered)
-    return discovered
-
-
-def _collect_preview_pdf_candidates(
-    paths: KitPaths,
-    *,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> tuple[Path, ...]:
-    search_root = paths.release_kit_dir or paths.project_dir
-    if search_root is None or not cached_path_exists(search_root, cache=fs_cache):
-        return ()
-
-    rpd_stem = paths.rpd_path.stem if paths.rpd_path is not None else paths.project_name
-    expected_stem = _normalize_pdf_name_words(f"{rpd_stem} nest summary")
-
-    candidates: list[tuple[int, Path]] = []
-    for child, depth in _shallow_descendant_files(
-        search_root,
-        max_depth=MAX_NEST_SUMMARY_DEPTH,
-        fs_cache=fs_cache,
-    ):
-        if child.suffix.casefold() not in SUPPORTED_PREVIEW_SUFFIXES:
-            continue
-        child_stem = _normalize_pdf_name_words(child.stem)
-        if child_stem != expected_stem:
-            continue
-        candidates.append((depth, child))
-
-    candidates.sort(key=lambda item: (item[0], natural_sort_key(str(item[1].relative_to(search_root)))))
-    return tuple(path for _depth, path in candidates)
-
-
-def _is_print_packet_pdf(path: Path) -> bool:
-    stem_words = _normalize_pdf_name_words(path.stem)
-    return (
-        stem_words.startswith("print packet")
-        or stem_words.startswith("printpacket")
-        or " print packet " in f" {stem_words} "
-        or " printpacket " in f" {stem_words} "
-    )
-
-
-def _is_assembly_packet_pdf(path: Path) -> bool:
-    stem_words = _normalize_pdf_name_words(path.stem)
-    return (
-        stem_words.startswith("assembly packet")
-        or stem_words.startswith("assemblypacket")
-        or stem_words.startswith("assembly drawings")
-        or stem_words.startswith("assemblydrawings")
-        or " assembly packet " in f" {stem_words} "
-        or " assemblypacket " in f" {stem_words} "
-        or " assembly drawings " in f" {stem_words} "
-        or " assemblydrawings " in f" {stem_words} "
-    )
-
-
-def _is_cut_list_packet_pdf(path: Path) -> bool:
-    stem_words = _normalize_pdf_name_words(path.stem)
-    return (
-        stem_words.startswith("cut list")
-        or stem_words.startswith("cutlist")
-        or " cut list " in f" {stem_words} "
-        or " cutlist " in f" {stem_words} "
-    )
-
-
-def _detect_named_packet_pdf(
-    paths: KitPaths,
-    *,
-    matches_fn,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> PdfMatch:
-    cache_obj = fs_cache
-    if paths.project_dir is None:
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
-    if not cached_path_exists(paths.project_dir, cache=cache_obj):
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
-
-    search_root = paths.release_kit_dir or paths.project_dir
-    if search_root is None or not cached_path_exists(search_root, cache=cache_obj):
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
-    cache_key = (
-        "named_packet_pdf",
-        getattr(matches_fn, "__name__", repr(matches_fn)),
-        normalize_cache_path(paths.project_dir),
-        normalize_cache_path(search_root),
-    )
-    if cache_obj is not None:
-        hit, value = cache_obj.get(cache_key)
-        if hit and isinstance(value, PdfMatch):
-            return value
-
-    candidates: list[tuple[int, Path]] = []
-    for child, depth in _shallow_descendant_files(
-        search_root,
-        max_depth=MAX_NEST_SUMMARY_DEPTH,
-        fs_cache=cache_obj,
-    ):
-        if child.suffix.casefold() not in SUPPORTED_PREVIEW_SUFFIXES:
-            continue
-        if not matches_fn(child):
-            continue
-        candidates.append((depth, child))
-
-    candidates.sort(key=lambda item: (item[0], natural_sort_key(str(item[1].relative_to(search_root)))))
-    paths_only = tuple(path for _depth, path in candidates)
-    if not paths_only:
-        result = PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
-        if cache_obj is not None:
-            cache_obj.set(cache_key, result, negative=True)
-        return result
-    result = PdfMatch(chosen_path=paths_only[-1], candidates=paths_only)
-    if cache_obj is not None:
-        cache_obj.set(cache_key, result, negative=False)
-    return result
-
-
-def detect_preview_pdf(
-    paths: KitPaths,
-    *,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> PdfMatch:
-    if paths.project_dir is None:
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_not_configured")
-    if not cached_path_exists(paths.project_dir, cache=fs_cache):
-        return PdfMatch(chosen_path=None, candidates=(), issue="project_missing")
-
-    candidates = _collect_preview_pdf_candidates(paths, fs_cache=fs_cache)
-    if not candidates:
-        return PdfMatch(chosen_path=None, candidates=(), issue="pdf_missing")
-    return PdfMatch(chosen_path=candidates[0], candidates=candidates)
-
-
-def detect_print_packet_pdf(
-    paths: KitPaths,
-    *,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> PdfMatch:
-    return _detect_named_packet_pdf(paths, matches_fn=_is_print_packet_pdf, fs_cache=fs_cache)
-
-
-def detect_assembly_packet_pdf(
-    paths: KitPaths,
-    *,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> PdfMatch:
-    return _detect_named_packet_pdf(paths, matches_fn=_is_assembly_packet_pdf, fs_cache=fs_cache)
-
-
-def detect_cut_list_packet_pdf(
-    paths: KitPaths,
-    *,
-    fs_cache: BoundedTTLCache[object] | None = None,
-) -> PdfMatch:
-    return _detect_named_packet_pdf(paths, matches_fn=_is_cut_list_packet_pdf, fs_cache=fs_cache)
-
-
 def fabrication_folder_has_files(
     folder: Path | None,
     *,
@@ -1352,7 +995,7 @@ def collect_kit_statuses(
         hit, cached = KIT_STATUS_CACHE.get(status_key)
         if hit and cached is not None:
             return list(cached)
-    cache_obj = fs_cache or _filesystem_cache()
+    cache_obj = fs_cache or FILE_METADATA_CACHE
     kit_names = scaffold_kit_names_for_truck(truck_number, settings, fs_cache=cache_obj)
     statuses = [
         build_kit_status(truck_number, kit_name, settings, fs_cache=cache_obj)
@@ -1467,262 +1110,6 @@ def _hidden_process_kwargs() -> dict[str, object]:
     return kwargs
 
 
-def _inventor_to_radan_module_path(entry_path: Path) -> Path:
-    if entry_path.suffix.casefold() == ".py":
-        return entry_path
-    return entry_path.parent / "inventor_to_radan.py"
-
-
-def _inventor_to_radan_inline_runner_path(module_path: Path) -> Path:
-    return module_path.parent / "inline_runner.py"
-
-
-def _load_inventor_to_radan_inline_runner(runner_path: Path) -> object:
-    if not runner_path.exists():
-        raise FileNotFoundError(f"Could not find inline Inventor-to-RADAN runner: {runner_path}")
-
-    module_name = "_truck_nest_inventor_to_radan_inline_runner"
-    spec = importlib.util.spec_from_file_location(module_name, runner_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load inline Inventor-to-RADAN runner: {runner_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    previous_module = sys.modules.get(module_name)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        if previous_module is not None:
-            sys.modules[module_name] = previous_module
-        else:
-            sys.modules.pop(module_name, None)
-
-
-def run_inventor_to_radan_inline(entry_path: Path | str, spreadsheet_path: Path | str) -> object:
-    entry = Path(str(entry_path))
-    spreadsheet = Path(str(spreadsheet_path))
-    if not entry.exists():
-        raise FileNotFoundError(str(entry))
-    if not spreadsheet.exists():
-        raise FileNotFoundError(str(spreadsheet))
-
-    module_path = _inventor_to_radan_module_path(entry)
-    if not module_path.exists():
-        raise FileNotFoundError(f"Could not find inline Inventor-to-RADAN module: {module_path}")
-
-    runner = _load_inventor_to_radan_inline_runner(_inventor_to_radan_inline_runner_path(module_path))
-    run_inline = getattr(runner, "run_inline", None)
-    if not callable(run_inline):
-        raise RuntimeError(f"{module_path.parent / 'inline_runner.py'} does not expose run_inline().")
-
-    try:
-        return run_inline(entry, spreadsheet, allow_prompts=False, show_summary=False)
-    except Exception as exc:
-        if exc.__class__.__name__ != "InventorToRadanNeedsUi":
-            raise
-        missing_dxf_items = getattr(exc, "missing_dxf_items", ()) or ()
-        missing_rules = getattr(exc, "missing_rules", ()) or ()
-        parts: list[str] = []
-        if missing_dxf_items:
-            parts.append(f"{len(missing_dxf_items)} missing-DXF classification(s)")
-        if missing_rules:
-            parts.append(f"{len(missing_rules)} RADAN rule(s)")
-        detail = " and ".join(parts) if parts else "user input"
-        raise InventorToRadanInlineNeedsUi(
-            f"Inline conversion needs {detail}.",
-            missing_dxf_count=len(missing_dxf_items),
-            missing_rule_count=len(missing_rules),
-        ) from exc
-
-
-def radan_csv_missing_symbols(
-    csv_path: Path | str,
-    output_folder: Path | str,
-    *,
-    max_parts: int | None = None,
-) -> tuple[Path, ...]:
-    if max_parts is not None and max_parts <= 0:
-        raise ValueError("max_parts must be greater than zero when supplied.")
-    csv_file = Path(str(csv_path))
-    symbol_folder = Path(str(output_folder))
-    missing: list[Path] = []
-    importable_count = 0
-    with csv_file.open(newline="", encoding="utf-8-sig") as handle:
-        reader = csv.reader(handle)
-        for row in reader:
-            if not row or all(not cell.strip() for cell in row):
-                continue
-            dxf_text = row[0].strip()
-            if not dxf_text:
-                continue
-            importable_count += 1
-            symbol_path = symbol_folder / f"{Path(dxf_text).stem}.sym"
-            if not symbol_path.exists():
-                missing.append(symbol_path)
-            if max_parts is not None and importable_count >= max_parts:
-                break
-    return tuple(missing)
-
-
-def visible_radan_sessions() -> tuple[tuple[int, str], ...]:
-    command = (
-        "$sessions = Get-Process -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.ProcessName -like 'radraft*' -and $_.MainWindowHandle -ne 0 -and "
-        "-not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) } | "
-        "Select-Object @{Name='ProcessId';Expression={$_.Id}}, @{Name='WindowTitle';Expression={$_.MainWindowTitle}}; "
-        "$sessions | ConvertTo-Json -Compress"
-    )
-    completed = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", command],
-        capture_output=True,
-        text=True,
-        timeout=5,
-        **_hidden_process_kwargs(),
-    )
-    if completed.returncode != 0 or not completed.stdout.strip():
-        return ()
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return ()
-    if isinstance(payload, dict):
-        items = [payload]
-    elif isinstance(payload, list):
-        items = payload
-    else:
-        return ()
-    sessions: list[tuple[int, str]] = []
-    for item in items:
-        try:
-            process_id = int(item.get("ProcessId"))
-        except (AttributeError, TypeError, ValueError):
-            continue
-        title = str(item.get("WindowTitle") or "").strip()
-        if title:
-            sessions.append((process_id, title))
-    return tuple(sessions)
-
-
-def _process_exists(process_id: int) -> bool:
-    if process_id <= 0:
-        return False
-    if os.name == "nt":
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(process_id))
-        if not handle:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
-    try:
-        os.kill(int(process_id), 0)
-    except OSError:
-        return False
-    return True
-
-
-def radan_csv_import_lock_status(project_path: Path | str) -> tuple[bool, Path, int | None]:
-    project = Path(str(project_path)).expanduser().resolve()
-    digest = hashlib.sha1(str(project).casefold().encode("utf-8")).hexdigest()[:16]
-    lock_path = Path(os.environ.get("TEMP", str(project.parent))) / f"radan_csv_import_{digest}.lock"
-    if not lock_path.exists():
-        return False, lock_path, None
-    try:
-        process_id = int(lock_path.read_text(encoding="ascii", errors="ignore").strip())
-    except (OSError, ValueError):
-        return False, lock_path, None
-    return _process_exists(process_id), lock_path, process_id
-
-
-def launch_radan_csv_import(
-    csv_path: Path | str,
-    output_folder: Path | str,
-    *,
-    project_path: Path | str | None = None,
-    log_path: Path | str | None = None,
-    entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
-    allow_visible_radan: bool = False,
-    rebuild_symbols: bool = False,
-    lab_symbol_writer: bool = False,
-    native_sym_experimental: bool = False,
-    d_record_view_height_threshold_guard: bool = False,
-    preprocess_dxf_outer_profile: bool = False,
-    preprocess_dxf_tolerance: float | None = None,
-    assign_project_colors: bool = False,
-    project_update_method: str = "direct-xml",
-    refresh_project_sheets: bool = False,
-    max_parts: int | None = None,
-) -> subprocess.Popen[object]:
-    entry = Path(str(entry_path))
-    csv = Path(str(csv_path))
-    output = Path(str(output_folder))
-    if not entry.exists():
-        raise FileNotFoundError(str(entry))
-    if not csv.exists():
-        raise FileNotFoundError(str(csv))
-    if not output.exists():
-        raise FileNotFoundError(str(output))
-    project = Path(str(project_path)) if project_path is not None else None
-    if project is not None and not project.exists():
-        raise FileNotFoundError(str(project))
-    log = Path(str(log_path)) if log_path is not None else None
-
-    command = [
-        _python_executable(),
-        str(entry),
-        "--csv",
-        str(csv),
-        "--output-folder",
-        str(output),
-    ]
-    if project is not None:
-        command.extend(["--project", str(project)])
-    if allow_visible_radan:
-        command.append("--allow-visible-radan")
-    if rebuild_symbols:
-        command.append("--rebuild-symbols")
-    if lab_symbol_writer or native_sym_experimental:
-        command.append("--lab-symbol-writer")
-    if d_record_view_height_threshold_guard:
-        command.append("--d-record-view-height-threshold-guard")
-    if preprocess_dxf_outer_profile:
-        command.append("--preprocess-dxf-outer-profile")
-    if preprocess_dxf_tolerance is not None:
-        command.extend(["--preprocess-dxf-tolerance", str(preprocess_dxf_tolerance)])
-    if assign_project_colors:
-        command.append("--assign-project-colors")
-    if project_update_method:
-        command.extend(["--project-update-method", str(project_update_method)])
-    if refresh_project_sheets:
-        command.append("--refresh-project-sheets")
-    if max_parts is not None:
-        if max_parts <= 0:
-            raise ValueError("max_parts must be greater than zero when supplied.")
-        command.extend(["--max-parts", str(max_parts)])
-    if log is not None:
-        command.extend(["--log-file", str(log)])
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log_stream = log.open("a", encoding="utf-8", buffering=1)
-        try:
-            return subprocess.Popen(
-                command,
-                cwd=str(entry.parent),
-                stdin=subprocess.DEVNULL,
-                stdout=log_stream,
-                stderr=log_stream,
-                **_hidden_process_kwargs(),
-            )
-        finally:
-            log_stream.close()
-    return subprocess.Popen(
-        command,
-        cwd=str(entry.parent),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        **_hidden_process_kwargs(),
-    )
-
-
 def _move_or_replace(
     source_path: Path,
     target_path: Path,
@@ -1741,273 +1128,6 @@ def _move_or_replace(
         target_path.unlink()
     shutil.move(str(source_path), str(target_path))
     return target_path
-
-
-def _normalize_block_match_stem(value: str) -> str:
-    return " ".join(str(value or "").strip().casefold().split())
-
-
-def _relative_path_case_insensitive(path: Path, root: Path) -> Path:
-    try:
-        return path.relative_to(root)
-    except ValueError:
-        path_text = str(path).replace("/", "\\").rstrip("\\")
-        root_text = str(root).replace("/", "\\").rstrip("\\")
-        root_prefix = f"{root_text}\\"
-        if path_text.casefold().startswith(root_prefix.casefold()):
-            return Path(*PureWindowsPath(path_text[len(root_prefix) :]).parts)
-        raise ValueError(f"{path} is not under {root}") from None
-
-
-def machine_block_project_dir(
-    project_dir: Path | str,
-    release_root: Path | str,
-    *,
-    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
-) -> Path:
-    project = Path(str(project_dir))
-    release = Path(str(release_root))
-    root = Path(str(machine_root))
-    # RPD projects live one folder below the shop-facing kit folder
-    # (for example F57524\CONSOLE PACK\F57524 CONSOLE PACK). The machine
-    # expects block files in the kit folder, not inside that inner project folder.
-    relative_kit_folder = _relative_path_case_insensitive(project.parent, release)
-    return root / relative_kit_folder
-
-
-def machine_block_root_for_release_root(
-    release_root: Path | str,
-    *,
-    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
-) -> Path:
-    release_name = PureWindowsPath(str(release_root)).name
-    p_release_name = PureWindowsPath(DEFAULT_P_RELEASE_ROOT).name
-    root = Path(str(machine_root))
-    if release_name.casefold() == p_release_name.casefold():
-        machine_name = PureWindowsPath(str(root)).name
-        if machine_name.casefold() == p_release_name.casefold():
-            return root
-        return root.parent / p_release_name
-    return root
-
-
-def local_block_project_dir(project_dir: Path | str) -> Path:
-    project = Path(str(project_dir))
-    # Keep the L-side archive beside the inner RADAN project folder, matching
-    # the machine folder layout and avoiding an extra project-name layer.
-    return project.parent
-
-
-def discover_project_drg_paths(project_dir: Path | str) -> tuple[Path, ...]:
-    project = Path(str(project_dir))
-    if not project.exists():
-        raise FileNotFoundError(str(project))
-    nests_dir = project / "nests"
-    search_root = nests_dir if nests_dir.exists() else project
-    return tuple(
-        sorted(
-            (
-                path
-                for path in search_root.rglob("*")
-                if path.is_file() and path.suffix.casefold() == ".drg"
-            ),
-            key=lambda item: str(item).casefold(),
-        )
-    )
-
-
-def _discover_block_files(source_root: Path) -> tuple[Path, ...]:
-    return tuple(
-        sorted(
-            (
-                path
-                for path in source_root.iterdir()
-                if path.is_file() and path.suffix.casefold() == ".cnc"
-            ),
-            key=lambda item: str(item).casefold(),
-        )
-    )
-
-
-def _block_match_for_drg(drg_path: Path, block_files: tuple[Path, ...]) -> tuple[Path | None, str]:
-    drg_stem = _normalize_block_match_stem(drg_path.stem)
-    candidates: list[tuple[int, str, Path]] = []
-    for block_path in block_files:
-        block_stem = _normalize_block_match_stem(block_path.stem)
-        if not block_stem:
-            continue
-        if block_stem == drg_stem:
-            candidates.append((len(block_stem), "exact_stem", block_path))
-        elif drg_stem.startswith(block_stem):
-            candidates.append((len(block_stem), "truncated_prefix", block_path))
-    if not candidates:
-        return None, ""
-    candidates.sort(key=lambda item: (item[0], item[1] == "exact_stem"), reverse=True)
-    best_length = candidates[0][0]
-    best = [candidate for candidate in candidates if candidate[0] == best_length]
-    if len(best) > 1:
-        names = ", ".join(path.name for _length, _reason, path in best)
-        raise ValueError(f"Multiple block files match {drg_path.name}: {names}")
-    _length, reason, path = best[0]
-    return path, reason
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _copy_verified(source_path: Path, target_path: Path, *, expected_size: int, expected_sha256: str) -> None:
-    if normalize_cache_path(source_path) == normalize_cache_path(target_path):
-        return
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    if target_path.exists():
-        target_path.unlink()
-    shutil.copy2(source_path, target_path)
-    if not target_path.exists():
-        raise RuntimeError(f"Copied block file did not verify: {target_path}")
-    if target_path.stat().st_size != expected_size:
-        raise RuntimeError(f"Copied block file size did not verify: {target_path}")
-    if _sha256_path(target_path) != expected_sha256:
-        raise RuntimeError(f"Copied block file checksum did not verify: {target_path}")
-
-
-def build_project_block_transfer_plan(
-    project_dir: Path | str,
-    release_root: Path | str,
-    *,
-    source_root: Path | str = DEFAULT_BLOCK_FILES_ROOT,
-    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
-) -> BlockFileTransferPlan:
-    project = Path(str(project_dir))
-    source = Path(str(source_root))
-    machine = machine_block_root_for_release_root(release_root, machine_root=machine_root)
-    if not project.exists():
-        raise FileNotFoundError(str(project))
-    if not source.exists():
-        raise FileNotFoundError(f"Block file source folder is not available: {source}")
-    if not machine.exists():
-        raise FileNotFoundError(f"Machine block destination is not available: {machine}")
-    target_dir = machine_block_project_dir(project, release_root, machine_root=machine)
-    local_target_dir = local_block_project_dir(project)
-    drg_paths = discover_project_drg_paths(project)
-    block_files = _discover_block_files(source)
-    matches: list[BlockFileMatch] = []
-    already_sent: list[Path] = []
-    missing: list[Path] = []
-    used_sources: set[str] = set()
-    for drg_path in drg_paths:
-        source_path, reason = _block_match_for_drg(drg_path, block_files)
-        if source_path is None:
-            target_path = target_dir / f"{drg_path.stem}.cnc"
-            if target_path.exists():
-                already_sent.append(target_path)
-                continue
-            missing.append(drg_path)
-            continue
-        source_key = normalize_cache_path(source_path)
-        if source_key in used_sources:
-            raise ValueError(f"Block file {source_path.name} matches more than one DRG.")
-        used_sources.add(source_key)
-        # The post output can truncate names; write the machine copy with the full DRG stem.
-        target_path = target_dir / f"{drg_path.stem}{source_path.suffix}"
-        local_target_path = local_target_dir / f"{drg_path.stem}{source_path.suffix}"
-        matches.append(
-            BlockFileMatch(
-                drg_path=drg_path,
-                source_path=source_path,
-                target_path=target_path,
-                local_target_path=local_target_path,
-                match_reason=reason,
-            )
-        )
-    return BlockFileTransferPlan(
-        project_dir=project,
-        source_root=source,
-        machine_root=machine,
-        target_dir=target_dir,
-        local_target_dir=local_target_dir,
-        drg_paths=drg_paths,
-        matches=tuple(matches),
-        already_sent_paths=tuple(already_sent),
-        missing_drg_paths=tuple(missing),
-    )
-
-
-def send_project_block_files_to_machine(
-    project_dir: Path | str,
-    release_root: Path | str,
-    *,
-    source_root: Path | str = DEFAULT_BLOCK_FILES_ROOT,
-    machine_root: Path | str = DEFAULT_MACHINE_EIA_ROOT,
-    progress_cb=None,
-    should_cancel_cb=None,
-) -> BlockFileTransferResult:
-    plan = build_project_block_transfer_plan(
-        project_dir,
-        release_root,
-        source_root=source_root,
-        machine_root=machine_root,
-    )
-    if not plan.matches:
-        return BlockFileTransferResult(
-            plan=plan,
-            operation="copy_then_delete",
-            transferred_paths=(),
-            skipped_paths=(),
-            local_transferred_paths=(),
-        )
-    plan.target_dir.mkdir(parents=True, exist_ok=True)
-    plan.local_target_dir.mkdir(parents=True, exist_ok=True)
-    transferred: list[Path] = []
-    local_transferred: list[Path] = []
-    skipped: list[Path] = []
-    total = len(plan.matches)
-    for index, match in enumerate(plan.matches, start=1):
-        if should_cancel_cb is not None and should_cancel_cb():
-            skipped.extend(item.source_path for item in plan.matches[index - 1 :])
-            return BlockFileTransferResult(
-                plan=plan,
-                operation="copy_then_delete",
-                transferred_paths=tuple(transferred),
-                skipped_paths=tuple(skipped),
-                local_transferred_paths=tuple(local_transferred),
-                canceled=True,
-            )
-        if progress_cb is not None:
-            progress_cb(index - 1, total, f"Sending {match.source_path.name}")
-        source_size = match.source_path.stat().st_size
-        source_sha256 = _sha256_path(match.source_path)
-        _copy_verified(
-            match.source_path,
-            match.target_path,
-            expected_size=source_size,
-            expected_sha256=source_sha256,
-        )
-        _copy_verified(
-            match.source_path,
-            match.local_target_path,
-            expected_size=source_size,
-            expected_sha256=source_sha256,
-        )
-        match.source_path.unlink()
-        transferred.append(match.target_path)
-        local_transferred.append(match.local_target_path)
-        if progress_cb is not None:
-            progress_cb(index, total, f"Sent {match.target_path.name}")
-    invalidate_filesystem_cache_for_paths(tuple(transferred) + tuple(local_transferred))
-    invalidate_filesystem_cache_for_path(plan.source_root)
-    invalidate_filesystem_cache_for_path(plan.local_target_dir)
-    return BlockFileTransferResult(
-        plan=plan,
-        operation="copy_then_delete",
-        transferred_paths=tuple(transferred),
-        skipped_paths=tuple(skipped),
-        local_transferred_paths=tuple(local_transferred),
-    )
 
 
 def move_inventor_outputs_to_project(
