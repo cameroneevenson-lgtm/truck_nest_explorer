@@ -3706,6 +3706,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         with (
             workspace_tempdir() as temp_root,
             patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.save_settings"),
             patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
         ):
             window = main_window.MainWindow(runtime_dir=temp_root)
@@ -3746,6 +3747,7 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
         with (
             workspace_tempdir() as temp_root,
             patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.save_settings"),
             patch("main_window.QTimer.singleShot", lambda *args, **kwargs: None),
         ):
             window = main_window.MainWindow(runtime_dir=temp_root)
