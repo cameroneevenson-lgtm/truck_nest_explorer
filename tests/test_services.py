@@ -66,12 +66,14 @@ from packet_build_service import (
     _configure_asset_lookup,
     apply_assembly_context_to_sym_comments,
     apply_assembly_notes_to_parts,
+    apply_title_block_descriptions_from_csv,
     assembly_comment_shorthand,
     assembly_notes_by_part,
     build_assembly_packet,
     build_cut_list_packet,
     prepare_packet_build_context,
     scan_assembly_bom_context,
+    undo_title_block_descriptions,
     validate_print_packet_readiness,
     write_assembly_bom_context_csv,
 )
@@ -1787,6 +1789,48 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
 
             self.assertEqual(result.updated_count, 1)
             self.assertIn('value="ASM: F55334-BODY"', sym_path.read_text(encoding="utf-8"))
+
+    def test_apply_then_undo_title_block_descriptions_restores_previous_comment(self) -> None:
+        with workspace_tempdir() as temp_root:
+            sym_path = temp_root / "F55334-B-1001.sym"
+            sym_path.write_text(
+                '<Symbol><Attr num="109" name="Comments" desc="Comments about this file." type="s" value="Weld"></Attr></Symbol>',
+                encoding="utf-8",
+            )
+            csv_path = temp_root / "TitleBlockDescriptions_test.csv"
+            csv_path.write_text(
+                "part_name,sym_path,source_pdf,extracted_title,current_comment,proposed_comment,issue\n"
+                f"F55334-B-1001,{sym_path},,RG5 STORAGE COMPARTMENT,Weld,RG5 STORAGE COMPARTMENT,\n",
+                encoding="utf-8",
+            )
+            backup_dir = temp_root / "_bak" / "title_block_comments"
+
+            apply_result = apply_title_block_descriptions_from_csv(csv_path=csv_path, backup_dir=backup_dir)
+
+            self.assertEqual(apply_result.updated_count, 1)
+            self.assertEqual(len(apply_result.restorable_backups), 1)
+            updated_text = sym_path.read_text(encoding="utf-8")
+            self.assertIn("RG5 STORAGE COMPARTMENT", updated_text)
+            self.assertNotIn('value="Weld"', updated_text)
+
+            undo_result = undo_title_block_descriptions(apply_result.restorable_backups)
+
+            self.assertEqual(undo_result.restored_count, 1)
+            self.assertEqual(undo_result.missing_count, 0)
+            restored_text = sym_path.read_text(encoding="utf-8")
+            self.assertIn('value="Weld"', restored_text)
+            self.assertNotIn("RG5 STORAGE COMPARTMENT", restored_text)
+
+    def test_undo_title_block_descriptions_reports_missing_backup(self) -> None:
+        with workspace_tempdir() as temp_root:
+            sym_path = temp_root / "F55334-B-1001.sym"
+            sym_path.write_text("<Symbol></Symbol>", encoding="utf-8")
+            missing_backup = temp_root / "_bak" / "title_block_comments" / "does_not_exist.sym"
+
+            result = undo_title_block_descriptions([(str(sym_path), str(missing_backup))])
+
+            self.assertEqual(result.restored_count, 0)
+            self.assertEqual(result.missing_count, 1)
 
     def test_build_cut_list_packet_combines_one_copy_of_each_source_pdf(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -3731,6 +3775,62 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
                 warning_mock.assert_called_once()
                 launch_mock.assert_called_once()
                 self.assertTrue(launch_mock.call_args.kwargs["lab_symbol_writer"])
+            finally:
+                window._truck_executor.shutdown(wait=False, cancel_futures=True)
+                window._status_executor.shutdown(wait=False, cancel_futures=True)
+                window._flow_executor.shutdown(wait=False, cancel_futures=True)
+                window.close()
+                app.processEvents()
+
+    def test_apply_title_descriptions_enables_undo_and_undo_restores_comment(self) -> None:
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+        import main_window
+
+        app = QApplication.instance() or QApplication([])
+        with (
+            workspace_tempdir() as temp_root,
+            patch("main_window.load_settings", return_value=ExplorerSettings()),
+            patch("main_window.QTimer.singleShot", lambda *a, **k: None),
+        ):
+            window = main_window.MainWindow(runtime_dir=temp_root)
+            try:
+                status, _csv_path = self._build_import_selected_fixture(temp_root)
+                window._current_status = lambda: status
+
+                sym_path = temp_root / "F55334-B-1001.sym"
+                sym_path.write_text(
+                    '<Symbol><Attr num="109" name="Comments" desc="Comments about this file." '
+                    'type="s" value="Weld"></Attr></Symbol>',
+                    encoding="utf-8",
+                )
+                title_csv_path = temp_root / "TitleBlockDescriptions_test.csv"
+                title_csv_path.write_text(
+                    "part_name,sym_path,source_pdf,extracted_title,current_comment,proposed_comment,issue\n"
+                    f"F55334-B-1001,{sym_path},,RG5 STORAGE COMPARTMENT,Weld,RG5 STORAGE COMPARTMENT,\n",
+                    encoding="utf-8",
+                )
+
+                controller = window.packet_build_controller
+                self.assertFalse(window.undo_title_descriptions_button.isEnabled())
+
+                with (
+                    patch.object(QFileDialog, "getOpenFileName", return_value=(str(title_csv_path), "")),
+                    patch.object(QMessageBox, "question", return_value=QMessageBox.Yes),
+                    patch.object(QMessageBox, "information"),
+                ):
+                    controller.apply_title_descriptions_from_csv()
+
+                self.assertIn("RG5 STORAGE COMPARTMENT", sym_path.read_text(encoding="utf-8"))
+                self.assertTrue(window.undo_title_descriptions_button.isEnabled())
+
+                with (
+                    patch.object(QMessageBox, "question", return_value=QMessageBox.Yes),
+                    patch.object(QMessageBox, "information"),
+                ):
+                    controller.undo_title_descriptions()
+
+                self.assertIn('value="Weld"', sym_path.read_text(encoding="utf-8"))
+                self.assertFalse(window.undo_title_descriptions_button.isEnabled())
             finally:
                 window._truck_executor.shutdown(wait=False, cancel_futures=True)
                 window._status_executor.shutdown(wait=False, cancel_futures=True)

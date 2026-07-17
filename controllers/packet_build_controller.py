@@ -23,6 +23,7 @@ from packet_build_service import (
     review_pdf_assets_for_action,
     scan_assembly_bom_context,
     scan_title_block_descriptions,
+    undo_title_block_descriptions,
     validate_print_packet_readiness,
     write_assembly_bom_context_csv,
     write_title_block_descriptions_csv,
@@ -72,6 +73,7 @@ class PacketBuildController:
         cut_list_button: QPushButton,
         title_scan_button: QPushButton | None = None,
         title_apply_button: QPushButton | None = None,
+        title_undo_button: QPushButton | None = None,
     ) -> None:
         self.window = window
         self._print_button = print_button
@@ -79,6 +81,8 @@ class PacketBuildController:
         self._cut_list_button = cut_list_button
         self._title_scan_button = title_scan_button
         self._title_apply_button = title_apply_button
+        self._title_undo_button = title_undo_button
+        self._title_apply_backups_by_key: dict[str, tuple[tuple[str, str], ...]] = {}
         self._lock = threading.RLock()
         self._active_keys: set[tuple[str, str]] = set()
         self._running = False
@@ -92,6 +96,10 @@ class PacketBuildController:
     def _guard_key(self, status: KitStatus, action_key: str) -> tuple[str, str]:
         path_source = status.paths.rpd_path or status.paths.project_dir or status.paths.display_name
         return (str(action_key or "").strip().casefold(), normalize_cache_path(path_source))
+
+    def _kit_cache_key(self, status: KitStatus) -> str:
+        path_source = status.paths.rpd_path or status.paths.project_dir or status.paths.display_name
+        return normalize_cache_path(path_source)
 
     def _begin_guard(self, title: str, status: KitStatus, action_key: str) -> PacketBuildGuard | None:
         guard = PacketBuildGuard(
@@ -205,6 +213,14 @@ class PacketBuildController:
             if button is None:
                 continue
             button.setEnabled(status is not None and not active)
+
+        if self._title_undo_button is not None:
+            has_pending_undo = (
+                status is not None
+                and not active
+                and bool(self._title_apply_backups_by_key.get(self._kit_cache_key(status)))
+            )
+            self._title_undo_button.setEnabled(has_pending_undo)
 
     def _confirm_rebuild(
         self,
@@ -873,6 +889,13 @@ class PacketBuildController:
             QMessageBox.critical(window, title, str(exc))
             return
 
+        kit_key = self._kit_cache_key(status)
+        if result.restorable_backups:
+            self._title_apply_backups_by_key[kit_key] = result.restorable_backups
+        else:
+            self._title_apply_backups_by_key.pop(kit_key, None)
+        self.refresh_button_states()
+
         QMessageBox.information(
             window,
             title,
@@ -885,4 +908,52 @@ class PacketBuildController:
         )
         window.log(
             f"Applied title-block descriptions from {csv_path_text}: {result.updated_count} .sym comment(s) updated."
+        )
+
+    def undo_title_descriptions(self) -> None:
+        window = self.window
+        title = "Undo Title Descriptions"
+        status = window._current_status()
+        if status is None:
+            QMessageBox.information(window, title, "Select a kit first.")
+            return
+        backups = self._title_apply_backups_by_key.get(self._kit_cache_key(status))
+        if not backups:
+            QMessageBox.information(window, title, "There is nothing to undo for this kit.")
+            return
+
+        choice = QMessageBox.question(
+            window,
+            title,
+            (
+                f"Restore {len(backups)} .sym comment(s) for {status.paths.display_name} to their state "
+                "before the most recent Apply Title Descriptions run?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+
+        try:
+            result = undo_title_block_descriptions(backups)
+        except Exception as exc:
+            QMessageBox.critical(window, title, str(exc))
+            return
+
+        self._title_apply_backups_by_key.pop(self._kit_cache_key(status), None)
+        self.refresh_button_states()
+
+        QMessageBox.information(
+            window,
+            title,
+            (
+                f"SYM comments restored: {result.restored_count}\n"
+                f"Missing backups: {result.missing_count}\n"
+                f"Errors: {len(result.errors)}"
+            ),
+        )
+        window.log(
+            f"Undid title-block description apply for {status.paths.display_name}: "
+            f"{result.restored_count} .sym comment(s) restored."
         )

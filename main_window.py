@@ -246,6 +246,7 @@ class MainWindow(QMainWindow):
             "build_cut_list_button",
             "scan_title_descriptions_button",
             "apply_title_descriptions_button",
+            "undo_title_descriptions_button",
             "launch_kitter_button",
             "send_blocks_button",
             "launch_inventor_button",
@@ -271,6 +272,7 @@ class MainWindow(QMainWindow):
             cut_list_button=self.build_cut_list_button,
             title_scan_button=self.scan_title_descriptions_button,
             title_apply_button=self.apply_title_descriptions_button,
+            title_undo_button=self.undo_title_descriptions_button,
         )
         self._apply_dashboard_style()
         self._load_settings_into_form()
@@ -501,6 +503,13 @@ class MainWindow(QMainWindow):
             "part's .sym comment (RADAN attribute 109)."
         )
         self.apply_title_descriptions_button.clicked.connect(self.apply_selected_title_descriptions)
+        self.undo_title_descriptions_button = QPushButton("Undo Title Descriptions")
+        self.undo_title_descriptions_button.setToolTip(
+            "Restore the .sym comment(s) changed by the most recent Apply Title Descriptions run for "
+            "this kit. Only available right after an apply; applying again or undoing replaces this."
+        )
+        self.undo_title_descriptions_button.setEnabled(False)
+        self.undo_title_descriptions_button.clicked.connect(self.undo_selected_title_descriptions)
         self.launch_kitter_button = QPushButton("Run Kitter")
         self.launch_kitter_button.setToolTip("Launch RADAN Kitter on the selected project file.")
         self.launch_kitter_button.clicked.connect(self.launch_selected_kitter)
@@ -541,6 +550,7 @@ class MainWindow(QMainWindow):
             self.build_cut_list_button,
             self.scan_title_descriptions_button,
             self.apply_title_descriptions_button,
+            self.undo_title_descriptions_button,
         ):
             kit_row.addWidget(button)
         kit_row.addStretch(1)
@@ -2307,6 +2317,9 @@ class MainWindow(QMainWindow):
 
     def apply_selected_title_descriptions(self) -> None:
         self.packet_build_controller.apply_title_descriptions_from_csv()
+
+    def undo_selected_title_descriptions(self) -> None:
+        self.packet_build_controller.undo_title_descriptions()
 
     def launch_selected_kitter(self) -> None:
         status = self._current_status()

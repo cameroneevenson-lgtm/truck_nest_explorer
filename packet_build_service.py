@@ -288,15 +288,16 @@ def _write_text_utf8(path: Path, text: str) -> None:
     os.replace(tmp_path, path)
 
 
-def _backup_sym_before_comment_update(sym_path: Path, backup_dir: Path | None) -> None:
+def _backup_sym_before_comment_update(sym_path: Path, backup_dir: Path | None) -> Path | None:
     if backup_dir is None:
-        return
+        return None
     backup_dir.mkdir(parents=True, exist_ok=True)
     candidate = backup_dir / sym_path.name
     if candidate.exists():
         digest = hashlib.sha1(str(sym_path.resolve()).casefold().encode("utf-8")).hexdigest()[:8]
         candidate = backup_dir / f"{sym_path.stem}.{digest}{sym_path.suffix}"
     candidate.write_bytes(sym_path.read_bytes())
+    return candidate
 
 
 def _append_assembly_shorthands_to_comment(existing_comment: str, shorthands: Sequence[str]) -> str:
@@ -467,6 +468,17 @@ class TitleBlockScanResult:
 class TitleBlockApplyResult:
     updated_count: int
     skipped_count: int
+    missing_count: int
+    errors: tuple[tuple[str, str], ...] = ()
+    # (sym_path, backup_path) for every .sym this call actually changed, so
+    # undo_title_block_descriptions can restore exactly this run - and only
+    # this run - without guessing at backup-file naming.
+    restorable_backups: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class TitleBlockUndoResult:
+    restored_count: int
     missing_count: int
     errors: tuple[tuple[str, str], ...] = ()
 
@@ -648,6 +660,7 @@ def apply_title_block_descriptions_from_csv(
     skipped = 0
     missing = 0
     errors: list[tuple[str, str]] = []
+    restorable_backups: list[tuple[str, str]] = []
     with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
             sym_path_text = str(row.get("sym_path") or "").strip()
@@ -669,9 +682,11 @@ def apply_title_block_descriptions_from_csv(
                     skipped += 1
                     continue
                 if updated_text != text:
-                    _backup_sym_before_comment_update(sym_path, backup_dir)
+                    backup_path = _backup_sym_before_comment_update(sym_path, backup_dir)
                     _write_text_utf8(sym_path, updated_text)
                     updated += 1
+                    if backup_path is not None:
+                        restorable_backups.append((str(sym_path), str(backup_path)))
                 else:
                     skipped += 1
             except Exception as exc:
@@ -679,6 +694,33 @@ def apply_title_block_descriptions_from_csv(
     return TitleBlockApplyResult(
         updated_count=updated,
         skipped_count=skipped,
+        missing_count=missing,
+        errors=tuple(errors),
+        restorable_backups=tuple(restorable_backups),
+    )
+
+
+def undo_title_block_descriptions(
+    restorable_backups: Sequence[tuple[str, str]],
+) -> TitleBlockUndoResult:
+    """Restore exactly the (sym_path, backup_path) pairs captured by one
+    apply_title_block_descriptions_from_csv call, undoing just that run -
+    not any other .sym changes made before or after it."""
+    restored = 0
+    missing = 0
+    errors: list[tuple[str, str]] = []
+    for sym_path_text, backup_path_text in restorable_backups:
+        backup_path = Path(backup_path_text)
+        if not backup_path.exists():
+            missing += 1
+            continue
+        try:
+            Path(sym_path_text).write_bytes(backup_path.read_bytes())
+            restored += 1
+        except Exception as exc:
+            errors.append((sym_path_text, str(exc)))
+    return TitleBlockUndoResult(
+        restored_count=restored,
         missing_count=missing,
         errors=tuple(errors),
     )
