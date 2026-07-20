@@ -4367,6 +4367,73 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             window.close()
             app.processEvents()
 
+    def test_full_flow_after_post_review_opens_bom_alongside_packets(self) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
+        from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext
+
+        app = QApplication.instance() or QApplication([])
+        window = QWidget()
+        window.full_flow_button = QPushButton("Run Full Flow", window)
+        window._queue_status_refresh_for_truck = lambda truck_number: True
+        window.log = lambda message: None
+        controller = FullFlowController(window, mutating_widgets=(window.full_flow_button,), editable_table=QTableWidget(window))
+        project_path = Path("paint.rpd")
+        bom_path = Path("F55334-PAINT PACK.xlsx")
+        packet_path = Path("print_packet.pdf")
+        status = SimpleNamespace(
+            kit_name="PAINT PACK",
+            paths=SimpleNamespace(display_name="F55334 PAINT PACK", truck_number="F55334", rpd_path=project_path),
+            spreadsheet_match=SimpleNamespace(chosen_path=bom_path, candidates=(bom_path,)),
+        )
+        inventor = inventor_service.InventorRunResult(
+            spreadsheet_path=bom_path,
+            project_dir=Path("."),
+            entry_path=Path("inventor_to_radan.bat"),
+            moved_paths=(Path("paint.csv"),),
+            report_path=Path("report.txt"),
+            discard_paths=(),
+        )
+        result = full_flow_service.FullFlowResult(
+            project_path=project_path,
+            inventor=inventor,
+            csv_import=full_flow_service.CsvImportResult(log_path=Path("import.log"), return_code=0),
+            rf_assignment=full_flow_service.RfAssignmentResult(
+                predicted_count=4,
+                skipped_count=0,
+                model_source="model",
+                kit_count=1,
+                backup_path=None,
+            ),
+            packets=full_flow_service.PacketFlowResult(
+                packet_paths=(packet_path,),
+                print_pages=1,
+                print_missing=0,
+                assembly_pages=2,
+                cut_list_pages=3,
+            ),
+        )
+        context = FullFlowRunContext(
+            1,
+            status,
+            False,
+            FullFlowPhase.POST_REVIEW,
+            inventor_result=inventor,
+            full_flow_result=result,
+        )
+        controller._context = context
+        try:
+            with (
+                patch("controllers.full_flow_controller.open_path") as open_mock,
+                patch.object(QMessageBox, "information"),
+            ):
+                controller._after_post_review(context)
+            opened_paths = [call.args[0] for call in open_mock.call_args_list]
+            self.assertEqual(opened_paths, [bom_path, packet_path, project_path])
+            self.assertFalse(controller.is_running)
+        finally:
+            window.close()
+            app.processEvents()
+
     def test_full_flow_controller_nester_failure_still_opens_project(self) -> None:
         from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidget, QWidget
         from controllers.full_flow_controller import FullFlowController, FullFlowPhase, FullFlowRunContext

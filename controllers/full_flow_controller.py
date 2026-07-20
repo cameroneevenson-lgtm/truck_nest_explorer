@@ -502,6 +502,16 @@ class FullFlowController:
                 QMessageBox.critical(self.window, "Run Full Flow", "Full Flow returned an invalid result.")
             return
 
+        spreadsheet_path = context.status.spreadsheet_match.chosen_path
+        if spreadsheet_path is not None:
+            self._progress(f"Opening BOM: {Path(spreadsheet_path).name}")
+            try:
+                open_path(spreadsheet_path)
+            except Exception as exc:
+                message = f"Could not open BOM {spreadsheet_path}: {exc}"
+                self._log(message)
+                self._progress(message)
+
         opened_packets = 0
         self._progress(f"Opening {len(result.packets.packet_paths)} packet(s).")
         for packet_path in result.packets.packet_paths:
