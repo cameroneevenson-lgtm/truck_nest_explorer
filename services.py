@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import csv
 import json
 import os
@@ -260,6 +261,40 @@ def active_registered_truck_numbers(database_path: Path | str | None = None) -> 
     return numbers
 
 
+def _odd_job_registry_entries(path: Path) -> list[dict]:
+    """Read Odd Job Intake's registry, whichever store it is using.
+
+    Intake moved from a JSON file to SQLite beside it. Both are read here
+    because this feeds a *guard* - it is what stops canonical truck kits being
+    scaffolded over a standalone job - and a guard that quietly sees an empty
+    registry is a guard that has stopped working. Read-only and defensive: this
+    app never writes Intake's store.
+    """
+    records: list[dict] = []
+    database = path.with_suffix(".db")
+    if database.exists():
+        try:
+            with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
+                connection.execute("PRAGMA busy_timeout=5000")
+                rows = connection.execute("SELECT data FROM entries").fetchall()
+            for (data,) in rows:
+                entry = json.loads(data)
+                if isinstance(entry, dict):
+                    records.append(entry)
+        except (OSError, sqlite3.Error, json.JSONDecodeError):
+            return []
+        return records
+
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
 def standalone_odd_job_numbers(registry_path: Path | str | None = None) -> set[str]:
     """Return F##### roots created as standalone jobs by Odd Job Intake.
 
@@ -268,17 +303,10 @@ def standalone_odd_job_numbers(registry_path: Path | str | None = None) -> set[s
     attached to a real truck and must not make that truck disappear here.
     """
     path = Path(str(registry_path)) if registry_path is not None else ODD_JOB_INTAKE_REGISTRY_PATH
-    if not path.exists():
-        return set()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-
-    entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    entries = _odd_job_registry_entries(path)
     numbers: set[str] = set()
-    for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict) or clean_text(entry.get("label")):
+    for entry in entries:
+        if clean_text(entry.get("label")):
             continue
         job_number = normalize_hidden_truck_number(entry.get("job_number", ""))
         if job_number and is_standard_truck_number(job_number):

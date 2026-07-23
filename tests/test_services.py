@@ -9,9 +9,10 @@ import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 import shutil
+import sqlite3
 import uuid
 from unittest.mock import patch
 
@@ -134,6 +135,17 @@ def workspace_tempdir() -> Path:
         yield temp_dir
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def write_flow_database(path: Path, active_trucks: list[str]) -> None:
+    with sqlite3.connect(str(path)) as connection:
+        connection.execute(
+            "CREATE TABLE Truck (truck_number TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1)"
+        )
+        connection.executemany(
+            "INSERT INTO Truck (truck_number, is_active) VALUES (?, 1)",
+            [(truck,) for truck in active_trucks],
+        )
 
 
 def write_pdf(path: Path, *, text: str, width: float, height: float) -> None:
@@ -2612,32 +2624,157 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertNotIn("--d-record-view-height-threshold-guard", command)
             self.assertNotIn("--assign-project-colors", command)
 
-    def test_discover_trucks_respects_registry_for_standard_f_jobs(self) -> None:
+    def test_discover_trucks_respects_dashboard_database_for_standard_f_jobs(self) -> None:
         with workspace_tempdir() as temp_root:
             release_root = temp_root / "release"
             fabrication_root = temp_root / "fab"
-            registry_path = temp_root / "truck_registry.csv"
+            database_path = temp_root / "fabrication_flow.db"
             (release_root / "F55334").mkdir(parents=True)
             (release_root / "F59999").mkdir(parents=True)
             (release_root / "Templates").mkdir(parents=True)
             (release_root / "_runtime").mkdir(parents=True)
             (release_root / "F5533").mkdir(parents=True)
             (fabrication_root / "F55335").mkdir(parents=True)
-            registry_path.write_text(
-                "truck_number,day_zero,is_active,notes\n"
-                "F55334,2026-02-09,1,Whole truck\n",
-                encoding="utf-8",
-            )
+            write_flow_database(database_path, ["F55334"])
 
             settings = ExplorerSettings(
                 release_root=str(release_root),
                 fabrication_root=str(fabrication_root),
             )
 
-            with patch("services.FLOW_TRUCK_REGISTRY_PATH", registry_path):
+            with patch("services.FLOW_DATABASE_PATH", database_path):
                 trucks = discover_trucks(settings)
 
             self.assertEqual(trucks, ["F55334"])
+
+    def test_discover_trucks_excludes_standalone_f_job_from_odd_job_intake(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            intake_registry = temp_root / "job_intake_registry.json"
+            missing_flow_database = temp_root / "missing_fabrication_flow.db"
+            (release_root / "F55334").mkdir(parents=True)
+            (release_root / "F59999").mkdir(parents=True)
+            intake_registry.write_text(
+                json.dumps(
+                    {
+                        "entries": [
+                            {"job_number": "F59999", "label": ""},
+                            {"job_number": "F55334", "label": "REPAIR BRACKETS"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            with patch("services.ODD_JOB_INTAKE_REGISTRY_PATH", intake_registry), patch(
+                "services.FLOW_DATABASE_PATH", missing_flow_database
+            ):
+                trucks = discover_trucks(settings)
+
+            self.assertEqual(trucks, ["F55334"])
+
+    def test_discover_trucks_excludes_explicit_w_side_standalone_f_job(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            intake_registry = temp_root / "job_intake_registry.json"
+            job = "F59999"
+            (fabrication_root / job).mkdir(parents=True)
+            intake_registry.write_text(
+                json.dumps({"entries": [{"job_number": job, "label": None}]}),
+                encoding="utf-8",
+            )
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+                truck_order=[job],
+            )
+
+            with patch("services.ODD_JOB_INTAKE_REGISTRY_PATH", intake_registry):
+                trucks = discover_trucks(settings)
+
+            self.assertNotIn(job, trucks)
+
+    def test_standalone_odd_job_cannot_create_canonical_truck_kits(self) -> None:
+        with workspace_tempdir() as temp_root:
+            intake_registry = temp_root / "job_intake_registry.json"
+            missing_flow_database = temp_root / "missing_fabrication_flow.db"
+            intake_registry.write_text(
+                json.dumps({"entries": [{"job_number": "F59999", "label": ""}]}),
+                encoding="utf-8",
+            )
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+
+            with patch("services.ODD_JOB_INTAKE_REGISTRY_PATH", intake_registry), patch(
+                "services.FLOW_DATABASE_PATH", missing_flow_database
+            ):
+                with self.assertRaisesRegex(RuntimeError, "registered as a standalone job"):
+                    create_kit_scaffold("F59999", "PAINT PACK", settings)
+
+    def test_standalone_odd_job_guard_reads_intakes_sqlite_registry(self) -> None:
+        """Odd Job Intake moved its registry from JSON to SQLite.
+
+        This guard is the only thing stopping canonical truck kits being
+        scaffolded over a standalone one-off, and reading the wrong store would
+        not fail - it would quietly find no standalone jobs and let the
+        scaffold through. So it is asserted against the store Intake now uses.
+        """
+        with workspace_tempdir() as temp_root:
+            intake_registry = temp_root / "job_intake_registry.json"
+            missing_flow_database = temp_root / "missing_fabrication_flow.db"
+            with closing(sqlite3.connect(temp_root / "job_intake_registry.db")) as connection:
+                connection.execute(
+                    "CREATE TABLE entries (key TEXT PRIMARY KEY, received_at TEXT, data TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO entries VALUES (?, ?, ?)",
+                    ("F59999", "", json.dumps({"job_number": "F59999", "label": None})),
+                )
+                connection.commit()
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+
+            with patch("services.ODD_JOB_INTAKE_REGISTRY_PATH", intake_registry), patch(
+                "services.FLOW_DATABASE_PATH", missing_flow_database
+            ):
+                with self.assertRaisesRegex(RuntimeError, "registered as a standalone job"):
+                    create_kit_scaffold("F59999", "PAINT PACK", settings)
+
+    def test_active_dashboard_truck_wins_over_standalone_intake_record(self) -> None:
+        with workspace_tempdir() as temp_root:
+            release_root = temp_root / "release"
+            fabrication_root = temp_root / "fab"
+            intake_registry = temp_root / "job_intake_registry.json"
+            database_path = temp_root / "fabrication_flow.db"
+            job = "F55334"
+            (release_root / job).mkdir(parents=True)
+            intake_registry.write_text(
+                json.dumps({"entries": [{"job_number": job, "label": ""}]}),
+                encoding="utf-8",
+            )
+            write_flow_database(database_path, [job])
+            settings = ExplorerSettings(
+                release_root=str(release_root),
+                fabrication_root=str(fabrication_root),
+            )
+
+            with patch("services.ODD_JOB_INTAKE_REGISTRY_PATH", intake_registry), patch(
+                "services.FLOW_DATABASE_PATH", database_path
+            ):
+                self.assertIn(job, discover_trucks(settings))
+                result = create_kit_scaffold(job, "PAINT PACK", settings)
+
+            self.assertTrue(result.paths.rpd_path.exists())
 
     def test_discover_trucks_includes_explicit_w_side_nonstandard_job_folder(self) -> None:
         with workspace_tempdir() as temp_root:
@@ -2777,20 +2914,16 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual([status.kit_name for status in statuses], ["DRIVER PACK"])
             self.assertFalse((p_release_root / job).exists())
 
-    def test_create_kit_scaffold_rejects_unregistered_f_job_when_registry_exists(self) -> None:
+    def test_create_kit_scaffold_rejects_unregistered_f_job_when_dashboard_database_exists(self) -> None:
         with workspace_tempdir() as temp_root:
-            registry_path = temp_root / "truck_registry.csv"
-            registry_path.write_text(
-                "truck_number,day_zero,is_active,notes\n"
-                "F55334,2026-02-09,1,Whole truck\n",
-                encoding="utf-8",
-            )
+            database_path = temp_root / "fabrication_flow.db"
+            write_flow_database(database_path, ["F55334"])
             settings = ExplorerSettings(
                 release_root=str(temp_root / "release"),
                 fabrication_root=str(temp_root / "fab"),
             )
 
-            with patch("services.FLOW_TRUCK_REGISTRY_PATH", registry_path):
+            with patch("services.FLOW_DATABASE_PATH", database_path):
                 with self.assertRaisesRegex(RuntimeError, "not listed as an active whole-truck job"):
                     create_kit_scaffold("F59999", "PAINT PACK", settings)
 
