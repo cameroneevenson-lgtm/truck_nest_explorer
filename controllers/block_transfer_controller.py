@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
-from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtWidgets import QMessageBox, QProgressDialog, QPushButton
 
 from background_job import BackgroundJobWorker
 from services import build_project_block_transfer_plan, send_project_block_files_to_machine
+
+# Copies go to the machine and the L-side archive over SMB, so a stalled share looks
+# exactly like a slow copy. After this long with no progress callback, say so in the
+# dialog rather than leaving a "Sending..." message that implies work is happening.
+STALL_WARNING_SECONDS = 30.0
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {remainder:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 
 class BlockTransferController:
@@ -159,7 +176,39 @@ class BlockTransferController:
         self._worker = worker
         self.refresh_button_state()
 
+        started_at = time.monotonic()
+        state = {"last_progress_at": started_at, "status_text": "Starting..."}
+
+        # Drives the elapsed/stall line. Without it a hung SMB copy leaves a static
+        # "Sending block files to the machine..." on screen indefinitely, which reads as
+        # "still working" no matter how long it has actually been stuck.
+        heartbeat = QTimer(self.window)
+        heartbeat.setInterval(1000)
+
+        def _render() -> None:
+            now = time.monotonic()
+            idle = now - state["last_progress_at"]
+            lines = [
+                "Sending block files to the machine...",
+                state["status_text"],
+                f"Elapsed {_format_elapsed(now - started_at)}",
+            ]
+            if idle >= STALL_WARNING_SECONDS:
+                lines.append(
+                    f"No activity for {_format_elapsed(idle)} - the machine or L-side "
+                    "share may be unreachable. Cancel is safe; files already copied are "
+                    "checksum-verified."
+                )
+            progress.setLabelText("\n".join(line for line in lines if line))
+
+        heartbeat.timeout.connect(_render)
+        heartbeat.start()
+
         def _cleanup() -> None:
+            try:
+                heartbeat.stop()
+            except Exception:
+                pass
             try:
                 progress.close()
             except Exception:
@@ -173,7 +222,9 @@ class BlockTransferController:
             else:
                 progress.setRange(0, int(total))
                 progress.setValue(max(0, min(int(total), int(done))))
-            progress.setLabelText(f"Sending block files to the machine...\n{status_text}")
+            state["last_progress_at"] = time.monotonic()
+            state["status_text"] = str(status_text or "")
+            _render()
 
         def _on_done(payload: object) -> None:
             _cleanup()
@@ -213,7 +264,14 @@ class BlockTransferController:
             QMessageBox.critical(self.window, title, message)
             self.window.log(f"Send Blocks failed for {status.paths.display_name}: {message}")
 
-        progress.canceled.connect(worker.request_stop)
+        def _on_cancel_requested() -> None:
+            # request_stop is only honoured between files, so say that instead of leaving
+            # the dialog claiming it is still sending.
+            worker.request_stop()
+            state["status_text"] = "Cancel requested; finishing the file in progress..."
+            _render()
+
+        progress.canceled.connect(_on_cancel_requested)
         worker.signals.progress.connect(_on_progress)
         worker.signals.done.connect(_on_done)
         worker.signals.error.connect(_on_error)

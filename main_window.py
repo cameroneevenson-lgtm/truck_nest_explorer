@@ -932,6 +932,9 @@ class MainWindow(QMainWindow):
             trucks = []
 
         if request_serial != self._truck_request_serial:
+            # A newer request supersedes this one. That request owns the status line and
+            # will replace it; clear ours so "Loading trucks..." can never outlive the load.
+            self.statusBar().clearMessage()
             return
 
         self._all_trucks = trucks
