@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Callable, Iterator
@@ -185,11 +186,83 @@ def _load_radan_automation_modules():
     return import_parts, radan_com
 
 
-def _load_radan_isolated_desktop_module():
-    root = _tools_root() / "radan_automation"
-    module_names = _python_module_names(root)
-    with _isolated_import_root(root, module_names):
-        return importlib.import_module("radan_isolated_desktop")
+def _run_headless_nester_isolated(
+    project_path: Path,
+    *,
+    runtime_dir: Path,
+    progress_cb: ProgressCallback | None = None,
+) -> "NesterResult":
+    """Drive radan_automation's standalone nester, which isolates itself on a private desktop."""
+
+    project = Path(project_path)
+    if not project.exists():
+        raise FileNotFoundError(str(project))
+
+    entry = _tools_root() / "radan_automation" / "run_project_nester.py"
+    if not entry.exists():
+        raise FileNotFoundError(str(entry))
+
+    stamp = int(time.time())
+    log_path = Path(runtime_dir) / "_runtime" / f"full_flow_nester_{_safe_name(project.stem)}_{stamp}.log"
+    json_path = log_path.with_suffix(".json")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    before_snapshot = _project_snapshot(project)
+    _emit(progress_cb, f"Nester precheck: {_snapshot_summary(before_snapshot)}")
+    _emit(progress_cb, "Nester: running on a private desktop; open RADAN sessions are unaffected.")
+
+    started = time.time()
+    completed = subprocess.run(
+        [
+            # app.py guarantees we are running under C:\Tools\.venv (see CLAUDE.md).
+            sys.executable,
+            str(entry),
+            "--project",
+            str(project),
+            "--isolated-desktop",
+            "--log-file",
+            str(log_path),
+            "--json-out",
+            str(json_path),
+        ],
+        cwd=str(entry.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    elapsed = time.time() - started
+
+    payload: dict[str, object] = {}
+    if json_path.exists():
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    if not payload:
+        detail = (completed.stderr or completed.stdout or "").strip()[:500]
+        raise RuntimeError(
+            f"Isolated nester produced no result (exit {completed.returncode}). {detail}"
+        )
+
+    after_snapshot = _project_snapshot(project)
+    changed = tuple(Path(item) for item in payload.get("changed_drg_files", []) or ())
+    _emit(
+        progress_cb,
+        f"Nester: returned {payload.get('return_code')} after {elapsed:.1f}s; "
+        f"new/updated {len(changed)} DRG(s), total {payload.get('drg_count', 0)}",
+    )
+
+    return NesterResult(
+        ok=bool(payload.get("ok")),
+        return_code=int(payload.get("return_code") or -1),
+        elapsed_seconds=float(payload.get("elapsed_seconds") or elapsed),
+        log_path=log_path,
+        drg_count=int(payload.get("drg_count") or 0),
+        changed_drg_paths=changed,
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+    )
 
 
 def _project_snapshot(project_path: Path) -> dict[str, object]:
@@ -610,6 +683,16 @@ def run_headless_nester(
     progress_cb: ProgressCallback | None = None,
     isolated_desktop: bool = RADAN_ISOLATED_DESKTOP,
 ) -> NesterResult:
+    if isolated_desktop:
+        # Isolation is a property of which desktop the *process* runs on, so it cannot be
+        # applied from inside this Qt process. Hand the work to the standalone nester in
+        # radan_automation, which re-runs itself on a private desktop.
+        return _run_headless_nester_isolated(
+            project_path,
+            runtime_dir=runtime_dir,
+            progress_cb=progress_cb,
+        )
+
     import_parts, radan_com = _load_radan_automation_modules()
     project = Path(project_path)
     if not project.exists():
@@ -624,33 +707,18 @@ def run_headless_nester(
     logger.write(f"Before nesting snapshot: {_snapshot_summary(before_snapshot)}")
     _emit(progress_cb, f"Nester precheck: {_snapshot_summary(before_snapshot)}")
     app = None
-    session = None
     should_quit_app = False
     started = time.time()
     try:
-        if isolated_desktop:
-            _emit(progress_cb, "Nester: starting RADAN automation on a private desktop")
-            session = _load_radan_isolated_desktop_module().start_isolated_session(
-                backend="win32com",
-                log=logger.write,
-            )
-            app = session.application
-            info = app.info()
-            should_quit_app = True
-            logger.write(
-                f"Started isolated RADAN automation PID {info.process_id} on private desktop "
-                f"{session.desktop_name!r} for full flow nester."
-            )
-        else:
-            _emit(progress_cb, "Nester: starting hidden RADAN automation")
-            app = radan_com.open_application(backend="win32com", force_new_instance=True)
-            info, should_quit_app = import_parts._resolve_automation_instance(app, preexisting_visible_pids, logger)
-            logger.write(f"Started hidden RADAN automation PID {info.process_id} for full flow nester.")
-            app.visible = False
-            try:
-                app.interactive = False
-            except Exception:
-                pass
+        _emit(progress_cb, "Nester: starting hidden RADAN automation")
+        app = radan_com.open_application(backend="win32com", force_new_instance=True)
+        info, should_quit_app = import_parts._resolve_automation_instance(app, preexisting_visible_pids, logger)
+        logger.write(f"Started hidden RADAN automation PID {info.process_id} for full flow nester.")
+        app.visible = False
+        try:
+            app.interactive = False
+        except Exception:
+            pass
         mac = import_parts._mac_object(app)
 
         _emit(progress_cb, "Nester: opening project")
@@ -738,7 +806,3 @@ def run_headless_nester(
                 app.close()
             except Exception:
                 pass
-        if session is not None:
-            # Idempotent, and the only thing that destroys the private desktop. A leaked
-            # desktop holds an invisible RADRAFT and its licence until reboot.
-            session.close()
