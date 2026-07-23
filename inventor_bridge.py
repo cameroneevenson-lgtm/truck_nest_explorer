@@ -23,6 +23,21 @@ from pathlib import Path
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
 DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_csv_headless.py")
 
+# Single switch for the whole app: run RADAN automation on a private Win32 desktop
+# (radan_automation/radan_isolated_desktop.py) so open RADAN sessions are not disturbed.
+# Same logon session and same instance count as the default path, so no extra licence seat.
+#
+# Still off by default: flip to True only once probe_visible_session_disturbance.py shows a
+# clean before/after on this machine. Turning it on also relaxes the "close RADAN first"
+# gates, so a premature flip would remove the protection without replacing it.
+# Set TRUCK_NEST_RADAN_ISOLATED_DESKTOP=1 to try it without editing code.
+RADAN_ISOLATED_DESKTOP = os.environ.get("TRUCK_NEST_RADAN_ISOLATED_DESKTOP", "").strip() in {
+    "1",
+    "true",
+    "True",
+    "yes",
+}
+
 
 class InventorToRadanInlineNeedsUi(RuntimeError):
     def __init__(self, message: str, *, missing_dxf_count: int = 0, missing_rule_count: int = 0) -> None:
@@ -231,6 +246,7 @@ def launch_radan_csv_import(
     log_path: Path | str | None = None,
     entry_path: Path | str = DEFAULT_RADAN_CSV_IMPORT_ENTRY,
     allow_visible_radan: bool = False,
+    isolated_desktop: bool = False,
     rebuild_symbols: bool = False,
     lab_symbol_writer: bool = False,
     native_sym_experimental: bool = False,
@@ -268,6 +284,8 @@ def launch_radan_csv_import(
         command.extend(["--project", str(project)])
     if allow_visible_radan:
         command.append("--allow-visible-radan")
+    if isolated_desktop:
+        command.append("--isolated-desktop")
     if rebuild_symbols:
         command.append("--rebuild-symbols")
     if lab_symbol_writer or native_sym_experimental:

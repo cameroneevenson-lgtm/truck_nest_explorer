@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QMessageBox
 
 from dialogs.import_log_dialog import ImportLogDialog
 from services import (
+    RADAN_ISOLATED_DESKTOP,
     launch_radan_csv_import,
     radan_csv_import_lock_status,
     radan_csv_missing_symbols,
@@ -123,7 +124,14 @@ class RadanImportController:
             visible_sessions = visible_radan_sessions()
         except Exception:
             visible_sessions = ()
-        if visible_sessions:
+        if visible_sessions and RADAN_ISOLATED_DESKTOP:
+            # Automation runs on a private Win32 desktop, so these sessions cannot be
+            # redrawn or focus-stolen. Nothing to warn about; just record what was open.
+            window.log(
+                "Visible RADAN session(s) open during import; isolated-desktop mode keeps them "
+                "safe: " + ", ".join(f"{pid}: {title}" for pid, title in visible_sessions[:8])
+            )
+        elif visible_sessions:
             session_text = "\n".join(f"{pid}: {title}" for pid, title in visible_sessions[:8])
             if len(visible_sessions) > 8:
                 session_text += f"\n... (+{len(visible_sessions) - 8} more)"
@@ -160,6 +168,7 @@ class RadanImportController:
                 project_path=status.paths.rpd_path,
                 log_path=log_path,
                 allow_visible_radan=allow_visible_radan,
+                isolated_desktop=RADAN_ISOLATED_DESKTOP,
                 rebuild_symbols=True,
                 lab_symbol_writer=lab_symbol_writer,
                 preprocess_dxf_outer_profile=True,

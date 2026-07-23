@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path, PureWindowsPath
 
@@ -62,6 +64,7 @@ from packet_pdf_detection import (
 )
 from inventor_bridge import (
     DEFAULT_RADAN_CSV_IMPORT_ENTRY,  # noqa: F401 - re-exported; used by tests/test_services.py
+    RADAN_ISOLATED_DESKTOP,  # noqa: F401 - re-exported; used by full_flow_service.py/radan_import_controller.py
     InventorToRadanInlineNeedsUi,  # noqa: F401 - re-exported; used by inventor_service.py
     launch_radan_csv_import,  # noqa: F401 - re-exported; used by radan_import_controller.py
     radan_csv_import_lock_status,  # noqa: F401 - re-exported; used by full_flow_service.py etc.
@@ -89,7 +92,8 @@ MINIMAL_RPD_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 </Project>
 """
 DEFAULT_VENV_PYTHON = Path(r"C:\Tools\.venv\Scripts\python.exe")
-FLOW_TRUCK_REGISTRY_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\truck_registry.csv")
+FLOW_DATABASE_PATH = Path(r"C:\Tools\fabrication_flow_dashboard\fabrication_flow.db")
+ODD_JOB_INTAKE_REGISTRY_PATH = Path(r"C:\Tools\odd_job_intake\_runtime\job_intake_registry.json")
 TRUCK_FOLDER_PATTERN = re.compile(r"^[A-Z]\d{5}$", re.IGNORECASE)
 OWNED_INVENTOR_OUTPUT_SUFFIXES = ("_Radan.csv", "_report.txt")
 KIT_STATUS_CACHE_TTL_SECONDS = 30.0
@@ -231,30 +235,64 @@ def add_odd_job_to_truck(settings: ExplorerSettings, truck_number: str, kit_name
     return True
 
 
-def _truthy_registry_value(value: object) -> bool:
-    text = clean_text(value).casefold()
-    if not text:
-        return True
-    return text not in {"0", "false", "no", "n", "inactive", "archived"}
+def active_registered_truck_numbers(database_path: Path | str | None = None) -> set[str]:
+    """Read the dashboard's authoritative active whole-truck set.
 
-
-def active_registered_truck_numbers(registry_path: Path | str | None = None) -> set[str]:
-    path = Path(str(registry_path)) if registry_path is not None else FLOW_TRUCK_REGISTRY_PATH
+    The old truck_registry.csv was removed when truck management moved into
+    Fabrication Flow's SQLite database. Query SQLite directly to avoid the
+    cross-repo flat-module name collisions described in both apps.
+    """
+    path = Path(str(database_path)) if database_path is not None else FLOW_DATABASE_PATH
     if not path.exists():
         return set()
     numbers: set[str] = set()
     try:
-        with path.open(newline="", encoding="utf-8-sig") as handle:
-            for row in csv.DictReader(handle):
-                truck = normalize_hidden_truck_number(row.get("truck_number", ""))
-                if not truck:
-                    continue
-                if not _truthy_registry_value(row.get("is_active", "1")):
-                    continue
+        with sqlite3.connect(str(path)) as connection:
+            rows = connection.execute(
+                "SELECT truck_number FROM Truck WHERE COALESCE(is_active, 1) = 1"
+            ).fetchall()
+        for row in rows:
+            truck = normalize_hidden_truck_number(row[0] if row else "")
+            if truck:
                 numbers.add(truck.upper())
-    except OSError:
+    except (OSError, sqlite3.Error):
         return set()
     return numbers
+
+
+def standalone_odd_job_numbers(registry_path: Path | str | None = None) -> set[str]:
+    """Return F##### roots created as standalone jobs by Odd Job Intake.
+
+    A blank label means Intake created the job-number root itself. Labeled
+    entries live below a folder that already existed, which includes odd work
+    attached to a real truck and must not make that truck disappear here.
+    """
+    path = Path(str(registry_path)) if registry_path is not None else ODD_JOB_INTAKE_REGISTRY_PATH
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    numbers: set[str] = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or clean_text(entry.get("label")):
+            continue
+        job_number = normalize_hidden_truck_number(entry.get("job_number", ""))
+        if job_number and is_standard_truck_number(job_number):
+            numbers.add(job_number.upper())
+    return numbers
+
+
+def is_standalone_odd_job(job_number: str) -> bool:
+    job = normalize_hidden_truck_number(job_number)
+    if not job or job.upper() not in standalone_odd_job_numbers():
+        return False
+    # An authoritative whole-truck registration wins if the same number was
+    # mistakenly or historically also recorded by Odd Job Intake.
+    return job.upper() not in active_registered_truck_numbers()
 
 
 def is_release_truck_discoverable(
@@ -267,6 +305,8 @@ def is_release_truck_discoverable(
         return False
     if release_truck_dir is None or not Path(str(release_truck_dir)).exists():
         return False
+    if is_standalone_odd_job(truck):
+        return False
     registered_trucks = active_registered_truck_numbers()
     if registered_trucks and is_standard_truck_number(truck):
         return truck.upper() in registered_trucks
@@ -275,12 +315,17 @@ def is_release_truck_discoverable(
 
 def assert_truck_scaffold_allowed(truck_number: str, settings: ExplorerSettings) -> None:
     truck = normalize_hidden_truck_number(truck_number)
+    if is_standalone_odd_job(truck):
+        raise RuntimeError(
+            f"Refusing to create canonical truck kits for {truck or truck_number}. "
+            f"It is registered as a standalone job in {ODD_JOB_INTAKE_REGISTRY_PATH}."
+        )
     registered_trucks = active_registered_truck_numbers()
     if not registered_trucks or not is_standard_truck_number(truck) or truck.upper() in registered_trucks:
         return
     raise RuntimeError(
         f"Refusing to create kit scaffolds for {truck or truck_number}. "
-        f"It is not listed as an active whole-truck job in {FLOW_TRUCK_REGISTRY_PATH}."
+        f"It is not listed as an active whole-truck job in {FLOW_DATABASE_PATH}."
     )
 
 
@@ -606,6 +651,8 @@ def discover_trucks(settings: ExplorerSettings) -> list[str]:
             pass
 
     for truck in explicit_truck_numbers(settings):
+        if is_standalone_odd_job(truck):
+            continue
         if find_fabrication_truck_dir(truck, settings) is not None:
             names.add(truck)
     return sorted(names, key=natural_sort_key)

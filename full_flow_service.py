@@ -23,6 +23,7 @@ from packet_build_service import (
     write_assembly_bom_context_csv,
 )
 from services import (
+    RADAN_ISOLATED_DESKTOP,
     launch_radan_csv_import,
     radan_csv_import_lock_status,
     resolve_existing_inventor_csv,
@@ -184,6 +185,13 @@ def _load_radan_automation_modules():
     return import_parts, radan_com
 
 
+def _load_radan_isolated_desktop_module():
+    root = _tools_root() / "radan_automation"
+    module_names = _python_module_names(root)
+    with _isolated_import_root(root, module_names):
+        return importlib.import_module("radan_isolated_desktop")
+
+
 def _project_snapshot(project_path: Path) -> dict[str, object]:
     root = _tools_root() / "radan_automation"
     try:
@@ -319,6 +327,7 @@ def run_csv_import_for_status(
         project_path=status.paths.rpd_path,
         log_path=log_path,
         allow_visible_radan=False,
+        isolated_desktop=RADAN_ISOLATED_DESKTOP,
         rebuild_symbols=True,
         preprocess_dxf_outer_profile=True,
         preprocess_dxf_tolerance=0.002,
@@ -599,6 +608,7 @@ def run_headless_nester(
     *,
     runtime_dir: Path,
     progress_cb: ProgressCallback | None = None,
+    isolated_desktop: bool = RADAN_ISOLATED_DESKTOP,
 ) -> NesterResult:
     import_parts, radan_com = _load_radan_automation_modules()
     project = Path(project_path)
@@ -614,18 +624,33 @@ def run_headless_nester(
     logger.write(f"Before nesting snapshot: {_snapshot_summary(before_snapshot)}")
     _emit(progress_cb, f"Nester precheck: {_snapshot_summary(before_snapshot)}")
     app = None
+    session = None
     should_quit_app = False
     started = time.time()
     try:
-        _emit(progress_cb, "Nester: starting hidden RADAN automation")
-        app = radan_com.open_application(backend="win32com", force_new_instance=True)
-        info, should_quit_app = import_parts._resolve_automation_instance(app, preexisting_visible_pids, logger)
-        logger.write(f"Started hidden RADAN automation PID {info.process_id} for full flow nester.")
-        app.visible = False
-        try:
-            app.interactive = False
-        except Exception:
-            pass
+        if isolated_desktop:
+            _emit(progress_cb, "Nester: starting RADAN automation on a private desktop")
+            session = _load_radan_isolated_desktop_module().start_isolated_session(
+                backend="win32com",
+                log=logger.write,
+            )
+            app = session.application
+            info = app.info()
+            should_quit_app = True
+            logger.write(
+                f"Started isolated RADAN automation PID {info.process_id} on private desktop "
+                f"{session.desktop_name!r} for full flow nester."
+            )
+        else:
+            _emit(progress_cb, "Nester: starting hidden RADAN automation")
+            app = radan_com.open_application(backend="win32com", force_new_instance=True)
+            info, should_quit_app = import_parts._resolve_automation_instance(app, preexisting_visible_pids, logger)
+            logger.write(f"Started hidden RADAN automation PID {info.process_id} for full flow nester.")
+            app.visible = False
+            try:
+                app.interactive = False
+            except Exception:
+                pass
         mac = import_parts._mac_object(app)
 
         _emit(progress_cb, "Nester: opening project")
@@ -713,3 +738,7 @@ def run_headless_nester(
                 app.close()
             except Exception:
                 pass
+        if session is not None:
+            # Idempotent, and the only thing that destroys the private desktop. A leaked
+            # desktop holds an invisible RADRAFT and its licence until reboot.
+            session.close()

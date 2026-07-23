@@ -26,7 +26,7 @@ from dialogs.inventor_report_review_dialog import InventorReviewState, review_in
 from full_flow_service import FullFlowError, FullFlowResult, run_full_flow_after_inventor_review, run_headless_nester
 from inventor_service import InventorNeedsUserAction, InventorRunResult, InventorServiceError, run_inventor_for_status
 from models import KitStatus
-from services import open_path, visible_radan_sessions
+from services import RADAN_ISOLATED_DESKTOP, open_path, visible_radan_sessions
 
 
 class FullFlowPhase(Enum):
@@ -531,8 +531,12 @@ class FullFlowController:
             self._finalize(context, nester_message)
             return
 
-        self._progress("Waiting for close-RADAN confirmation before the headless nester attempt.")
-        if not self._confirm_close_radan_for_full_flow():
+        if RADAN_ISOLATED_DESKTOP:
+            self._progress(
+                "Isolated-desktop mode: the nester runs on a private Win32 desktop, so open "
+                "RADAN sessions can stay open."
+            )
+        elif not self._confirm_close_radan_for_full_flow():
             self._progress("Headless nester skipped after the close-RADAN confirmation. RADAN will open normally.")
             self._finalize(context, nester_message)
             return
