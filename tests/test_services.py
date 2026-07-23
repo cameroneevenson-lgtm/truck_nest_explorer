@@ -1223,6 +1223,88 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(len(context.parts), 1)
             self.assertEqual(context.assembly_source_pdfs, (assembly_pdf,))
 
+    def test_prepare_packet_build_context_includes_excluded_large_format_part_pdf(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            oversized_sym = paths.fabrication_kit_dir / "F55334-B-09.sym"
+            oversized_pdf = paths.fabrication_kit_dir / "F55334-B-09.pdf"
+            oversized_ipt = paths.fabrication_kit_dir / "F55334-B-09.ipt"
+            stock_sym = paths.fabrication_kit_dir / "B-16.sym"
+            stock_pdf = paths.fabrication_kit_dir / "B-16.pdf"
+            oversized_sym.write_text("sym", encoding="utf-8")
+            oversized_ipt.write_text("ipt", encoding="utf-8")
+            stock_sym.write_text("sym", encoding="utf-8")
+            write_pdf(oversized_pdf, text="215 INCH PART", width=2448, height=1584)
+            write_pdf(stock_pdf, text="STOCK PART", width=792, height=1224)
+            paths.rpd_path.write_text(
+                f"""<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://www.radan.com/ns/project">
+  <Parts>
+    <Part>
+      <ID>1</ID>
+      <Symbol>{oversized_sym}</Symbol>
+      <Qty>1</Qty>
+      <Exclude>y</Exclude>
+    </Part>
+    <Part>
+      <ID>2</ID>
+      <Symbol>{stock_sym}</Symbol>
+      <Qty>1</Qty>
+      <Exclude>y</Exclude>
+    </Part>
+  </Parts>
+</Project>
+""",
+                encoding="utf-8",
+            )
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.assembly_source_pdfs, (oversized_pdf,))
+
+    def test_prepare_packet_build_context_does_not_include_nonexcluded_large_part_pdf(self) -> None:
+        with workspace_tempdir() as temp_root:
+            settings = ExplorerSettings(
+                release_root=str(temp_root / "release"),
+                fabrication_root=str(temp_root / "fab"),
+            )
+            paths = build_kit_paths("F55334", "PAINT PACK", settings)
+            assert paths.project_dir is not None
+            assert paths.rpd_path is not None
+            assert paths.fabrication_kit_dir is not None
+            paths.project_dir.mkdir(parents=True)
+            paths.fabrication_kit_dir.mkdir(parents=True)
+
+            sym_path = paths.fabrication_kit_dir / "F55334-B-09.sym"
+            part_pdf = paths.fabrication_kit_dir / "F55334-B-09.pdf"
+            part_ipt = paths.fabrication_kit_dir / "F55334-B-09.ipt"
+            sym_path.write_text("sym", encoding="utf-8")
+            part_ipt.write_text("ipt", encoding="utf-8")
+            write_pdf(part_pdf, text="LARGE NORMAL PART", width=2448, height=1584)
+            write_simple_rpd(paths.rpd_path, sym_path=sym_path)
+
+            context = prepare_packet_build_context(
+                rpd_path=paths.rpd_path,
+                fabrication_dir=paths.fabrication_kit_dir,
+                settings=settings,
+            )
+
+            self.assertEqual(context.assembly_source_pdfs, ())
+
     def test_validate_print_packet_readiness_rejects_empty_rpd(self) -> None:
         with workspace_tempdir() as temp_root:
             rpd_path = temp_root / "empty.rpd"
@@ -1675,6 +1757,24 @@ class TruckNestExplorerServicesTests(unittest.TestCase):
             self.assertEqual(result.read_errors, ())
             self.assertEqual([ref.bom_qty for ref in result.references], [2, 1, 1])
             self.assertNotIn("ACH", "\n".join(ref.part_name for ref in result.references))
+
+    def test_scan_assembly_bom_context_ignores_part_drawing_self_reference(self) -> None:
+        with workspace_tempdir() as temp_root:
+            part_name = "F55334-B-09"
+            part_pdf = temp_root / "fab" / f"{part_name}.pdf"
+            write_pdf(
+                part_pdf,
+                text=f"PART NUMBER\n{part_name}\n215 INCH OVERSIZED PART",
+                width=2448,
+                height=1584,
+            )
+
+            result = scan_assembly_bom_context(
+                parts=[SimpleNamespace(sym=str(temp_root / f"{part_name}.sym"), part=part_name)],
+                source_pdfs=(part_pdf,),
+            )
+
+            self.assertEqual(result.references, ())
 
     def test_write_assembly_bom_context_csv_persists_many_to_many_mapping(self) -> None:
         with workspace_tempdir() as temp_root:

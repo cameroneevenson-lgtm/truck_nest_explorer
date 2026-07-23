@@ -870,6 +870,12 @@ def _is_tabloid_size(width_points: float, height_points: float) -> bool:
     return all(abs(dims[index] - target[index]) <= TABLOID_TOLERANCE_POINTS for index in range(2))
 
 
+def _is_arch_d_size(width_points: float, height_points: float) -> bool:
+    dims = sorted((float(width_points), float(height_points)))
+    target = sorted((ARCH_D_WIDTH_POINTS, ARCH_D_HEIGHT_POINTS))
+    return all(abs(dims[index] - target[index]) <= TABLOID_TOLERANCE_POINTS for index in range(2))
+
+
 def _is_drawing_sheet_size(width_points: float, height_points: float) -> bool:
     dims = sorted((float(width_points), float(height_points)))
     targets = (
@@ -888,6 +894,10 @@ def _is_tabloid_pdf(path: Path) -> bool:
 
 def _tabloid_page_indices(path: Path) -> tuple[int, ...]:
     return _page_indices_matching_size(path, _is_tabloid_size)
+
+
+def _arch_d_page_indices(path: Path) -> tuple[int, ...]:
+    return _page_indices_matching_size(path, _is_arch_d_size)
 
 
 def _drawing_page_indices(path: Path) -> tuple[int, ...]:
@@ -965,6 +975,38 @@ def _matched_part_pdf_keys(
             continue
         matched.add(_normalize_path_key(pdf_path))
     return matched
+
+
+def _excluded_part_symbol_paths(rpd_path: Path) -> tuple[str, ...]:
+    tree = ET.parse(rpd_path)
+    excluded: list[str] = []
+    for el in tree.getroot().iter():
+        if _local_xml_name(str(el.tag)).casefold() != "part":
+            continue
+        exclude_text = _find_child_text_by_local_name(el, ("Exclude",)).casefold()
+        if exclude_text not in {"y", "yes", "true", "1"}:
+            continue
+        symbol_text = _find_child_text_by_local_name(el, ("Symbol",))
+        if symbol_text:
+            excluded.append(symbol_text)
+    return tuple(excluded)
+
+
+def _excluded_large_format_part_pdf_keys(
+    rpd_path: Path,
+    *,
+    resolve_asset_fn: Callable[[str, str], Optional[str]],
+) -> set[str]:
+    included: set[str] = set()
+    for sym_path in _excluded_part_symbol_paths(rpd_path):
+        pdf_path_text = resolve_asset_fn(sym_path, ".pdf")
+        if not pdf_path_text:
+            continue
+        pdf_path = Path(pdf_path_text)
+        if not pdf_path.exists() or not _arch_d_page_indices(pdf_path):
+            continue
+        included.add(_normalize_path_key(pdf_path))
+    return included
 
 
 def _revision_base_stem(stem: str) -> str:
@@ -1146,22 +1188,25 @@ def collect_unused_tabloid_pdfs(
     *,
     search_roots: Sequence[Path],
     resolve_asset_fn: Callable[[str, str], Optional[str]],
+    included_matched_pdf_keys: set[str] | None = None,
 ) -> tuple[Path, ...]:
     if not search_roots:
         return ()
 
     matched_pdf_keys = _matched_part_pdf_keys(parts, resolve_asset_fn=resolve_asset_fn)
+    included_matched_pdf_keys = included_matched_pdf_keys or set()
     candidates: list[tuple[int, tuple[int, list[object]], Path]] = []
     seen: set[str] = set()
     for root_index, root in enumerate(search_roots):
         for pdf_path in _iter_pdf_paths(root):
             key = _normalize_path_key(pdf_path)
-            if key in seen or key in matched_pdf_keys:
+            is_included_matched_part = key in included_matched_pdf_keys
+            if key in seen or (key in matched_pdf_keys and not is_included_matched_part):
                 continue
             seen.add(key)
             if _looks_generated_pdf_artifact(pdf_path):
                 continue
-            if not _has_assembly_inventor_source(pdf_path):
+            if not is_included_matched_part and not _has_assembly_inventor_source(pdf_path):
                 continue
             if not _drawing_page_indices(pdf_path):
                 continue
@@ -1194,11 +1239,20 @@ def prepare_packet_build_context(
         fabrication_dir=fabrication_dir,
     )
     assembly_search_roots = _assembly_search_roots(fabrication_dir, rpd_path.parent)
+    included_matched_pdf_keys = (
+        _excluded_large_format_part_pdf_keys(
+            rpd_path,
+            resolve_asset_fn=resolve_asset_fn,
+        )
+        if include_assembly_sources
+        else set()
+    )
     assembly_source_pdfs = (
         collect_unused_tabloid_pdfs(
             parts,
             search_roots=assembly_search_roots,
             resolve_asset_fn=resolve_asset_fn,
+            included_matched_pdf_keys=included_matched_pdf_keys,
         )
         if include_assembly_sources
         else ()
@@ -1276,10 +1330,16 @@ def _scan_pdf_for_assembly_references(
     single bad PDF should not abort the rest of the scan.
     """
     found: list[AssemblyBomReference] = []
+    source_part_key = _pdf_part_stem_key(pdf_path.stem)
     with fitz.open(str(pdf_path)) as doc:
         for page_index in range(doc.page_count):
             text = str(doc[page_index].get_text("text") or "")
             for alias in aliases:
+                # Excluded large-format part drawings are also assembly-packet
+                # sources. Do not mistake the drawing's own title-block part
+                # number for evidence that it belongs to an assembly.
+                if source_part_key and _pdf_part_stem_key(alias.part_name) == source_part_key:
+                    continue
                 if not alias.pattern.search(text):
                     continue
                 key = (alias.part_name.casefold(), _normalize_path_key(pdf_path), page_index + 1)
