@@ -27,15 +27,18 @@ DEFAULT_RADAN_CSV_IMPORT_ENTRY = Path(r"C:\Tools\radan_automation\import_parts_c
 # (radan_automation/radan_isolated_desktop.py) so open RADAN sessions are not disturbed.
 # Same logon session and same instance count as the default path, so no extra licence seat.
 #
-# Still off by default: flip to True only once probe_visible_session_disturbance.py shows a
-# clean before/after on this machine. Turning it on also relaxes the "close RADAN first"
-# gates, so a premature flip would remove the protection without replacing it.
-# Set TRUCK_NEST_RADAN_ISOLATED_DESKTOP=1 to try it without editing code.
-RADAN_ISOLATED_DESKTOP = os.environ.get("TRUCK_NEST_RADAN_ISOLATED_DESKTOP", "").strip() in {
-    "1",
-    "true",
-    "True",
-    "yes",
+# ON by default since 2026-07-23. Measured on this machine: a 12-part conversion batch ran
+# with two Nest Editor sessions open and the watched session recorded zero disturbance
+# events across 1145 samples (RADAN_DESKTOP_ISOLATION_FINDINGS_20260723.md). This is what
+# retires the "close RADAN before nesting" prompts.
+#
+# Set TRUCK_NEST_RADAN_ISOLATED_DESKTOP=0 to fall back to the legacy shared-desktop path,
+# which still exists and still shows those prompts.
+RADAN_ISOLATED_DESKTOP = os.environ.get("TRUCK_NEST_RADAN_ISOLATED_DESKTOP", "1").strip() not in {
+    "0",
+    "false",
+    "False",
+    "no",
 }
 
 
